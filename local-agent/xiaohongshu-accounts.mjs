@@ -17,21 +17,21 @@ import {
   openSync,
   readFileSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 export const DEFAULT_XHS_ACCOUNT_ID = "default";
 
 const REGISTRY_VERSION = 1;
 const ENGINE_SERVICE = "xiaohongshu-mcp";
-const START_LOCK_MAX_AGE_MS = 120_000;
 const START_TIMEOUT_MS = 30_000;
 const ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 const startsInFlight = new Map();
+const startLockDbs = new Map();
 
 let dependencies = {
   fetch: (...args) => globalThis.fetch(...args),
@@ -124,7 +124,7 @@ function ensureAccountPrivateState(config, accountId, { migrateLegacy = false } 
   chmodSync(paths.cookiePath, 0o600);
   ensureAuthToken(paths.tokenPath);
   if (existsSync(paths.logPath)) chmodSync(paths.logPath, 0o600);
-  if (existsSync(paths.lockPath)) chmodSync(paths.lockPath, 0o600);
+  if (existsSync(`${paths.lockPath}.sqlite`)) chmodSync(`${paths.lockPath}.sqlite`, 0o600);
   return paths;
 }
 
@@ -258,25 +258,28 @@ async function probeEngine(record, timeoutMs = 1_500) {
 }
 
 function acquireStartLock(record) {
-  if (existsSync(record.lockPath)) {
-    try {
-      if (Date.now() - statSync(record.lockPath).mtimeMs > START_LOCK_MAX_AGE_MS) unlinkSync(record.lockPath);
-    } catch { /* 下一次原子 open 会给出明确结果 */ }
-  }
+  if (startLockDbs.has(record.lockPath)) return false;
+  const lockDbPath = `${record.lockPath}.sqlite`;
+  let lockDb = null;
   try {
-    const fd = openSync(record.lockPath, "wx", 0o600);
-    writeFileSync(fd, `${process.pid}\n`, "utf8");
-    closeSync(fd);
-    chmodSync(record.lockPath, 0o600);
+    lockDb = new DatabaseSync(lockDbPath);
+    chmodSync(lockDbPath, 0o600);
+    lockDb.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;");
+    startLockDbs.set(record.lockPath, lockDb);
     return true;
   } catch (error) {
-    if (error?.code === "EEXIST") return false;
+    try { lockDb?.close(); } catch { /* 未取得锁时只关闭自己的句柄 */ }
+    if (/SQLITE_BUSY|database is locked/i.test(String(error?.code || error?.message || ""))) return false;
     throw error;
   }
 }
 
 function releaseStartLock(record) {
-  try { if (existsSync(record.lockPath)) unlinkSync(record.lockPath); } catch { /* 后续健康探测仍能防止双启动 */ }
+  const lockDb = startLockDbs.get(record.lockPath);
+  if (!lockDb) return;
+  startLockDbs.delete(record.lockPath);
+  try { lockDb.exec("COMMIT;"); } catch { /* close 仍会释放 OS 锁 */ }
+  try { lockDb.close(); } catch { /* 后续健康探测仍能防止双启动 */ }
 }
 
 async function waitForEngine(record, timeoutMs = START_TIMEOUT_MS) {
@@ -369,6 +372,7 @@ export async function requestAccount(accountId, path, options = {}) {
 export function __configureXhsAccountsForTests(overrides = {}) {
   dependencies = { ...dependencies, ...overrides };
   startsInFlight.clear();
+  for (const record of [...startLockDbs.keys()]) releaseStartLock({ lockPath: record });
 }
 
 export function __resetXhsAccountsForTests() {
@@ -378,6 +382,7 @@ export function __resetXhsAccountsForTests() {
     sleep: (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
   };
   startsInFlight.clear();
+  for (const record of [...startLockDbs.keys()]) releaseStartLock({ lockPath: record });
 }
 
 export function xhsAccountRuntimeSummary(accountId = DEFAULT_XHS_ACCOUNT_ID) {

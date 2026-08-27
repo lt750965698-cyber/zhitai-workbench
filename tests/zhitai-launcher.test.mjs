@@ -193,6 +193,7 @@ test("小红书 default 迁移到私有目录，以回环端口、独立 cookie 
     assert.equal(fs.statSync(tokenPath).mode & 0o777, 0o600);
     assert.equal(fs.statSync(engineLogPath).mode & 0o777, 0o600);
     assert.equal(fs.existsSync(path.join(accountDir, "engine-start.lock")), false);
+    assert.equal(fs.statSync(path.join(accountDir, "engine-start.lock.sqlite")).mode & 0o777, 0o600);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

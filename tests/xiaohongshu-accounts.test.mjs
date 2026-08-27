@@ -145,6 +145,8 @@ test("新增账号按需启动独立回环进程，携带独立 COOKIES_PATH 和
   assert.equal(call.options.shell, false);
   assert.ok(!call.args.join(" ").includes(call.options.env.AUTH_TOKEN), "token 不得进入进程命令行");
   assert.equal(existsSync(runtime.lockPath), false, "启动完成必须释放互斥锁");
+  assert.equal(existsSync(`${runtime.lockPath}.sqlite`), true, "进程锁数据库应保留供后续复用");
+  assert.equal(mode(`${runtime.lockPath}.sqlite`), 0o600);
 });
 
 test("API 请求按 accountId 路由并强制 Bearer；未知账号不触发任何请求", async () => {

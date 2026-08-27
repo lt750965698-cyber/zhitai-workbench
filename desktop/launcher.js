@@ -10,6 +10,7 @@ const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
 const crypto = require("node:crypto");
+const { DatabaseSync } = require("node:sqlite");
 
 const HOME = os.homedir();
 const RUNTIME_ROOT = path.resolve(process.env.ZHITAI_RUNTIME_ROOT
@@ -28,6 +29,7 @@ const NODE_BIN = [
 ].filter(Boolean).find((candidate) => fs.existsSync(candidate)) || process.execPath;
 
 const WEB_MARKERS = ["织台 · 内容自动化工作台", "workbench-shell"];
+const xhsStartLockDbs = new Map();
 
 let ctx = {
   projectDir: path.resolve(__dirname, ".."),
@@ -206,23 +208,29 @@ function ensureXhsDefaultState() {
 }
 
 function acquireXhsStartLock(config) {
-  if (fs.existsSync(config.lockPath)) {
-    try {
-      if (Date.now() - fs.statSync(config.lockPath).mtimeMs > 120000) fs.unlinkSync(config.lockPath);
-    } catch (_) { /* 原子 open 会给出最终结果 */ }
-  }
+  if (xhsStartLockDbs.has(config.lockPath)) return false;
+  const lockDbPath = `${config.lockPath}.sqlite`;
+  let lockDb = null;
   try {
-    fs.writeFileSync(config.lockPath, `${process.pid}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    fs.chmodSync(config.lockPath, 0o600);
+    lockDb = new DatabaseSync(lockDbPath);
+    fs.chmodSync(lockDbPath, 0o600);
+    lockDb.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;");
+    xhsStartLockDbs.set(config.lockPath, lockDb);
     return true;
   } catch (error) {
-    if (error && error.code === "EEXIST") return false;
+    try { lockDb?.close(); } catch (_) { /* 未取得锁时只关闭自己的句柄 */ }
+    if (/SQLITE_BUSY|database is locked/i.test(String(error?.code || error?.message || ""))) return false;
     throw error;
   }
 }
 
 function releaseXhsStartLock(lockPath) {
-  try { if (lockPath && fs.existsSync(lockPath)) fs.unlinkSync(lockPath); } catch (_) { /* 健康探测仍会防双启动 */ }
+  if (!lockPath) return;
+  const lockDb = xhsStartLockDbs.get(lockPath);
+  if (!lockDb) return;
+  xhsStartLockDbs.delete(lockPath);
+  try { lockDb.exec("COMMIT;"); } catch (_) { /* close 仍会释放 OS 锁 */ }
+  try { lockDb.close(); } catch (_) { /* 健康探测仍会防双启动 */ }
 }
 
 // 服务清单（真实路径）
