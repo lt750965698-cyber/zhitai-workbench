@@ -1,0 +1,15 @@
+{
+  "name": "zhitai-clawbot-control",
+  "version": "2.0.1",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.12",
+      "minGatewayVersion": "2026.5.12"
+    }
+  }
+}

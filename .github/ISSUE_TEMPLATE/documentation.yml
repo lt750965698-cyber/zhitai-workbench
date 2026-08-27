@@ -1,0 +1,52 @@
+name: 文档问题 / Documentation
+description: 报告过时、错误、缺失或可能误导的文档。
+title: "[Docs] "
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issues。
+          required: true
+        - label: 我没有附上真实凭据、素材、账号数据或本机路径。
+          required: true
+  - type: input
+    id: location
+    attributes:
+      label: 文档位置
+      description: 文件路径、标题或公开 URL。
+      placeholder: docs/GETTING_STARTED.md
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 问题类型
+      options:
+        - 命令或文件名错误
+        - 与当前实现不一致
+        - 过度承诺或能力边界不清
+        - 安全、隐私或授权说明不足
+        - 链接失效
+        - 翻译或表达问题
+        - 缺少文档
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: 当前内容或问题
+    validations:
+      required: true
+  - type: textarea
+    id: suggested
+    attributes:
+      label: 建议修改
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 可核验依据
+      description: 相关源码、测试或官方上游文档。

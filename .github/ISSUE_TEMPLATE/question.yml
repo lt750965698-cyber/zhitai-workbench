@@ -1,0 +1,52 @@
+name: 使用问题 / Question
+description: 询问织台核心的安装、配置或行为。
+title: "[Question] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先阅读 README、docs/GETTING_STARTED.md 和 SUPPORT.md。
+        不要上传完整配置、凭据、账号数据、真实素材或私聊。
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已阅读支持政策并搜索现有 Issues。
+          required: true
+        - label: 我已对所有信息完成脱敏。
+          required: true
+        - label: 问题不涉及绕过访问控制、验证码、版权保护或平台风控。
+          required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: 想完成什么
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: 已尝试什么
+      description: 包含使用的公开文档和已脱敏命令。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境与版本
+      description: 操作系统、Node.js、pnpm、织台标签或提交。
+    validations:
+      required: true
+  - type: textarea
+    id: integrations
+    attributes:
+      label: 外置集成
+      description: 如相关，列出项目名和固定版本；不相关请填“无”。
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: 已脱敏输出
+      render: text

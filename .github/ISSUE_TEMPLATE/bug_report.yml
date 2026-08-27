@@ -1,0 +1,95 @@
+name: 缺陷报告 / Bug report
+description: 报告织台核心中可复现的问题。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告。安全漏洞请使用 Private vulnerability reporting。
+        请删除 Cookie、Token、二维码、手机号、账号数据、真实素材和本机绝对路径。
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issues，未找到相同问题。
+          required: true
+        - label: 这不是需要私下报告的安全漏洞。
+          required: true
+        - label: 我已对日志、截图和配置完成脱敏。
+          required: true
+        - label: 测试所用账号和内容归我所有或已获授权。
+          required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: 问题区域
+      options:
+        - 本地节点 / 知识库
+        - Web 工作台
+        - Electron 桌面外壳
+        - 采集适配器
+        - 分析或生成适配器
+        - 发布适配器
+        - 通知或远程控制
+        - 测试、构建或文档
+        - 不确定
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 织台版本
+      description: 标签或完整 Git commit。
+      placeholder: v0.1.0-alpha.1
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: 操作系统、架构、Node.js、pnpm，以及 Web 或 Electron。
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现
+      description: 从干净配置开始的明确步骤。不要粘贴密钥或完整 config.local.json。
+      placeholder: |
+        1. 保持所有外置适配器关闭
+        2. 运行 pnpm agent
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: integrations
+    attributes:
+      label: 外置集成
+      description: 如相关，列出项目名、固定版本和状态；不相关请填“无”。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏日志
+      description: 只保留最小错误信息，删除个人数据、凭据、URL 查询参数和绝对路径。
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: 回归范围、临时缓解方式或可公开的合成测试仓库。

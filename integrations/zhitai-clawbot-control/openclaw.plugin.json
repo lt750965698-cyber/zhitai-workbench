@@ -1,0 +1,14 @@
+{
+  "id": "zhitai-inbox-bridge",
+  "name": "Zhitai ClawBot Remote Control",
+  "description": "24/7 private Weixin entry for deterministic link ingestion, fixed controls, and human review that creates multi-platform draft todos without public publishing.",
+  "version": "2.0.1",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

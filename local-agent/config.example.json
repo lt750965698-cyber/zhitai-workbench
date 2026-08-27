@@ -1,0 +1,310 @@
+{
+  "host": "127.0.0.1",
+  "port": 17890,
+  "knowledgeBase": "~/KnowledgeHub/内容库",
+  "allowedOrigins": [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001"
+  ],
+  "webhookSecret": "",
+  "webhookKeychainService": "com.zhitai.inbox-webhook",
+  "polling": {
+    "intervalMs": 1000,
+    "timeoutMs": 1800000
+  },
+  "adapters": {
+    "douyin": {
+      "enabled": false,
+      "type": "douyin-rest",
+      "service": "douyin_downloader",
+      "baseUrl": "http://127.0.0.1:8000",
+      "outputRoot": "/absolute/path/to/douyin-downloader/Downloaded",
+      "importMode": "copy"
+    },
+    "wechat": {
+      "enabled": false,
+      "type": "wechat-mp-tools",
+      "service": "wechat_mp_tools",
+      "baseUrl": "http://127.0.0.1:5200",
+      "importMode": "copy",
+      "channelParserConfigured": false,
+      "allowPublicChannelFallback": false,
+      "notes": "微信文件传输助手是必需主入口：视频号卡片可走本机 wx_channels_download 的 objectId/nonceId 通道，可访问的分享链接也可解析入库。ClawBot 私聊仅保留备用直链收件。"
+    },
+    "xiaohongshu": {
+      "enabled": false,
+      "type": "wechat-mp-tools",
+      "service": "wechat_mp_tools",
+      "baseUrl": "http://127.0.0.1:5200",
+      "importMode": "copy"
+    },
+    "publisher": {
+      "enabled": false,
+      "type": "matrix-media",
+      "service": "matrix_media",
+      "timeoutMs": 180000,
+      "allowedAssetRoots": []
+    }
+  },
+  "services": {
+    "wechat_mp_tools": {
+      "label": "织台补充采集引擎",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "ingest",
+      "project": "wechat-mp-tools",
+      "projectUrl": "https://github.com/x554960766/wechat-mp-tools",
+      "healthUrl": "http://127.0.0.1:5200/api/auth/status",
+      "healthJsonKeys": [
+        "logged_in",
+        "login_state"
+      ],
+      "installChecks": [
+        "~/.local/share/zhitai-runtime/engines/wechat-mp-tools-current/app.py",
+        "~/.local/share/zhitai-runtime/engines/wechat-mp-tools-current/.venv/bin/python"
+      ],
+      "start": {
+        "command": "~/.local/share/zhitai-runtime/engines/wechat-mp-tools-current/.venv/bin/python",
+        "args": [
+          "app.py",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "5200",
+          "--no-browser"
+        ],
+        "cwd": "~/.local/share/zhitai-runtime/engines/wechat-mp-tools-current"
+      },
+      "notes": "可选外置引擎；仅在用户确认并按上游许可自行安装后，才从本机私有 runtime 以无窗口后台方式运行。"
+    },
+    "wx_channels_card": {
+      "label": "视频号卡片解析引擎",
+      "onDemand": true,
+      "role": "ingest",
+      "project": "wx_channels_download",
+      "projectUrl": "https://github.com/ltaoo/wx_channels_download",
+      "autoStart": false,
+      "healthUrl": "http://127.0.0.1:2022/api/channels/status",
+      "installChecks": [
+        "~/.local/share/zhitai-runtime/engines/wx-video-card/wx_video_download",
+        "~/.local/share/zhitai-runtime/engines/wx-video-card/config.yaml"
+      ],
+      "requiredExecutables": [
+        "~/.local/share/zhitai-runtime/engines/wx-video-card/wx_video_download"
+      ],
+      "start": {
+        "command": "~/.local/share/zhitai-runtime/engines/wx-video-card/wx_video_download",
+        "args": [
+          "--config",
+          "~/.local/share/zhitai-runtime/engines/wx-video-card/config.yaml",
+          "--workdir",
+          "~/.local/share/zhitai-runtime/engines/wx-video-card/runtime"
+        ],
+        "cwd": "~/.local/share/zhitai-runtime/engines/wx-video-card"
+      },
+      "notes": "视频号卡片主入口引擎：从文件传输助手卡片提取 objectId/nonceId，经已连接的微信视频号页面解析媒体并自动入库。仍使用本机证书和仅限微信域名的 PAC，不接管全局代理。"
+    },
+    "douyin_downloader": {
+      "label": "抖音下载服务",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "ingest",
+      "project": "douyin-downloader",
+      "projectUrl": "https://github.com/jiji262/douyin-downloader",
+      "healthUrl": "http://127.0.0.1:8000/api/v1/health",
+      "installChecks": [
+        "/absolute/path/to/douyin-downloader/run.py"
+      ],
+      "start": {
+        "command": "python3",
+        "args": [
+          "run.py",
+          "--serve",
+          "--serve-host",
+          "127.0.0.1",
+          "--serve-port",
+          "8000"
+        ],
+        "cwd": "/absolute/path/to/douyin-downloader"
+      }
+    },
+    "openclaw_weixin": {
+      "label": "ClawBot 备用直链收件与手机遥控",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "remote_control",
+      "ingressRole": "fallback",
+      "project": "openclaw-weixin",
+      "projectUrl": "https://github.com/Tencent/openclaw-weixin",
+      "installChecks": [
+        "/absolute/path/to/openclaw-weixin"
+      ],
+      "repositoryRoot": "/absolute/path/to/openclaw-weixin",
+      "expectedRevision": "固定并审计过的 40 位 Git commit",
+      "setup": {
+        "command": "/usr/bin/open",
+        "args": [
+          "/absolute/path/to/finish-openclaw-setup.command"
+        ]
+      },
+      "probe": {
+        "command": "node",
+        "args": [
+          "/absolute/path/to/launchagent-probe.mjs",
+          "com.zhitai.openclaw-weixin"
+        ]
+      },
+      "businessProbe": {
+        "command": "node",
+        "args": [
+          "/absolute/path/to/openclaw-business-probe.mjs",
+          "/absolute/path/to/openclaw-runtime/state",
+          "/tmp/openclaw",
+          "com.zhitai.openclaw-weixin"
+        ]
+      },
+      "notes": "可选备用通道与手机控制：官方微信长轮询由 launchd 常驻；私聊直链、固定命令和成片审核均在模型分发前处理，不依赖 Codex。它离线不阻断文件传输助手主入口。人工终审以“选择 N”为主并兼容“发布 N”，批准只创建多平台草稿待办，不公开发布。"
+    },
+    "pywechat_file_transfer": {
+      "label": "文件传输助手监听（Windows 实验）",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "inbox",
+      "project": "pywechat",
+      "projectUrl": "https://github.com/Hello-Mr-Crab/pywechat",
+      "installChecks": [
+        "C:/absolute/path/to/pywechat"
+      ],
+      "notes": "仅适用于专用 Windows 会话；依赖微信 UI 和前台窗口，不应作为生产唯一入口。"
+    },
+    "filehelper_web": {
+      "label": "微信文件传输助手网页版（主入口）",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "inbox",
+      "ingressRole": "primary",
+      "project": "wechat-filehelper",
+      "projectUrl": "https://filehelper.weixin.qq.com/",
+      "installChecks": [
+        "local-agent/zhitai-kuaidian-companion.user.js"
+      ],
+      "setup": {
+        "command": "/usr/bin/open",
+        "args": [
+          "https://filehelper.weixin.qq.com/"
+        ]
+      },
+      "notes": "浏览器中需分别安装上游发布的原版快点脚本（保持原样）与本仓库的 zhitai-kuaidian-companion.user.js；本仓库不再分发、下载、修改或打包上游源码。installChecks 只确认织台原创桥接脚本文件就绪，不代表浏览器已安装或微信已登录；在线状态由 /api/v1/kuaidian/status 心跳判定。"
+    },
+    "matrix_media": {
+      "label": "多平台发布器",
+      "autoStart": false,
+      "role": "publish",
+      "project": "MatrixMedia",
+      "projectUrl": "https://github.com/hanliang97/MatrixMedia",
+      "onDemand": true,
+      "installChecks": [
+        "~/.local/share/zhitai-runtime/engines/matrixmedia.app/Contents/MacOS/matrixmedia"
+      ],
+      "notes": "可选外置引擎；用户确认并自行取得后可安装到本机私有 runtime，账号、历史、扫码和发布由织台调用其 CLI。"
+    },
+    "xiaohongshu_publisher": {
+      "label": "小红书图文发布",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "publish",
+      "project": "xiaohongshu-mcp",
+      "projectUrl": "https://github.com/xpzouying/xiaohongshu-mcp",
+      "healthUrl": "http://127.0.0.1:18060/health",
+      "installChecks": [
+        "~/.local/share/zhitai-runtime/engines/xiaohongshu-mcp-current/xiaohongshu-mcp"
+      ],
+      "notes": "小红书图文/多图/标签/定时发布；登录二维码在织台内显示。"
+    },
+    "ai_goofish_monitor": {
+      "label": "闲鱼商品监控",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "xianyu_monitor",
+      "project": "ai-goofish-monitor",
+      "projectUrl": "https://github.com/Usagi-org/ai-goofish-monitor",
+      "installChecks": [
+        "/absolute/path/to/ai-goofish-monitor"
+      ],
+      "repositoryRoot": "/absolute/path/to/ai-goofish-monitor",
+      "expectedRevision": "f85d140b6b45029d9a0925feb96dad733b41396d",
+      "allowedDirtyPaths": [
+        "config.json"
+      ],
+      "healthUrl": "http://127.0.0.1:8000/health",
+      "start": {
+        "command": "/absolute/path/to/ai-goofish-monitor/.venv/bin/python",
+        "args": [
+          "src/app.py"
+        ],
+        "cwd": "/absolute/path/to/ai-goofish-monitor",
+        "env": {
+          "SERVER_PORT": "8000",
+          "PYTHONUNBUFFERED": "1"
+        }
+      },
+      "notes": "用现有 .venv 与已构建 dist 启动（不重装依赖）；Web UI http://127.0.0.1:8000。"
+    },
+    "xianyu_auto_agent": {
+      "label": "闲鱼智能客服原型",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "xianyu_support",
+      "project": "XianyuAutoAgent",
+      "projectUrl": "https://github.com/shaxiu/XianyuAutoAgent",
+      "mutualExclusionGroup": "xianyu-chat-owner",
+      "installChecks": [
+        "/absolute/path/to/XianyuAutoAgent"
+      ],
+      "repositoryRoot": "/absolute/path/to/XianyuAutoAgent",
+      "expectedRevision": "540bbc26cf02ee6348d997843942776a9be9460b",
+      "notes": "同一账号不能与 xianyu-auto-reply-fix 同时运行。完成日志脱敏与 heartbeat wrapper 后再加入 start 命令。"
+    },
+    "xianyu_auto_reply_fix": {
+      "label": "闲鱼多账号管理",
+      "autoStart": false,
+      "onDemand": true,
+      "role": "xianyu_accounts",
+      "project": "xianyu-auto-reply-fix",
+      "projectUrl": "https://github.com/GuDong2003/xianyu-auto-reply-fix",
+      "mutualExclusionGroup": "xianyu-chat-owner",
+      "installChecks": [
+        "/absolute/path/to/xianyu-auto-reply-fix"
+      ],
+      "repositoryRoot": "/absolute/path/to/xianyu-auto-reply-fix",
+      "expectedRevision": "7b9eabb068f382da6ee7c6b014a47b75f289b1f5",
+      "allowedDirtyPaths": [
+        "global_config.yml"
+      ],
+      "healthUrl": "http://127.0.0.1:8090/health",
+      "start": {
+        "command": "/absolute/path/to/xianyu-auto-reply-fix/.venv/bin/python",
+        "args": [
+          "Start.py"
+        ],
+        "cwd": "/absolute/path/to/xianyu-auto-reply-fix",
+        "env": {
+          "API_PORT": "8090",
+          "PYTHONUNBUFFERED": "1"
+        }
+      },
+      "notes": "用现有 .venv/Start.py 启动（不重装依赖）；Web UI http://127.0.0.1:8090；与 XianyuAutoAgent 同账号互斥。"
+    }
+  },
+  "watcher": {
+    "intervalMs": 20000,
+    "maxRetries": 8,
+    "roots": []
+  },
+  "kuaidianFallback": {
+    "enabled": false,
+    "note": "快点失败时是否用元宝回退（仅补元数据不下载加密流）；默认关闭 → failed_no_fallback_configured"
+  }
+}

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞 / Security vulnerability
+    url: https://github.com/lt750965698-cyber/zhitai-workbench/security/advisories/new
+    about: 请使用私密安全报告，不要公开漏洞、凭据或利用细节。
+  - name: 支持政策 / Support policy
+    url: https://github.com/lt750965698-cyber/zhitai-workbench/blob/main/SUPPORT.md
+    about: 先了解支持范围、所需信息和隐私要求。
