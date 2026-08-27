@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -269,7 +271,7 @@ test("两个 store 实例并发占位仍只有一个创建成功", async (t) => 
   assert.equal((await firstStore.list()).length, 1);
 });
 
-test("只清理超过两分钟且 PID 无效的陈旧锁", async (t) => {
+test("升级后忽略旧版陈旧锁文件，改由 SQLite 的进程级锁自动恢复", async (t) => {
   const sandbox = await mkdtemp(join(tmpdir(), "zhitai-publish-stale-lock-"));
   t.after(() => rm(sandbox, { recursive: true, force: true }));
   const ledgerPath = join(sandbox, "receipts.json");
@@ -283,6 +285,41 @@ test("只清理超过两分钟且 PID 无效的陈旧锁", async (t) => {
     account: "persist:13800138000抖音",
     content: { id: "asset-stale", title: "儿童房布局", mediaSha256: "2".repeat(64) },
     jobId: "job-stale",
+    mode: "public",
+    scheduledAt: null,
+  });
+  assert.equal(result.created, true);
+  const lockMode = (await stat(`${ledgerPath}.lock.sqlite`)).mode & 0o777;
+  assert.equal(lockMode, 0o600);
+});
+
+test("持锁进程崩溃后由操作系统释放发布回执锁", async (t) => {
+  const sandbox = await mkdtemp(join(tmpdir(), "zhitai-publish-crash-lock-"));
+  t.after(() => rm(sandbox, { recursive: true, force: true }));
+  const ledgerPath = join(sandbox, "receipts.json");
+  const lockPath = `${ledgerPath}.lock.sqlite`;
+  const childScript = `
+    import { DatabaseSync } from "node:sqlite";
+    const db = new DatabaseSync(${JSON.stringify(lockPath)});
+    db.exec("BEGIN IMMEDIATE;");
+    process.stdout.write("locked\\n");
+    setInterval(() => {}, 1000);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", childScript], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
+  const [ready] = await once(child.stdout, "data");
+  assert.equal(String(ready).trim(), "locked");
+  child.kill("SIGKILL");
+  await once(child, "exit");
+
+  const store = createPublishReceiptStore({ path: ledgerPath });
+  const result = await store.reserve({
+    platform: "dy",
+    account: "persist:13800138000抖音",
+    content: { id: "asset-crash", title: "儿童房布局", mediaSha256: "3".repeat(64) },
+    jobId: "job-crash",
     mode: "public",
     scheduledAt: null,
   });

@@ -3,8 +3,8 @@
  * 账号、历史、登录会话仍沿用 MatrixMedia 官方数据格式和自动化引擎。
  */
 import { spawn } from "node:child_process";
-import { mkdir, open, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
@@ -14,6 +14,7 @@ export const MATRIX_BINARY = process.env.ZHITAI_MATRIX_BINARY
 const CLI_TIMEOUT_MS = 120_000;
 const PTY_WRAPPER = "/usr/bin/script";
 const loginSessions = new Map();
+const receiptMutationQueues = new Map();
 const MATRIX_PARTITIONS = join(homedir(), "Library", "Application Support", "matrix-video", "Partitions");
 const SESSION_PLATFORMS = [
   { suffix: "抖音", code: "dy", platform: "抖音", cookie: "passport_assist_user" },
@@ -286,7 +287,8 @@ function mergeReceiptState(previous, next) {
  */
 export function createPublishReceiptStore({ path, now = () => new Date().toISOString(), idFactory = randomUUID } = {}) {
   if (!path || typeof path !== "string") throw new Error("publisher_receipt_path_required");
-  let mutation = Promise.resolve();
+  const ledgerPath = resolve(path);
+  const lockPath = `${ledgerPath}.lock.sqlite`;
 
   const nowIso = () => {
     const value = typeof now === "function" ? now() : now;
@@ -298,7 +300,7 @@ export function createPublishReceiptStore({ path, now = () => new Date().toISOSt
   const readLedger = async () => {
     let raw;
     try {
-      raw = await readFile(path, "utf8");
+      raw = await readFile(ledgerPath, "utf8");
     } catch (error) {
       if (error?.code === "ENOENT") return { version: 1, receipts: [] };
       throw error;
@@ -313,76 +315,59 @@ export function createPublishReceiptStore({ path, now = () => new Date().toISOSt
   };
 
   const writeLedger = async (ledger) => {
-    await mkdir(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    await mkdir(dirname(ledgerPath), { recursive: true });
+    const temporary = `${ledgerPath}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(ledger, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
+    await rename(temporary, ledgerPath);
   };
 
-  const acquireLedgerLock = async () => {
-    await mkdir(dirname(path), { recursive: true });
-    const lockPath = `${path}.lock`;
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      try {
-        const handle = await open(lockPath, "wx", 0o600);
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, "utf8");
-        return async () => {
-          await handle.close();
-          await unlink(lockPath);
-        };
-      } catch (error) {
-        if (error?.code !== "EEXIST") throw error;
-        let stale = false;
-        try {
-          const owner = JSON.parse(await readFile(lockPath, "utf8"));
-          const createdAt = Date.parse(String(owner?.createdAt || ""));
-          const oldEnough = Number.isFinite(createdAt) && Date.now() - createdAt > 120_000;
-          const pid = Number(owner?.pid);
-          if (oldEnough && (!Number.isInteger(pid) || pid <= 0)) {
-            stale = true;
-          } else if (oldEnough) {
-            try { process.kill(pid, 0); }
-            catch (probeError) {
-              // ESRCH 明确表示进程不存在；EPERM 仍视为活进程，绝不删锁。
-              stale = probeError?.code === "ESRCH";
-            }
-          }
-        } catch { /* 无法证明陈旧就保持 fail-closed */ }
-        if (stale) {
-          const quarantine = `${lockPath}.stale.${process.pid}.${randomUUID()}`;
-          try {
-            // rename 原子夺取这一个已核验的旧锁，避免并发清理误删新进程刚创建的锁。
-            await rename(lockPath, quarantine);
-            await unlink(quarantine);
-            continue;
-          } catch { /* 另一进程已处理或锁已变化，继续等待 */ }
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
+  const withLedgerLock = async (operation) => {
+    await mkdir(dirname(ledgerPath), { recursive: true });
+    let lockDb = null;
+    let inTransaction = false;
+    try {
+      // SQLite 的 OS 级文件锁会在进程退出时自动释放，不需要读取、判断或删除陈旧锁文件。
+      // 同进程按 ledgerPath 排队，避免同步 busy wait 阻塞正在执行异步落盘的本进程持锁者。
+      lockDb = new DatabaseSync(lockPath);
+      await chmod(lockPath, 0o600);
+      lockDb.exec("PRAGMA busy_timeout = 2500; BEGIN IMMEDIATE;");
+      inTransaction = true;
+      const output = await operation();
+      lockDb.exec("COMMIT;");
+      inTransaction = false;
+      return output;
+    } catch (error) {
+      if (inTransaction) {
+        try { lockDb.exec("ROLLBACK;"); } catch { /* close 仍会释放 OS 锁 */ }
       }
+      if (/SQLITE_BUSY|database is locked/i.test(String(error?.code || error?.message || ""))) {
+        throw new Error("publisher_receipt_store_locked");
+      }
+      throw error;
+    } finally {
+      try { lockDb?.close(); } catch { /* 关闭失败也不覆盖原始结果 */ }
     }
-    // 不猜测/清理可能属于另一个活进程的锁；超时后 fail-closed，绝不调用平台。
-    throw new Error("publisher_receipt_store_locked");
   };
 
   const mutate = (mutator) => {
-    const operation = mutation.catch(() => {}).then(async () => {
-      const release = await acquireLedgerLock();
-      try {
+    const previous = receiptMutationQueues.get(ledgerPath) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(() => withLedgerLock(async () => {
         const ledger = await readLedger();
         const output = await mutator(ledger.receipts);
         await writeLedger(ledger);
         return output;
-      } finally {
-        await release();
-      }
+    }));
+    const tail = operation.then(() => undefined, () => undefined);
+    receiptMutationQueues.set(ledgerPath, tail);
+    void tail.then(() => {
+      if (receiptMutationQueues.get(ledgerPath) === tail) receiptMutationQueues.delete(ledgerPath);
     });
-    mutation = operation.then(() => undefined, () => undefined);
     return operation;
   };
 
   return {
     async list() {
-      await mutation.catch(() => {});
+      await (receiptMutationQueues.get(ledgerPath) || Promise.resolve());
       const ledger = await readLedger();
       return cloneReceipt(ledger.receipts);
     },
