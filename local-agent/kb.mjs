@@ -2239,10 +2239,11 @@ export async function editField(db, assetId, field, value, reason) {
       return { ok: true };
     }
     return { ok: false, error: `field_not_editable:${field}` };
-  } catch (e) {
+  } catch {
     // 磁盘同步失败（或读不到 metadata.json）：回滚 DB，保持 DB 与磁盘一致，回明确错误
     try { rollback(); } catch { /* 回滚失败也如实报错 */ }
-    return { ok: false, error: "disk_sync_failed", message: String((e && e.message) || e).slice(0, 300) };
+    // API 只返回稳定错误码；底层异常可能包含本机路径或堆栈，不跨越 HTTP 边界。
+    return { ok: false, error: "disk_sync_failed" };
   }
 }
 
