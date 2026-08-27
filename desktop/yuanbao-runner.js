@@ -223,7 +223,12 @@ function createYuanbaoRunner({ openStudio, runtimeRoot }) {
           jsonResponse(res, 200, result);
         } catch (error) {
           const message = String(error?.message || error);
-          jsonResponse(res, message.startsWith("waiting_login:") ? 409 : 502, { ok: false, status: message.startsWith("waiting_login:") ? "waiting_login" : "failed", error: message.replace(/^waiting_login:/, "") });
+          const waitingLogin = message.startsWith("waiting_login:");
+          jsonResponse(res, waitingLogin ? 409 : 502, {
+            ok: false,
+            status: waitingLogin ? "waiting_login" : "failed",
+            error: waitingLogin ? "请在织台元宝窗口登录一次" : "yuanbao_bridge_failed",
+          });
         }
         return;
       }

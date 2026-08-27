@@ -4451,11 +4451,14 @@ async function readGitDirtyPaths(repositoryRoot) {
 async function readGitRevision(repositoryRoot) {
   try {
     let gitDirectory = join(repositoryRoot, ".git");
-    const gitMetadata = await stat(gitDirectory);
-    if (gitMetadata.isFile()) {
+    try {
       const pointer = (await readFile(gitDirectory, "utf8")).trim().match(/^gitdir:\s*(.+)$/i)?.[1];
       if (!pointer) return null;
       gitDirectory = resolve(repositoryRoot, pointer);
+    } catch (error) {
+      // Normal repositories expose .git as a directory; linked worktrees expose
+      // it as the small gitdir pointer file handled above.
+      if (!["EISDIR", "EPERM", "EACCES"].includes(error?.code)) throw error;
     }
     const head = (await readFile(join(gitDirectory, "HEAD"), "utf8")).trim();
     if (/^[a-f0-9]{40}$/i.test(head)) return head.toLowerCase();

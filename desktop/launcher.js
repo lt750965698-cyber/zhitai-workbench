@@ -132,34 +132,75 @@ function ensurePrivateDirectory(directory) {
   fs.chmodSync(directory, 0o700);
 }
 
+function openNoFollow(file, flags, mode) {
+  return fs.openSync(file, flags | (fs.constants.O_NOFOLLOW || 0), mode);
+}
+
+function closeQuietly(fd) {
+  if (fd === null || fd === undefined) return;
+  try { fs.closeSync(fd); } catch (_) { /* best effort */ }
+}
+
 function ensureXhsDefaultState() {
   const config = xhsDefaultConfig();
   ensurePrivateDirectory(config.accountsDir);
   ensurePrivateDirectory(config.accountDir);
-  if (!fs.existsSync(config.cookiePath)) {
-    try {
-      if (config.legacyCookiesPath !== config.cookiePath && fs.existsSync(config.legacyCookiesPath)) {
-        fs.copyFileSync(config.legacyCookiesPath, config.cookiePath, fs.constants.COPYFILE_EXCL);
-      } else {
-        fs.writeFileSync(config.cookiePath, "[]\n", { encoding: "utf8", flag: "wx", mode: 0o600 });
+  let cookieCreateFd = null;
+  try {
+    cookieCreateFd = openNoFollow(
+      config.cookiePath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    let initialCookies = "[]\n";
+    if (config.legacyCookiesPath !== config.cookiePath) {
+      let legacyFd = null;
+      try {
+        legacyFd = openNoFollow(config.legacyCookiesPath, fs.constants.O_RDONLY);
+        initialCookies = fs.readFileSync(legacyFd);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      } finally {
+        closeQuietly(legacyFd);
       }
-    } catch (error) {
-      // local-agent 可能同时进行首次迁移；复用原子创建的胜出文件。
-      if (error && error.code !== "EEXIST") throw error;
     }
+    fs.writeFileSync(cookieCreateFd, initialCookies);
+  } catch (error) {
+    // local-agent 可能同时进行首次迁移；复用原子创建的胜出文件。
+    if (error?.code !== "EEXIST") throw error;
+  } finally {
+    closeQuietly(cookieCreateFd);
   }
-  fs.chmodSync(config.cookiePath, 0o600);
-  if (!fs.existsSync(config.tokenPath)) {
-    try {
-      fs.writeFileSync(config.tokenPath, crypto.randomBytes(32).toString("base64url") + "\n", {
-        encoding: "utf8", flag: "wx", mode: 0o600,
-      });
-    } catch (error) {
-      if (error && error.code !== "EEXIST") throw error;
-    }
+  let cookieFd = null;
+  try {
+    cookieFd = openNoFollow(config.cookiePath, fs.constants.O_RDONLY);
+    fs.fchmodSync(cookieFd, 0o600);
+  } finally {
+    closeQuietly(cookieFd);
   }
-  fs.chmodSync(config.tokenPath, 0o600);
-  const token = fs.readFileSync(config.tokenPath, "utf8").trim();
+
+  let tokenCreateFd = null;
+  try {
+    tokenCreateFd = openNoFollow(
+      config.tokenPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    fs.writeFileSync(tokenCreateFd, crypto.randomBytes(32).toString("base64url") + "\n", "utf8");
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  } finally {
+    closeQuietly(tokenCreateFd);
+  }
+  let tokenFd = null;
+  let token = "";
+  try {
+    tokenFd = openNoFollow(config.tokenPath, fs.constants.O_RDONLY);
+    fs.fchmodSync(tokenFd, 0o600);
+    token = fs.readFileSync(tokenFd, "utf8").trim();
+  } finally {
+    closeQuietly(tokenFd);
+  }
   if (!/^[A-Za-z0-9_-]{32,}$/.test(token)) throw new Error("xhs_default_auth_token_invalid");
   return { ...config, token };
 }

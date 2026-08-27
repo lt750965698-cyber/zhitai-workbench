@@ -333,9 +333,9 @@ export async function handleKbRequest({ request, requestUrl, response, sendJson:
       }
       recordEvent("info", "KB_PERFORMANCE_IMPORT", `表现数据已导入 ${id}`);
       sendJson(response, 200, saved, request);
-    } catch (error) {
+    } catch {
       recordEvent("error", "KB_PERFORMANCE_IMPORT", `表现数据导入失败 ${id}`);
-      sendJson(response, 500, { error: "performance_import_failed", message: sanitizeFailureText(error?.message || error) }, request);
+      sendJson(response, 500, { error: "performance_import_failed" }, request);
     }
     return true;
   }
@@ -395,8 +395,8 @@ export async function handleKbRequest({ request, requestUrl, response, sendJson:
       if (!saved.ok) { sendJson(response, saved.status || 400, saved, request); return true; }
       recordEvent("info", "KB_REMAKE_COMPLETE", `复刻成片已写回 ${id}`);
       sendJson(response, 200, saved, request);
-    } catch (error) {
-      sendJson(response, 500, { error: "remake_persist_failed", message: sanitizeFailureText(error?.message || error) }, request);
+    } catch {
+      sendJson(response, 500, { error: "remake_persist_failed" }, request);
     }
     return true;
   }
@@ -424,9 +424,9 @@ export async function handleKbRequest({ request, requestUrl, response, sendJson:
       }
       recordEvent("info", "KB_MEDIA_ANALYSIS", `视频分析已写回 ${id}`);
       sendJson(response, 200, saved, request);
-    } catch (error) {
+    } catch {
       recordEvent("error", "KB_MEDIA_ANALYSIS", `视频分析写回失败 ${id}`);
-      sendJson(response, 500, { error: "analysis_persist_failed", message: sanitizeFailureText(error?.message || error) }, request);
+      sendJson(response, 500, { error: "analysis_persist_failed" }, request);
     }
     return true;
   }
@@ -437,8 +437,8 @@ export async function handleKbRequest({ request, requestUrl, response, sendJson:
     try {
       const saved = await persistExternalVideoPrompt(kbDb, id, json || {});
       sendJson(response, saved.ok ? 200 : (saved.status || 400), saved, request);
-    } catch (error) {
-      sendJson(response, 500, { error: "external_prompt_persist_failed", message: sanitizeFailureText(error?.message || error) }, request);
+    } catch {
+      sendJson(response, 500, { error: "external_prompt_persist_failed" }, request);
     }
     return true;
   }

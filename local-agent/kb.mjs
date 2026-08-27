@@ -16,8 +16,8 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
-import { writeFile, mkdir, stat, copyFile, rm, rename, readFile, readdir } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { writeFile, mkdir, stat, lstat, open, copyFile, rm, rename, readFile, readdir } from "node:fs/promises";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, basename, sep } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -1910,23 +1910,34 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
   // Snapshot the generator output once, then derive every integrity and media
   // decision from that immutable staging copy. The generator may still own or
   // replace final.mp4 while this request runs.
-  try { await copyFile(sourcePath, staging); }
+  try { await copyFile(sourcePath, staging, fsConstants.COPYFILE_EXCL); }
   catch { return { ok: false, status: 404, error: "generated_video_missing" }; }
   let stagingCommitted = false;
+  let stagingHandle = null;
   let sourceStat;
   let media;
   let sha256;
   try {
-    sourceStat = await stat(staging);
+    stagingHandle = await open(staging, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    sourceStat = await stagingHandle.stat();
     if (!sourceStat.isFile() || sourceStat.size < 1024) {
       return { ok: false, status: 400, error: "generated_video_invalid" };
     }
-    sha256 = createHash("sha256").update(await readFile(staging)).digest("hex");
+    sha256 = createHash("sha256").update(await stagingHandle.readFile()).digest("hex");
+    const validatedStat = await stagingHandle.stat();
     try { media = await probeLocalMedia(staging); }
     catch { return { ok: false, status: 400, error: "generated_video_probe_failed" }; }
     if (media.mediaValidation !== "ok") {
       return { ok: false, status: 400, error: `generated_video_${media.mediaValidation || "invalid"}` };
     }
+    const afterProbeStat = await stagingHandle.stat();
+    const stagingPathStat = await lstat(staging);
+    const unchanged = ["dev", "ino", "size", "mtimeMs"]
+      .every((field) => sourceStat[field] === validatedStat[field]
+        && validatedStat[field] === afterProbeStat[field])
+      && ["dev", "ino", "size"]
+        .every((field) => afterProbeStat[field] === stagingPathStat[field]);
+    if (!unchanged) return { ok: false, status: 400, error: "generated_video_integrity_failed" };
     let audioQuality;
     try { audioQuality = JSON.parse(await readFile(resolve(generationRoot, jobId, "audio-quality.json"), "utf8")); }
     catch { return { ok: false, status: 400, error: "generated_video_audio_quality_missing" }; }
@@ -1945,8 +1956,16 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
       };
     }
     await rename(staging, target);
+    const targetPathStat = await lstat(target);
+    const committedStat = await stagingHandle.stat();
+    if (!["dev", "ino", "size", "mtimeMs"].every((field) => committedStat[field] === afterProbeStat[field])
+      || !["dev", "ino", "size"].every((field) => targetPathStat[field] === committedStat[field])) {
+      await rm(target, { force: true }).catch(() => null);
+      return { ok: false, status: 400, error: "generated_video_integrity_failed" };
+    }
     stagingCommitted = true;
   } finally {
+    await stagingHandle?.close().catch(() => null);
     if (!stagingCommitted) await rm(staging, { force: true }).catch(() => null);
   }
   const quality = assessMediaQuality({ ...media, media_validation: media.mediaValidation });
