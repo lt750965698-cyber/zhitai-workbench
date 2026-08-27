@@ -26,6 +26,7 @@ test("notification center creates a private-looking topic and records accepted t
   assert.equal(result.ok, true);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].options.headers.Title, encodeURIComponent("织台手机通知测试"));
+  assert.equal(calls[0].options.redirect, "error");
   const state = await center.publicState();
   assert.equal(state.ready, true);
   assert.equal(state.settings.ntfy.operational, true);

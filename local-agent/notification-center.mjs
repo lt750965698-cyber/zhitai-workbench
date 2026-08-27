@@ -1124,7 +1124,13 @@ export class NotificationCenter {
     if (this.settings.ntfy.accessToken) headers.Authorization = `Bearer ${this.settings.ntfy.accessToken}`;
     let item;
     try {
-      const response = await fetch(endpoint, { method: "POST", headers, body: envelope.message, signal: AbortSignal.timeout(10_000) });
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: envelope.message,
+        redirect: "error",
+        signal: AbortSignal.timeout(10_000),
+      });
       item = {
         id: `ntf_${randomUUID()}`,
         ...shared,

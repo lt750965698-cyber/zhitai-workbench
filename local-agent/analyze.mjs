@@ -198,6 +198,7 @@ async function callYuanbaoCookieChat(prompt, { timeoutMs = 45000 } = {}) {
       method: "POST",
       headers: yuanbaoHeaders(cookie, { "content-type": "application/json" }),
       body: JSON.stringify({ agentId: AGENT_ID }),
+      redirect: "error",
       signal: controller.signal,
     });
     if (!createResp.ok) return null;
@@ -222,6 +223,7 @@ async function callYuanbaoCookieChat(prompt, { timeoutMs = 45000 } = {}) {
       method: "POST",
       headers: yuanbaoHeaders(cookie, { "x-agentid": `${AGENT_ID}/${chatId}` }),
       body: JSON.stringify(body),
+      redirect: "error",
       signal: controller.signal,
     });
     if (!chatResp.ok) return null;
