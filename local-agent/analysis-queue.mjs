@@ -178,11 +178,15 @@ export class AnalysisQueue {
 
   #scheduleDrain(delayMs = 0) {
     if (this.timer) clearTimeout(this.timer);
+    const delay = Math.max(0, delayMs);
     this.timer = setTimeout(() => {
       this.timer = null;
       void this.#drain();
-    }, Math.max(0, delayMs));
-    this.timer.unref?.();
+    }, delay);
+    // A queued job must keep a short-lived process alive long enough to start
+    // its first drain. Only long retry waits are safe to detach: the persisted
+    // retry state can be resumed when the local agent starts again.
+    if (delay > 0) this.timer.unref?.();
   }
 
   async #drain() {

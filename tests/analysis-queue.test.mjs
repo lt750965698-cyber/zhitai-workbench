@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,33 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { AnalysisQueue } from "../local-agent/analysis-queue.mjs";
+
+async function runIsolatedNode(source, { timeoutMs = 3_000 } = {}) {
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const { code, signal } = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error(`isolated node timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("close", (exitCode, exitSignal) => {
+      clearTimeout(timeout);
+      resolve({ code: exitCode, signal: exitSignal });
+    });
+  });
+  return { code, signal, stdout, stderr };
+}
 
 async function waitFor(check, { timeoutMs = 3_000, intervalMs = 10 } = {}) {
   const deadline = Date.now() + timeoutMs;
@@ -16,6 +44,37 @@ async function waitFor(check, { timeoutMs = 3_000, intervalMs = 10 } = {}) {
   }
   throw new Error("analysis queue test timed out");
 }
+
+test("立即排队的任务会保持事件循环存活直到 drain 启动", async () => {
+  const queueModule = new URL("../local-agent/analysis-queue.mjs", import.meta.url).href;
+  const result = await runIsolatedNode(`
+    import { AnalysisQueue } from ${JSON.stringify(queueModule)};
+    import { mkdtemp, rm } from "node:fs/promises";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+
+    const root = await mkdtemp(join(tmpdir(), "zhitai-analysis-liveness-"));
+    try {
+      let resolveCompleted;
+      const completed = new Promise((resolve) => { resolveCompleted = resolve; });
+      const queue = new AnalysisQueue({
+        filePath: join(root, "analysis-jobs.json"),
+        analyze: async () => ({ ok: true }),
+        onEvent: async (kind) => {
+          if (kind === "completed") resolveCompleted();
+        },
+      });
+      await queue.init();
+      await queue.enqueueMany([{ assetId: "asset-liveness", title: "事件循环存活" }]);
+      await completed;
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  `);
+
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+});
 
 test("持久分析队列首次失败进入退避，随后自动重试并成功", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "zhitai-analysis-retry-"));
