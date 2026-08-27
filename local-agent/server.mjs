@@ -19,12 +19,14 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { fileURLToPath } from "node:url";
 import { CHANNELS_PROXY_PAC } from "./channels-proxy-pac.mjs";
 import { DEFAULT_KEYCHAIN_SERVICE, readKeychainSecret } from "./keychain-secret.mjs";
+import { decideInboxAuthentication } from "./inbox-auth.mjs";
 import { downloadChannelsVideo, loadYuanbaoCookie, parseChannelsVideo } from "./channels-yuanbao.mjs";
 import { parseChannelsCard } from "./channels-card.mjs";
 import { analyzeVideo } from "./analyze.mjs";
 import { initKb, handleKbRequest } from "./kb-routes.mjs";
 import { assessMediaQuality, ingestOne as kbIngestOne, openKbDb, sanitizeFailureText } from "./kb.mjs";
 import { isStableShareUrl, canonicalizeSourceUrl, probeLocalMedia, redactUrlForStorage } from "./downloader-adapter.mjs";
+import { downloadSafeImage } from "./safe-image-download.mjs";
 import * as matrix from "./matrixmedia-adapter.mjs";
 import * as xhsPublisher from "./xiaohongshu-publisher.mjs";
 import * as wechatOfficial from "./wechat-official-publisher.mjs";
@@ -130,6 +132,10 @@ let runtimeConditionsTimer = null;
 let creativeReviewMutation = Promise.resolve();
 let runtimeConditionsMutation = Promise.resolve();
 let runtimeConditionsCache = { at: 0, snapshot: null };
+let runtimeConditionsRefreshInFlight = null;
+let runtimeConditionsLastRefreshAt = 0;
+let runtimeConditionsLastRefreshSnapshot = null;
+const RUNTIME_CONDITIONS_REFRESH_COOLDOWN_MS = 15_000;
 
 async function readCreativeReviews() {
   try {
@@ -847,6 +853,22 @@ async function collectRuntimeConditions({ refresh = false, notify = false } = {}
   return snapshot;
 }
 
+async function refreshRuntimeConditions() {
+  if (runtimeConditionsRefreshInFlight) return runtimeConditionsRefreshInFlight;
+  if (runtimeConditionsLastRefreshSnapshot
+    && Date.now() - runtimeConditionsLastRefreshAt < RUNTIME_CONDITIONS_REFRESH_COOLDOWN_MS) {
+    return runtimeConditionsLastRefreshSnapshot;
+  }
+  runtimeConditionsRefreshInFlight = collectRuntimeConditions({ refresh: true, notify: true })
+    .then((snapshot) => {
+      runtimeConditionsLastRefreshAt = Date.now();
+      runtimeConditionsLastRefreshSnapshot = snapshot;
+      return snapshot;
+    })
+    .finally(() => { runtimeConditionsRefreshInFlight = null; });
+  return runtimeConditionsRefreshInFlight;
+}
+
 credentialReminderTimer = setInterval(() => void checkCredentialNotifications().catch(() => {}), 15 * 60_000);
 credentialReminderTimer.unref?.();
 setTimeout(() => void checkCredentialNotifications().catch(() => {}), 5_000).unref?.();
@@ -877,9 +899,9 @@ await remoteController.init();
 
 // 桌面端会额外上报 GPT/豆包真实页面状态；本地节点每 6 小时低频深检
 // 发布账号与公众号权限，并由 ClawBot/ntfy 聚合提醒一次。
-runtimeConditionsTimer = setInterval(() => void collectRuntimeConditions({ refresh: true, notify: true }).catch(() => {}), 6 * 60 * 60_000);
+runtimeConditionsTimer = setInterval(() => void refreshRuntimeConditions().catch(() => {}), 6 * 60 * 60_000);
 runtimeConditionsTimer.unref?.();
-setTimeout(() => void collectRuntimeConditions({ refresh: true, notify: true }).catch(() => {}), 60_000).unref?.();
+setTimeout(() => void refreshRuntimeConditions().catch(() => {}), 60_000).unref?.();
 
 const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
@@ -913,7 +935,7 @@ const server = createServer(async (request, response) => {
         queue: tasks.filter((task) => ["queued", "running", "scheduled"].includes(task.status)).length,
         knowledgeBase: publicKnowledgeBase,
         webhookEnabled: true,
-        inboxMode: config.webhookSecret ? "origin_bound+signature_optional" : "origin_bound",
+        inboxMode: config.webhookSecret ? "signature_required" : "origin_or_loopback",
         webhookSecretSource: config.webhookSecretSource,
         adapters: publicAdapterState(),
         services,
@@ -922,8 +944,15 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/v1/runtime-conditions") {
-      const refresh = requestUrl.searchParams.get("refresh") === "1";
-      const snapshot = await collectRuntimeConditions({ refresh, notify: refresh });
+      const snapshot = await collectRuntimeConditions();
+      sendJson(response, 200, snapshot, request);
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/v1/runtime-conditions/refresh") {
+      if (!guardJsonWrite(request, response)) return;
+      await readJsonBody(request, 1_000);
+      const snapshot = await refreshRuntimeConditions();
       sendJson(response, 200, snapshot, request);
       return;
     }
@@ -941,7 +970,7 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, {
         knowledgeBase: publicKnowledgeBase,
         webhookEnabled: true,
-        inboxMode: config.webhookSecret ? "origin_bound+signature_optional" : "origin_bound",
+        inboxMode: config.webhookSecret ? "signature_required" : "origin_or_loopback",
         webhookSecretSource: config.webhookSecretSource,
         adapters: publicAdapterState(),
         services: await getServiceStates(),
@@ -2174,7 +2203,6 @@ const server = createServer(async (request, response) => {
     await recordEvent("error", "REQUEST", safeMessage(message));
     sendJson(response, status, {
       error: status >= 500 ? "request_failed" : message,
-      ...(status >= 500 ? { message: safeMessage(message) } : {}),
     }, request);
   }
 });
@@ -2392,18 +2420,17 @@ function requireConfirmedAction(request) {
 }
 
 async function guardInbox(request, raw) {
-  // 收件箱采用「来源绑定」而非共享密钥。理由：
-  // 1. 节点只监听 127.0.0.1，外网打不进来；
-  // 2. 唯一现实威胁是浏览器里的第三方网页跨站提交，而 corsHeaders() 只对
-  //    allowedOrigins 回 ACAO，非白名单页面的 JSON POST 在预检阶段就被浏览器拒绝；
-  // 3. 本机进程能直接读密钥文件，HMAC 对它零防御，徒增一次手动粘贴。
-  // 因此：带 Origin 的必须在白名单内；油猴脚本 / 本机 CLI 不带 Origin，直接放行。
-  const origin = request.headers.origin;
-  if (origin && !config.allowedOrigins.includes(origin)) {
-    throw httpError(403, "origin_not_allowed");
-  }
-  // 向后兼容：旧客户端若仍携带签名头且本机留有密钥，照旧走强校验。
-  if (request.headers["x-zhitai-signature"] && config.webhookSecret) {
+  // 配置共享密钥后，所有收件/遥控入口都必须验签；不能通过省略签名头
+  // 降级到 Origin 信任。只有明确未配置密钥时，才允许精确白名单 Origin，
+  // 或无 Origin 且真实 socket 来自回环地址的零配置本机桥。
+  const authentication = decideInboxAuthentication({
+    hasSecret: Boolean(config.webhookSecret),
+    allowedOrigins: config.allowedOrigins,
+    origin: request.headers.origin,
+    remoteAddress: request.socket?.remoteAddress,
+  });
+  if (authentication === "deny") throw httpError(403, "origin_not_allowed");
+  if (authentication === "signature") {
     await verifyWebhook(request, raw);
   }
 }
@@ -3012,12 +3039,11 @@ async function downloadResolvedChannels(task, packageDir, media, channel) {
     },
   });
 
+  let coverPath = null;
   if (media.coverUrl) {
     try {
-      const response = await fetch(media.coverUrl, { headers: { Referer: "https://channels.weixin.qq.com/" } });
-      if (response.ok) {
-        await writeFile(join(stagingDir, "cover.jpg"), Buffer.from(await response.arrayBuffer()));
-      }
+      const cover = await downloadSafeImage(media.coverUrl, stagingDir);
+      coverPath = cover.path;
     } catch {
       /* 封面失败不影响主流程 */
     }
@@ -3030,7 +3056,7 @@ async function downloadResolvedChannels(task, packageDir, media, channel) {
   return {
     title: media.description || saved.filename || "视频号内容",
     author: media.author || "",
-    outputPaths: [saved.path, join(stagingDir, "cover.jpg")],
+    outputPaths: [saved.path, coverPath].filter(Boolean),
     cleanupPaths: [stagingDir],
     category: category || "",
     analysis: analysisMarkdown || "",

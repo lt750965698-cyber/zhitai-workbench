@@ -133,11 +133,12 @@ export async function checkRuntimeConditions(accountIds: string[] = [], refresh 
     return window.zhitaiBridge.checkRuntimeConditions(accountIds.slice(0, 8), refresh);
   }
 
-  const query = refresh ? "?refresh=1" : "";
   const result = await zapi<RuntimeConditionsResponse>(
-    `http://127.0.0.1:17890/api/v1/runtime-conditions${query}`,
-    "GET",
-    undefined,
+    refresh
+      ? "http://127.0.0.1:17890/api/v1/runtime-conditions/refresh"
+      : "http://127.0.0.1:17890/api/v1/runtime-conditions",
+    refresh ? "POST" : "GET",
+    refresh ? {} : undefined,
     { timeoutMs: refresh ? 120_000 : 10_000 },
   );
   if (!result.ok || !result.body) {

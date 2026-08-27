@@ -449,26 +449,52 @@ function formatSchedule(value: string | null): { date: string; time: string } {
   };
 }
 
-function hostnameFromUrl(value: string): string | null {
+function webUrlFromValue(value: string): URL | null {
   if (!value) return null;
   try {
-    return new URL(value).hostname;
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url : null;
   } catch {
     return null;
   }
 }
 
+function hostnameFromUrl(value: string): string | null {
+  const url = webUrlFromValue(value);
+  if (!url || url.username || url.password) return null;
+  return url.hostname.toLowerCase();
+}
+
+function platformFromWebUrl(value: string): Platform | null {
+  const hostname = hostnameFromUrl(value);
+  if (!hostname) return null;
+  if (["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(hostname)) return "X";
+  if (["douyin.com", "www.douyin.com", "v.douyin.com"].includes(hostname)) return "抖音";
+  if (["xiaohongshu.com", "www.xiaohongshu.com", "xhslink.com"].includes(hostname)) return "小红书";
+  if (hostname === "mp.weixin.qq.com") return "公众号";
+  if (hostname === "weixin.qq.com" || hostname === "channels.weixin.qq.com") return "视频号";
+  return null;
+}
+
 function inferPlatform(value: string): Platform {
-  const normalized = value.toLowerCase();
-  if (normalized === "x" || normalized.includes("x.com/") || normalized.includes("twitter.com/")) return "X";
-  if (normalized.includes("抖音")) return "抖音";
-  if (normalized.includes("小红书")) return "小红书";
-  if (normalized.includes("公众号")) return "公众号";
-  if (normalized.includes("视频号")) return "视频号";
-  if (normalized.includes("douyin")) return "抖音";
-  if (normalized.includes("xiaohongshu") || normalized.includes("xhslink")) return "小红书";
-  if (normalized.includes("mp.weixin") || normalized.includes("official_account")) return "公众号";
-  if (normalized.includes("channel") || normalized.includes("finder") || normalized.includes("weixin") || normalized.includes("wechat")) return "视频号";
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  for (const part of parts) {
+    const urlPlatform = platformFromWebUrl(part);
+    if (urlPlatform) return urlPlatform;
+  }
+
+  // URL 已在上方按精确 hostname 处理；其 query/path 不参与平台标签推断。
+  const labels = parts.filter((part) => !webUrlFromValue(part)).map((part) => part.toLowerCase());
+  const labelText = labels.join(" ");
+  const exactLabels = new Set(labels);
+  const identifiers = new Set(labels.flatMap((label) => label.split(/[^a-z0-9]+/).filter(Boolean)));
+  if (exactLabels.has("x") || exactLabels.has("twitter") || exactLabels.has("x-bookmarks") || exactLabels.has("x_bookmarks")) return "X";
+  if (labelText.includes("抖音") || identifiers.has("douyin")) return "抖音";
+  if (labelText.includes("小红书") || identifiers.has("xiaohongshu") || identifiers.has("xhslink")) return "小红书";
+  if (labelText.includes("公众号") || exactLabels.has("mp.weixin") || exactLabels.has("official_account")
+    || exactLabels.has("wechat_official") || exactLabels.has("wechat_official_account")) return "公众号";
+  if (labelText.includes("视频号") || identifiers.has("channel") || identifiers.has("channels")
+    || identifiers.has("finder") || identifiers.has("weixin") || identifiers.has("wechat")) return "视频号";
   return "未知来源";
 }
 

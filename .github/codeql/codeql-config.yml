@@ -1,0 +1,6 @@
+name: "Zhitai CodeQL configuration"
+
+# Test fixtures intentionally exercise hostile URLs, temporary paths, and other
+# negative inputs. Keep the production scan focused on code that ships or runs.
+paths-ignore:
+  - tests/**

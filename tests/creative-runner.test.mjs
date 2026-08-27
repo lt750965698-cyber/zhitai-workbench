@@ -144,14 +144,16 @@ test("今日运行条件深检识别 GPT 和最多 8 个独立豆包账号", asy
 });
 
 test("桌面 IPC 只暴露运行条件检查参数，不传递凭证", async () => {
-  const [mainSource, preloadSource, serverSource] = await Promise.all([
+  const [mainSource, preloadSource, serverSource, zapiSource] = await Promise.all([
     readFile(new URL("../desktop/main.js", import.meta.url), "utf8"),
     readFile(new URL("../desktop/preload.js", import.meta.url), "utf8"),
     readFile(new URL("../local-agent/server.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../app/zapi.ts", import.meta.url), "utf8"),
   ]);
   assert.match(mainSource, /zhitai:runtime-conditions:check/);
   assert.match(mainSource, /runtime-conditions\/creative/);
-  assert.match(mainSource, /runtime-conditions\?refresh=1/);
+  assert.match(mainSource, /runtime-conditions\/refresh/);
+  assert.doesNotMatch(mainSource, /runtime-conditions\?refresh=/);
   assert.match(mainSource, /repairedJob/);
   assert.match(mainSource, /repairedLegacyReference/);
   assert.match(mainSource, /verifiedFixRetryReady/);
@@ -166,6 +168,14 @@ test("桌面 IPC 只暴露运行条件检查参数，不传递凭证", async () 
   assert.match(serverSource, /网页生成需处理/);
   assert.match(serverSource, /authorizedSender === true/);
   assert.match(serverSource, /await notificationCenter\?\.stop\(\)/);
+  assert.match(serverSource, /decideInboxAuthentication\(\{/);
+  assert.match(serverSource, /if \(authentication === "signature"\) \{\s*await verifyWebhook\(request, raw\)/);
+  assert.doesNotMatch(serverSource, /x-zhitai-signature"\]\s*&&\s*config\.webhookSecret/);
+  assert.match(serverSource, /if \(runtimeConditionsRefreshInFlight\) return runtimeConditionsRefreshInFlight/);
+  assert.match(serverSource, /RUNTIME_CONDITIONS_REFRESH_COOLDOWN_MS/);
+  assert.match(zapiSource, /runtime-conditions\/refresh/);
+  assert.match(zapiSource, /refresh \? "POST" : "GET"/);
+  assert.doesNotMatch(zapiSource, /runtime-conditions\$\{query\}|\?refresh=1/);
   assert.match(preloadSource, /checkRuntimeConditions:\s*\(accountIds = \[\], refresh = false\)/);
   assert.doesNotMatch(preloadSource, /cookie|password|secret/i);
 });

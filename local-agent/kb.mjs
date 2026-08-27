@@ -1902,44 +1902,54 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
     || join(RUNTIME_ROOT, "generation"));
   const sourcePath = resolve(generationRoot, jobId, "final.mp4");
   if (!sourcePath.startsWith(`${generationRoot}${sep}`)) return { ok: false, status: 400, error: "invalid_generation_path" };
-  let sourceStat;
-  try { sourceStat = await stat(sourcePath); }
-  catch { return { ok: false, status: 404, error: "generated_video_missing" }; }
-  if (!sourceStat.isFile() || sourceStat.size < 1024) return { ok: false, status: 400, error: "generated_video_invalid" };
-  const sourceBuffer = await readFile(sourcePath);
-  const sourceSha256 = createHash("sha256").update(sourceBuffer).digest("hex");
-  let media;
-  try { media = await probeLocalMedia(sourcePath); }
-  catch { return { ok: false, status: 400, error: "generated_video_probe_failed" }; }
-  if (media.mediaValidation !== "ok") {
-    return { ok: false, status: 400, error: `generated_video_${media.mediaValidation || "invalid"}` };
-  }
-  let audioQuality;
-  try { audioQuality = JSON.parse(await readFile(resolve(generationRoot, jobId, "audio-quality.json"), "utf8")); }
-  catch { return { ok: false, status: 400, error: "generated_video_audio_quality_missing" }; }
-  const audioGate = validateAudioQualityReport(audioQuality, {
-    sizeBytes: sourceStat.size,
-    sha256: sourceSha256,
-    expectedJobId: jobId,
-  });
-  if (!audioGate.ok) {
-    return {
-      ok: false,
-      status: 400,
-      error: audioGate.reason === "integrity"
-        ? "generated_video_integrity_failed"
-        : "generated_video_audio_quality_failed",
-    };
-  }
-  const quality = assessMediaQuality({ ...media, media_validation: media.mediaValidation });
   const outputDir = join(asset.package_path, "remake-output");
   await mkdir(outputDir, { recursive: true });
   const fileName = `zhitai-${match[1]}.mp4`;
   const target = join(outputDir, fileName);
   const staging = `${target}.tmp-${randomUUID()}`;
-  await copyFile(sourcePath, staging);
-  const sha256 = sourceSha256;
-  await rename(staging, target);
+  // Snapshot the generator output once, then derive every integrity and media
+  // decision from that immutable staging copy. The generator may still own or
+  // replace final.mp4 while this request runs.
+  try { await copyFile(sourcePath, staging); }
+  catch { return { ok: false, status: 404, error: "generated_video_missing" }; }
+  let stagingCommitted = false;
+  let sourceStat;
+  let media;
+  let sha256;
+  try {
+    sourceStat = await stat(staging);
+    if (!sourceStat.isFile() || sourceStat.size < 1024) {
+      return { ok: false, status: 400, error: "generated_video_invalid" };
+    }
+    sha256 = createHash("sha256").update(await readFile(staging)).digest("hex");
+    try { media = await probeLocalMedia(staging); }
+    catch { return { ok: false, status: 400, error: "generated_video_probe_failed" }; }
+    if (media.mediaValidation !== "ok") {
+      return { ok: false, status: 400, error: `generated_video_${media.mediaValidation || "invalid"}` };
+    }
+    let audioQuality;
+    try { audioQuality = JSON.parse(await readFile(resolve(generationRoot, jobId, "audio-quality.json"), "utf8")); }
+    catch { return { ok: false, status: 400, error: "generated_video_audio_quality_missing" }; }
+    const audioGate = validateAudioQualityReport(audioQuality, {
+      sizeBytes: sourceStat.size,
+      sha256,
+      expectedJobId: jobId,
+    });
+    if (!audioGate.ok) {
+      return {
+        ok: false,
+        status: 400,
+        error: audioGate.reason === "integrity"
+          ? "generated_video_integrity_failed"
+          : "generated_video_audio_quality_failed",
+      };
+    }
+    await rename(staging, target);
+    stagingCommitted = true;
+  } finally {
+    if (!stagingCommitted) await rm(staging, { force: true }).catch(() => null);
+  }
+  const quality = assessMediaQuality({ ...media, media_validation: media.mediaValidation });
   const now = new Date().toISOString();
   const id = `remake_zhitai_${match[1]}`;
   // 把一键生成真正使用过的 GPT 分镜图、豆包片段、配音/字幕、音频质检和运行记录一起归档，

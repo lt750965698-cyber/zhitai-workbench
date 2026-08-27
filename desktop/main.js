@@ -179,7 +179,11 @@ async function checkRuntimeConditions(accountIds = [], refresh = false) {
       body: creative,
       timeoutMs: 30_000,
     });
-    return localJson("/api/v1/runtime-conditions?refresh=1", { timeoutMs: 120_000 });
+    return localJson("/api/v1/runtime-conditions/refresh", {
+      method: "POST",
+      body: {},
+      timeoutMs: 120_000,
+    });
   })();
   try { return await runtimeConditionsInFlight; }
   finally { runtimeConditionsInFlight = null; }

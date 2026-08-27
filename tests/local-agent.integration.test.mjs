@@ -154,6 +154,7 @@ test("local agent integrates content packages, approval gates, and exclusive ser
     assert.equal(health.body.version, 2);
     assert.equal(health.body.queue, 0);
     assert.equal(health.body.knowledgeBase, publicKnowledgeBase);
+    assert.equal(health.body.inboxMode, "signature_required");
     assert.equal(health.body.adapters.douyin.configured, true);
     assert.equal(health.body.services.xianyu_auto_agent.status, "stopped");
     assert.equal(health.body.services.xianyu_auto_agent.install.state, "ready");
@@ -186,6 +187,13 @@ test("local agent integrates content packages, approval gates, and exclusive ser
   });
 
   await t.test("signed inbox accepts one request and rejects replay or tampering", async () => {
+    const unsigned = await requestJson(baseUrl, "/api/v1/inbox", {
+      method: "POST",
+      body: { text: "https://www.douyin.com/video/unsigned-fixture", source: "openclaw" },
+    });
+    assert.equal(unsigned.response.status, 401);
+    assert.deepEqual(unsigned.body, { error: "invalid_webhook_headers" });
+
     const timestamp = String(Math.floor(Date.now() / 1000));
     const nonce = "fixture_nonce_123456789";
     const body = { text: "https://www.douyin.com/video/webhook-fixture", source: "openclaw" };
@@ -196,6 +204,14 @@ test("local agent integrates content packages, approval gates, and exclusive ser
       "X-Zhitai-Nonce": nonce,
       "X-Zhitai-Signature": signature,
     };
+
+    const wrongOrigin = await requestJson(baseUrl, "/api/v1/inbox", {
+      method: "POST",
+      headers: { ...headers, Origin: "https://attacker.example" },
+      body,
+    });
+    assert.equal(wrongOrigin.response.status, 403);
+    assert.deepEqual(wrongOrigin.body, { error: "origin_not_allowed" });
 
     const accepted = await requestJson(baseUrl, "/api/v1/inbox", { method: "POST", headers, body });
     assert.equal(accepted.response.status, 202);

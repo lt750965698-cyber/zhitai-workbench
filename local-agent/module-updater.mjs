@@ -22,7 +22,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const RUNTIME_ROOT = resolve(process.env.ZHITAI_RUNTIME_ROOT
@@ -56,8 +56,78 @@ async function exists(path) {
 
 function safeRelativePath(value) {
   const raw = String(value || "").replace(/\\/g, "/");
-  if (!raw || raw.startsWith("/") || raw.includes("../") || raw === "..") throw new Error("更新清单包含不安全路径");
+  const segments = raw.split("/");
+  if (!raw || raw.startsWith("/") || segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error("更新清单包含不安全路径");
+  }
   return raw;
+}
+
+function encodedPath(...parts) {
+  return `/${parts.flatMap((part) => String(part).split("/")).map(encodeURIComponent).join("/")}`;
+}
+
+export function requireSha256(value, label = "更新文件") {
+  const match = /^(?:sha256:)?([a-f0-9]{64})$/i.exec(String(value || "").trim());
+  if (!match) throw new Error(`${label} 缺少有效的 SHA-256 校验值`);
+  return match[1].toLowerCase();
+}
+
+/**
+ * Restrict every updater request to the repository and immutable release tag
+ * selected by GitHub's release API. Redirects are accepted only for GitHub's
+ * dedicated release-asset host or the matching codeload endpoint.
+ */
+export function assertTrustedGithubUrl(value, policy, redirect = false) {
+  let url;
+  try { url = new URL(String(value || "")); }
+  catch { throw new Error("更新地址无效"); }
+  if (url.protocol !== "https:" || url.username || url.password || url.port || url.hash) {
+    throw new Error("更新地址不属于受信任的 GitHub Release");
+  }
+  const repo = String(policy?.repo || "");
+  const tag = String(policy?.tag || "");
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !tag || /[/?#]/.test(tag)) {
+    throw new Error("更新器缺少受信任的仓库或版本边界");
+  }
+  const [owner, repository] = repo.split("/");
+  if (policy.kind === "release-asset") {
+    if (!redirect) {
+      const expected = encodedPath(owner, repository, "releases", "download", tag, policy.assetName);
+      if (url.hostname !== "github.com" || url.pathname !== expected || url.search) {
+        throw new Error("Release 资源地址与预期仓库或版本不匹配");
+      }
+    } else if (url.hostname !== "release-assets.githubusercontent.com") {
+      throw new Error("Release 资源发生了非 GitHub 重定向");
+    }
+    return url;
+  }
+  if (policy.kind === "raw-file") {
+    const expected = encodedPath(owner, repository, tag, safeRelativePath(policy.relativePath));
+    if (url.hostname !== "raw.githubusercontent.com" || url.pathname !== expected || url.search) {
+      throw new Error("热更新文件地址与预期仓库、版本或路径不匹配");
+    }
+    return url;
+  }
+  if (policy.kind === "tarball") {
+    const apiPath = encodedPath("repos", owner, repository, "tarball", tag);
+    const archivePath = encodedPath(owner, repository, "archive", "refs", "tags", `${tag}.tar.gz`);
+    const codeloadPaths = new Set([
+      encodedPath(owner, repository, "tar.gz", "refs", "tags", tag),
+      encodedPath(owner, repository, "legacy.tar.gz", "refs", "tags", tag),
+    ]);
+    const matchesInitial = !redirect && (
+      (url.hostname === "api.github.com" && url.pathname === apiPath && !url.search)
+      || (url.hostname === "github.com" && url.pathname === archivePath && !url.search)
+    );
+    const matchesRedirect = redirect
+      && url.hostname === "codeload.github.com"
+      && codeloadPaths.has(url.pathname)
+      && !url.search;
+    if (!matchesInitial && !matchesRedirect) throw new Error("源码归档地址与预期仓库或版本不匹配");
+    return url;
+  }
+  throw new Error("更新器缺少下载地址策略");
 }
 
 function run(command, args, { cwd, timeoutMs = 120_000, allowedCodes = [0] } = {}) {
@@ -131,19 +201,70 @@ function fallbackRelease(moduleId, repo, expectedVersion) {
   return release;
 }
 
-async function download(url, destination, expectedSize = 0) {
-  const response = await fetch(url, {
-    headers: { "User-Agent": "zhitai-module-updater/1" },
-    signal: AbortSignal.timeout(20 * 60_000),
-  });
+async function fetchTrusted(url, policy, timeoutMs = 20 * 60_000) {
+  let current = assertTrustedGithubUrl(url, policy, false);
+  for (let redirects = 0; redirects <= 4; redirects += 1) {
+    const response = await fetch(current, {
+      headers: { "User-Agent": "zhitai-module-updater/1" },
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers.get("location");
+    if (!location || redirects === 4) throw new Error("GitHub 下载重定向无效或过多");
+    current = assertTrustedGithubUrl(new URL(location, current), policy, true);
+  }
+  throw new Error("GitHub 下载重定向过多");
+}
+
+async function download(url, destination, expectedSize = 0, { sha256, policy } = {}) {
+  // GitHub-generated source tarballs currently do not expose a release digest;
+  // all executable assets and hot-update files must have one.
+  const expectedSha256 = sha256
+    ? requireSha256(sha256, "Release 资源")
+    : (policy?.kind === "tarball" ? null : requireSha256(null, "Release 资源"));
+  const response = await fetchTrusted(url, policy);
   if (!response.ok || !response.body) throw new Error(`下载安装包失败（HTTP ${response.status}）`);
   await mkdir(dirname(destination), { recursive: true });
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(destination, { mode: 0o600 }));
-  if (expectedSize > 0) {
+  const digest = createHash("sha256");
+  const hashingStream = new Transform({
+    transform(chunk, _encoding, callback) {
+      digest.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  try {
+    await pipeline(Readable.fromWeb(response.body), hashingStream, createWriteStream(destination, { mode: 0o600 }));
     const size = (await lstat(destination)).size;
-    if (size !== expectedSize) throw new Error(`安装包大小校验失败（期望 ${expectedSize}，实际 ${size}）`);
+    if (expectedSize > 0 && size !== expectedSize) {
+      throw new Error(`安装包大小校验失败（期望 ${expectedSize}，实际 ${size}）`);
+    }
+    const actualSha256 = digest.digest("hex");
+    if (expectedSha256 && actualSha256 !== expectedSha256) throw new Error("Release 资源 SHA-256 校验失败");
+  } catch (error) {
+    await rm(destination, { force: true }).catch(() => null);
+    throw error;
   }
   return destination;
+}
+
+async function fetchVerifiedJsonAsset(asset, policy) {
+  const expectedSize = Number(asset?.size) || 0;
+  if (expectedSize < 2 || expectedSize > 2 * 1024 * 1024) throw new Error("热更新清单大小不合理");
+  const workspace = await prepareWorkspace("manifest");
+  const destination = join(workspace, "release-manifest.json");
+  try {
+    await download(asset?.browser_download_url, destination, expectedSize, {
+      sha256: asset?.digest,
+      policy,
+    });
+    return JSON.parse(await readFile(destination, "utf8"));
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error("官方热更新清单不是有效 JSON");
+    throw error;
+  } finally {
+    await rm(workspace, { recursive: true, force: true }).catch(() => null);
+  }
 }
 
 async function prepareWorkspace(moduleId) {
@@ -201,12 +322,23 @@ async function installMatrixMedia(release, expectedVersion) {
   const version = await assertExpectedRelease(release, expectedVersion);
   const asset = chooseReleaseAsset("matrixmedia", release);
   if (!asset?.browser_download_url) throw new Error("官方 Release 中没有适用于本机的 MatrixMedia 安装包");
+  const tag = String(release.tag_name || "");
+  const assetName = String(asset.name || "");
+  if (basename(assetName) !== assetName) throw new Error("MatrixMedia Release 资源名称无效");
   const workspace = await prepareWorkspace("matrixmedia");
-  const dmg = join(workspace, asset.name);
+  const dmg = join(workspace, assetName);
   const mount = join(workspace, "mount");
   const staged = join(workspace, "matrixmedia.app");
   await mkdir(mount, { recursive: true });
-  await download(asset.browser_download_url, dmg, Number(asset.size) || 0);
+  await download(asset.browser_download_url, dmg, Number(asset.size) || 0, {
+    sha256: asset.digest,
+    policy: {
+      kind: "release-asset",
+      repo: MODULES.matrixmedia.repo,
+      tag,
+      assetName,
+    },
+  });
   let mounted = false;
   try {
     await run("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmg], { timeoutMs: 120_000 });
@@ -273,11 +405,15 @@ async function npmCliPath() {
 async function installSourceModule(moduleId, release, expectedVersion) {
   const version = await assertExpectedRelease(release, expectedVersion);
   if (!release?.tarball_url) throw new Error("官方 Release 没有源码安装包");
+  const tag = String(release.tag_name || "");
+  const repo = MODULES[moduleId]?.repo;
   const workspace = await prepareWorkspace(moduleId);
   const archive = join(workspace, "source.tar.gz");
   const staged = join(workspace, "source");
   await mkdir(staged, { recursive: true });
-  await download(release.tarball_url, archive);
+  await download(release.tarball_url, archive, 0, {
+    policy: { kind: "tarball", repo, tag },
+  });
   await run("/usr/bin/tar", ["-xzf", archive, "-C", staged, "--strip-components", "1"], { timeoutMs: 120_000 });
 
   if (moduleId === "mcp-video-analyzer") {
@@ -339,7 +475,15 @@ async function installXianyu(release, expectedVersion) {
   const version = await assertExpectedRelease(release, expectedVersion);
   const asset = chooseReleaseAsset("xianyu-auto-reply", release);
   if (!asset?.browser_download_url) throw new Error("官方 Release 没有热更新清单");
-  const manifest = await fetchJson(asset.browser_download_url);
+  const repo = MODULES["xianyu-auto-reply"].repo;
+  const tag = String(release.tag_name || "");
+  const manifest = await fetchVerifiedJsonAsset(asset, {
+    kind: "release-asset",
+    repo,
+    tag,
+    assetName: "update_files.json",
+  });
+  if (normalizedVersion(manifest?.version) !== version) throw new Error("热更新清单版本与 GitHub Release 不一致");
   const files = Array.isArray(manifest?.files) ? manifest.files : [];
   if (!files.length) throw new Error("官方热更新清单为空");
   const workspace = await prepareWorkspace("xianyu-auto-reply");
@@ -349,11 +493,10 @@ async function installXianyu(release, expectedVersion) {
   for (const item of files) {
     const relative = safeRelativePath(item?.path);
     const staged = join(workspace, "files", relative);
-    await download(String(item?.download_url || ""), staged, Number(item?.size) || 0);
-    if (item?.md5) {
-      const digest = createHash("md5").update(await readFile(staged)).digest("hex");
-      if (digest !== String(item.md5).toLowerCase()) throw new Error(`文件校验失败：${relative}`);
-    }
+    await download(String(item?.download_url || ""), staged, Number(item?.size) || 0, {
+      sha256: item?.sha256,
+      policy: { kind: "raw-file", repo, tag, relativePath: relative },
+    });
     stagedRows.push({ relative, staged });
   }
   const changed = [];

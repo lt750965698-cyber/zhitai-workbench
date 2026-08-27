@@ -2,7 +2,22 @@
 "use strict";
 
 const AGENT = "http://127.0.0.1:17890";
+const X_BOOKMARKS_URL = "https://x.com/i/bookmarks";
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isXBookmarksUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    const allowedOrigins = new Set(["https://x.com", "https://www.x.com"]);
+    const isBookmarksPath = url.pathname === "/i/bookmarks" || url.pathname === "/i/bookmarks/";
+    return allowedOrigins.has(url.origin)
+      && !url.username
+      && !url.password
+      && isBookmarksPath;
+  } catch {
+    return false;
+  }
+}
 
 async function waitForLoad(window, timeoutMs = 30_000) {
   const started = Date.now();
@@ -79,8 +94,8 @@ function createXBookmarkRunner({ openStudio }) {
         if (interactive) { window.show(); window.focus(); }
         return { ok: false, status: "waiting_login", error: "请在织台的 X 收藏窗口登录一次" };
       }
-      if (!/x\.com\/(?:i\/bookmarks)?/i.test(currentUrl)) {
-        await window.loadURL("https://x.com/i/bookmarks");
+      if (!isXBookmarksUrl(currentUrl)) {
+        await window.loadURL(X_BOOKMARKS_URL);
         await waitForLoad(window);
       }
       const items = await collectVisibleBookmarks(window).catch(() => []);
@@ -110,5 +125,4 @@ function createXBookmarkRunner({ openStudio }) {
   return { sync };
 }
 
-module.exports = { createXBookmarkRunner };
-
+module.exports = { createXBookmarkRunner, isXBookmarksUrl };

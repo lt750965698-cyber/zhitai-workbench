@@ -176,7 +176,7 @@ test("桌面代理不会把 Content-Type 大小写重复合并成 HTTP 415", asy
   const result = await proxyRequest({
     url: "http://127.0.0.1:17890/api/v1/publisher/wechat-official/credentials",
     method: "POST",
-    body: { appId: "wx0000000000000000", appSecret: "0".repeat(32) },
+    body: { appId: `wx${"0".repeat(16)}`, appSecret: "0".repeat(32) },
     headers: { "Content-Type": "application/json" },
   }, fetchImpl);
   assert.equal(result.ok, true);

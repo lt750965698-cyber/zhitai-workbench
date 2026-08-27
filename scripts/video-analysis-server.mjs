@@ -60,21 +60,38 @@ const VIDEO_EXT = new Set([".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi", ".fl
 
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
+  const corsHeaders = res.zhitaiCorsOrigin ? {
+    "Access-Control-Allow-Origin": res.zhitaiCorsOrigin,
+    Vary: "Origin",
+  } : {};
   res.writeHead(code, {
     "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Cache-Control": "no-store",
+    ...corsHeaders,
   });
   res.end(body);
+}
+
+function allowedLoopbackOrigin(value) {
+  if (!value) return null;
+  let origin;
+  try { origin = new URL(String(value)); }
+  catch { return null; }
+  const loopback = origin.hostname === "localhost"
+    || origin.hostname === "127.0.0.1"
+    || origin.hostname === "[::1]";
+  return loopback && ["http:", "https:"].includes(origin.protocol) && origin.origin === value
+    ? origin.origin
+    : null;
 }
 
 function resolveVideoPath(input) {
   if (typeof input !== "string" || !input.trim()) return { error: "缺少 videoPath 参数" };
   const expanded = input.replace(/^~(?=\/)/, os.homedir());
   const abs = path.resolve(expanded);
-  if (!abs.startsWith(path.resolve(KB_ROOT))) return { error: "只允许分析内容库内的视频（" + KB_ROOT + "）" };
+  if (!abs.startsWith(path.resolve(KB_ROOT))) return { error: "只允许分析内容库内的视频" };
   const ext = path.extname(abs).toLowerCase();
   if (!VIDEO_EXT.has(ext)) return { error: "不支持的文件类型：" + (ext || "无扩展名") };
   return { abs };
@@ -89,11 +106,10 @@ async function downloadVideoById(videoId) {
   let response;
   try {
     response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-  } catch (cause) {
-    throw new Error("下载视频失败（本地节点 17890 不可达）：" + (cause instanceof Error ? cause.message : String(cause)));
+  } catch {
+    throw new Error("local_agent_unavailable");
   }
-  if (!response.ok) throw new Error(`下载视频失败：本地节点返回 HTTP ${response.status}（videoId=${videoId}）`);
-  if (!response.body) throw new Error("下载视频失败：媒体响应没有内容");
+  if (!response.ok || !response.body) throw new Error("media_download_failed");
   fs.mkdirSync(TMP_DIR, { recursive: true });
   const safeId = String(videoId).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
   const file = path.join(TMP_DIR, `${safeId}.mp4`);
@@ -104,11 +120,9 @@ async function downloadVideoById(videoId) {
       writer.on("finish", resolve);
       writer.on("error", reject);
     });
-  } catch (cause) {
-    throw new Error("下载视频失败（写入临时文件出错）：" + (cause instanceof Error ? cause.message : String(cause)));
-  }
+  } catch { throw new Error("media_download_failed"); }
   const size = fs.statSync(file).size;
-  if (size < 1024) throw new Error("下载的视频文件过小（" + size + " 字节），可能不是有效媒体，请确认该视频可播放");
+  if (size < 1024) throw new Error("media_download_invalid");
   return file;
 }
 
@@ -801,10 +815,17 @@ async function runExternalVideoReverse(input) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://" + HOST + ":" + PORT);
+  const requestOrigin = String(req.headers.origin || "");
+  const corsOrigin = allowedLoopbackOrigin(requestOrigin);
+  if (requestOrigin && !corsOrigin) {
+    sendJson(res, 403, { ok: false, error: "origin_not_allowed" });
+    return;
+  }
+  res.zhitaiCorsOrigin = corsOrigin;
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      ...(corsOrigin ? { "Access-Control-Allow-Origin": corsOrigin, Vary: "Origin" } : {}),
       "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     });
@@ -819,7 +840,6 @@ const server = http.createServer((req, res) => {
       service: "zhitai-video-analysis-proxy",
       analyzer: "mcp-video-analyzer",
       analyzerReady,
-      analyzerPath: ANALYZER_CLI,
       note: analyzerReady ? "可分析：转写/关键帧/OCR/媒体元数据" : "mcp-video-analyzer 未安装，等待配置",
       whisperReady: fs.existsSync(WHISPER_BIN),
       whisperXReady: fs.existsSync(WHISPERX_BIN),
@@ -838,7 +858,7 @@ const server = http.createServer((req, res) => {
     readRequestJson(req, 100_000)
       .then((input) => runExternalVideoReverse(input))
       .then((payload) => sendJson(res, 200, payload))
-      .catch((cause) => sendJson(res, 502, { ok: false, error: cause instanceof Error ? cause.message : String(cause) }));
+      .catch(() => sendJson(res, 502, { ok: false, error: "external_analysis_failed" }));
     return;
   }
 
@@ -846,9 +866,9 @@ const server = http.createServer((req, res) => {
     readRequestJson(req)
       .then((input) => submitRemake(input))
       .then((payload) => sendJson(res, 202, payload))
-      .catch((cause) => sendJson(res, 502, {
+      .catch(() => sendJson(res, 502, {
         ok: false,
-        error: `复刻生成任务创建失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        error: "remake_submission_failed",
       }));
     return;
   }
@@ -861,9 +881,9 @@ const server = http.createServer((req, res) => {
       url.searchParams.get("subject") || "",
     )
       .then((payload) => sendJson(res, 200, payload))
-      .catch((cause) => sendJson(res, 502, {
+      .catch(() => sendJson(res, 502, {
         ok: false,
-        error: `读取复刻任务失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        error: "remake_status_failed",
       }));
     return;
   }
@@ -878,7 +898,7 @@ const server = http.createServer((req, res) => {
       if (err) { sendJson(res, 404, { ok: false, error: "帧文件不存在或已清理" }); return; }
       res.writeHead(200, {
         "Content-Type": "image/jpeg",
-        "Access-Control-Allow-Origin": "*",
+        ...(corsOrigin ? { "Access-Control-Allow-Origin": corsOrigin, Vary: "Origin" } : {}),
         "Cache-Control": "no-store",
       });
       res.end(data);
@@ -904,7 +924,12 @@ const server = http.createServer((req, res) => {
           sourceTitle = String(sourceDetail?.asset?.title || "").trim() || null;
           videoPath = await downloadVideoById(source);
         } catch (cause) {
-          sendJson(res, 502, { ok: false, error: cause instanceof Error ? cause.message : String(cause) });
+          const code = cause instanceof Error && [
+            "local_agent_unavailable",
+            "media_download_failed",
+            "media_download_invalid",
+          ].includes(cause.message) ? cause.message : "media_download_failed";
+          sendJson(res, 502, { ok: false, error: code });
           return;
         }
       } else if (typeof input.videoPath === "string" && input.videoPath.trim()) {
@@ -922,7 +947,7 @@ const server = http.createServer((req, res) => {
           const [visionFrames, sceneDetection, whisperX, audioAnalysis] = await Promise.all([
             runVisionAnalysis(result.frames),
             runSceneDetection(videoPath),
-            runWhisperX(videoPath).catch((error) => ({ status: "unavailable", provider: "WhisperX", segments: [], words: [], diarization: "unavailable", note: error.message })),
+            runWhisperX(videoPath).catch(() => ({ status: "unavailable", provider: "WhisperX", segments: [], words: [], diarization: "unavailable", note: "whisperx_unavailable" })),
             runAudioAnalysis(videoPath),
           ]);
           result.visionFrames = visionFrames;
@@ -955,7 +980,7 @@ const server = http.createServer((req, res) => {
           try {
             if (typeof input.videoId === "string" && input.videoId.trim()) {
               try { persisted = await persistAnalysis(input.videoId.trim(), result, remakePlan); }
-              catch (cause) { persistWarning = `分析完成，但写回知识库失败：${cause instanceof Error ? cause.message : String(cause)}`; }
+              catch { persistWarning = "分析完成，但写回知识库失败（persistence_failed）"; }
             }
           } finally {
             if (audioAnalysis?.cleanupDir) await fs.promises.rm(audioAnalysis.cleanupDir, { recursive: true, force: true }).catch(() => {});
@@ -974,7 +999,7 @@ const server = http.createServer((req, res) => {
             persistWarning,
           });
         })
-        .catch((e) => sendJson(res, 502, { ok: false, error: e.message }));
+        .catch(() => sendJson(res, 502, { ok: false, error: "analysis_failed" }));
     });
     return;
   }

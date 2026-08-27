@@ -12,6 +12,21 @@ const BRIDGE_PORT = 17910;
 const YUANBAO_ORIGIN = "https://yuanbao.tencent.com";
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function isYuanbaoStudioUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    const expectedOrigin = new URL(YUANBAO_ORIGIN).origin;
+    const isChatPath = url.pathname === "/" || url.pathname === "/chat" || url.pathname.startsWith("/chat/");
+    return url.origin === expectedOrigin
+      && url.hostname === "yuanbao.tencent.com"
+      && !url.username
+      && !url.password
+      && isChatPath;
+  } catch {
+    return false;
+  }
+}
+
 function jsonResponse(res, status, value) {
   const body = JSON.stringify(value);
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
@@ -100,9 +115,9 @@ function createYuanbaoRunner({ openStudio, runtimeRoot }) {
       void seedSavedCookies(ses).then((seeded) => {
         if (!seeded || window.isDestroyed()) return;
         const refresh = () => {
-          if (!window.isDestroyed() && window.webContents.getURL().startsWith(YUANBAO_ORIGIN)) {
-            window.webContents.reloadIgnoringCache();
-          }
+          if (window.isDestroyed()) return;
+          if (isYuanbaoStudioUrl(window.webContents.getURL())) window.webContents.reloadIgnoringCache();
+          else void window.loadURL(`${YUANBAO_ORIGIN}/chat/${AGENT_ID}`).catch(() => {});
         };
         if (window.webContents.isLoading()) window.webContents.once("did-finish-load", () => setTimeout(refresh, 150));
         else setTimeout(refresh, 150);
@@ -140,7 +155,7 @@ function createYuanbaoRunner({ openStudio, runtimeRoot }) {
     if (captured?.["x-uskey"] && Date.now() - capturedAt < 5 * 60_000) {
       return { headers: captured, window };
     }
-    if (!window.webContents.getURL().startsWith(YUANBAO_ORIGIN)) {
+    if (!isYuanbaoStudioUrl(window.webContents.getURL())) {
       await window.loadURL(`${YUANBAO_ORIGIN}/chat/${AGENT_ID}`);
     } else {
       window.webContents.reloadIgnoringCache();
@@ -225,4 +240,4 @@ function createYuanbaoRunner({ openStudio, runtimeRoot }) {
   return { attach, call, startBridge, stopBridge };
 }
 
-module.exports = { createYuanbaoRunner };
+module.exports = { createYuanbaoRunner, isYuanbaoStudioUrl };

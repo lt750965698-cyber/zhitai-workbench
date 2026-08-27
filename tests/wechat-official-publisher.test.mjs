@@ -12,10 +12,12 @@ import {
 } from "../local-agent/wechat-official-accounts.mjs";
 import { createWechatOfficialPublisher } from "../local-agent/wechat-official-publisher.mjs";
 
-const APP_ID = "wx1234567890abcdef";
-const APP_SECRET = ["01234567", "89abcdef", "01234567", "89abcdef"].join("");
-const APP_ID_B = "wxabcdef1234567890";
-const APP_SECRET_B = ["abcdef01", "23456789", "abcdef01", "23456789"].join("");
+// Deterministic all-zero/all-f fixtures satisfy format validation but cannot
+// be mistaken for credentials issued by WeChat.
+const APP_ID = `wx${"0".repeat(16)}`;
+const APP_SECRET = "0".repeat(32);
+const APP_ID_B = `wx${"f".repeat(16)}`;
+const APP_SECRET_B = "f".repeat(32);
 
 function harness({ legacy = true } = {}) {
   const root = mkdtempSync(join(tmpdir(), "zhitai-wechat-accounts-"));

@@ -56,12 +56,50 @@
   }
 
   function readXmlValues(xml, tag) {
+    if (!/^[A-Za-z][A-Za-z0-9:_-]*$/.test(String(tag || ""))) return [];
     var out = [];
-    var re = new RegExp("<" + tag + "(?:\\s[^>]*)?>([\\s\\S]*?)<\\/" + tag + ">", "gi");
-    var match;
-    while ((match = re.exec(xml)) !== null) {
-      var value = String(match[1] || "").replace(/<[^>]+>/g, "").trim();
-      if (value) out.push(value);
+    try {
+      var doc = new DOMParser().parseFromString(String(xml || ""), "text/xml");
+      var parseErrors = doc.getElementsByTagName("parsererror");
+      var nodes = doc.getElementsByTagName(tag);
+      if (!parseErrors.length && nodes.length) {
+        for (var i = 0; i < nodes.length; i++) {
+          var parsedValue = String(nodes[i].textContent || "").trim();
+          if (parsedValue) out.push(parsedValue);
+        }
+        return out;
+      }
+    } catch (e) { /* 回退到不执行标记的字符扫描器 */ }
+
+    var source = String(xml || "");
+    var lower = source.toLowerCase();
+    var openPrefix = "<" + String(tag).toLowerCase();
+    var closeTag = "</" + String(tag).toLowerCase() + ">";
+    var cursor = 0;
+    while (cursor < source.length) {
+      var openAt = lower.indexOf(openPrefix, cursor);
+      if (openAt === -1) break;
+      var afterName = lower.charAt(openAt + openPrefix.length);
+      if (afterName !== ">" && !/\s/.test(afterName)) {
+        cursor = openAt + openPrefix.length;
+        continue;
+      }
+      var contentAt = lower.indexOf(">", openAt + openPrefix.length);
+      if (contentAt === -1) break;
+      var closeAt = lower.indexOf(closeTag, contentAt + 1);
+      if (closeAt === -1) break;
+      var rawValue = source.slice(contentAt + 1, closeAt);
+      var plainValue = "";
+      var insideTag = false;
+      for (var j = 0; j < rawValue.length; j++) {
+        var character = rawValue.charAt(j);
+        if (character === "<") { insideTag = true; continue; }
+        if (insideTag && character === ">") { insideTag = false; continue; }
+        if (!insideTag) plainValue += character;
+      }
+      plainValue = plainValue.trim();
+      if (plainValue) out.push(plainValue);
+      cursor = closeAt + closeTag.length;
     }
     return out;
   }
@@ -101,11 +139,17 @@
 
   /** 稳定分享 host 白名单（spD.u 回退用）：微信 sph/s/sf、视频号 mobile/sf、抖音短链、小红书短链 */
   function isStableShareHost(u) {
-    if (typeof u !== "string" || !/^https?:\/\//i.test(u)) return false;
-    return /weixin\.qq\.com\/(sph|s|sf)\//i.test(u)
-      || /channels\.weixin\.qq\.com\/mobile\/sf\//i.test(u)
-      || /v\.douyin\.com\//i.test(u)
-      || /xhslink\.com\//i.test(u);
+    if (typeof u !== "string") return false;
+    var url;
+    try { url = new URL(u); } catch (e) { return false; }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    if (url.username || url.password || url.port) return false;
+    var host = url.hostname.toLowerCase();
+    var pathname = url.pathname;
+    if (host === "weixin.qq.com") return /^\/(?:sph|s|sf)\/[^/]+/i.test(pathname);
+    if (host === "channels.weixin.qq.com") return /^\/mobile\/sf\/[^/]+/i.test(pathname);
+    if (host === "v.douyin.com" || host === "xhslink.com") return pathname.charAt(0) === "/";
+    return false;
   }
 
   /** 安全 atob 解码 spD.u 作为稳定源 URL 回退：u 可能是 ba() 的 base64 结果，或已是分享 URL。
@@ -130,8 +174,8 @@
     try { doc = parser.parseFromString(c, "text/xml"); } catch (e) { return null; }
     var urls = doc.getElementsByTagName("url");
     for (var i = 0; i < urls.length; i++) {
-      var u = (urls[i].textContent || "").replace(/^.*:/, "https:").trim();
-      if (/^https?:\/\//i.test(u) && isStableShareHost(u)) return u;
+      var u = String(urls[i].textContent || "").trim();
+      if (isStableShareHost(u)) return u;
     }
     return null;
   }
@@ -548,8 +592,10 @@
       collectReports: collectReports,
       collectCardCandidates: collectCardCandidates,
       extractCardFromSpdItem: extractCardFromSpdItem,
+      readXmlValues: readXmlValues,
       extractSourceUrl: extractSourceUrl,
       resolveSpdU: resolveSpdU,
+      isStableShareHost: isStableShareHost,
       isTerminalStatus: isTerminalStatus,
       isReportedSuccess: isReportedSuccess,
       pollUntilTerminal: pollUntilTerminal,

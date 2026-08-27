@@ -60,5 +60,7 @@ test("发布页把小红书错误和重试留在账号卡片内", () => {
 
 test("发布页顶部运行条件有真实本地接口，不再裸露 404", () => {
   assert.match(serverSrc, /requestUrl\.pathname === "\/api\/v1\/runtime-conditions"/);
-  assert.match(serverSrc, /collectRuntimeConditions\(\{ refresh, notify: refresh \}\)/);
+  assert.match(serverSrc, /requestUrl\.pathname === "\/api\/v1\/runtime-conditions\/refresh"/);
+  assert.match(serverSrc, /const snapshot = await refreshRuntimeConditions\(\)/);
+  assert.doesNotMatch(serverSrc, /searchParams\.get\("refresh"\).*collectRuntimeConditions/);
 });
