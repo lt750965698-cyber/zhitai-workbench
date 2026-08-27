@@ -108,7 +108,12 @@ function validTime(value, fallback) {
 
 function cleanServer(value) {
   const parsed = new URL(String(value || "https://ntfy.sh"));
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("notification_server_invalid");
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const loopback = ["localhost", "127.0.0.1", "::1"].includes(hostname);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    throw new Error("notification_server_https_required");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error("notification_server_invalid");
   return parsed.toString().replace(/\/$/, "");
 }
 

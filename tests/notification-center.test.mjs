@@ -484,6 +484,23 @@ test("invalid saved notification settings fall back safely without blocking init
   assert.equal(state.storage.degraded, true);
 });
 
+test("ntfy 凭据只允许发往 HTTPS 或真实回环地址，且不跟随重定向", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-secure-server-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const center = new NotificationCenter({ dataDir, buildDigest: async () => "摘要" });
+  await center.init();
+  await assert.rejects(
+    () => center.update({ ntfy: { server: "http://192.168.1.10:8080" } }),
+    /notification_server_https_required/,
+  );
+  await assert.rejects(
+    () => center.update({ ntfy: { server: "https://user:secret@notify.example.com" } }),
+    /notification_server_invalid/,
+  );
+  const updated = await center.update({ ntfy: { server: "http://127.0.0.1:8080" } });
+  assert.equal(updated.settings.ntfy.server, "http://127.0.0.1:8080");
+});
+
 test("configured ntfy is unverified until accepted and becomes non-operational after a failed probe", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-ntfy-health-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
