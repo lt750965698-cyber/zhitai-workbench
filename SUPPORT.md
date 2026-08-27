@@ -7,6 +7,7 @@
 - 可复现缺陷：提交 **Bug report** Issue；
 - 使用与配置问题：提交 **Question** Issue 或使用 Discussions；
 - 功能建议：提交 **Feature request** Issue；
+- 文档错误：提交 **Documentation** Issue；
 - 安全漏洞：使用仓库的 **Private vulnerability reporting**，不要公开披露；
 - 行为与参与规则：参阅 [贡献指南](CONTRIBUTING.md) 和 [社区行为准则](CODE_OF_CONDUCT.md)。
 
@@ -16,8 +17,9 @@
 
 - 织台版本、提交 SHA 或 Release 标签；
 - macOS 版本，以及 Node.js、pnpm 和 Electron 版本；
+- 使用 Web 页面还是 Electron 桌面外壳；
 - 最小复现步骤、预期行为与实际行为；
-- 涉及模块及其是否为外置引擎；
+- 涉及模块及其是否为外置引擎；如是，请提供名称和固定版本；
 - 已脱敏的错误码、相关日志片段和测试结果。
 
 请把复现缩小到虚构账号、测试素材和临时目录。不要上传完整配置、数据库、浏览器资料、真实内容包或诊断归档。
