@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import audio from "../desktop/audio-postprocessor.js";
@@ -147,6 +147,14 @@ test("Edge TTS 字幕必须按顺序反读，规范化后与选中旁白严格�
       verifiedSynthesizedNarration(subtitlePath, "厨房改造先统一动线和光线。"),
       /与选中旁白不一致/,
     );
+    if (process.platform !== "win32") {
+      const linkedSubtitlePath = join(directory, "linked-subtitles.srt");
+      await symlink(subtitlePath, linkedSubtitlePath);
+      await assert.rejects(
+        verifiedSynthesizedNarration(linkedSubtitlePath, "厨房改造先统一 动线、收纳和光线。"),
+        /本地字幕证据/,
+      );
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

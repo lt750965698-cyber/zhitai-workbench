@@ -2,6 +2,7 @@
 "use strict";
 
 const fsp = require("node:fs/promises");
+const fsConstants = require("node:fs").constants;
 const { createHash, randomUUID } = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
@@ -107,11 +108,33 @@ function parseEdgeTtsSrt(value) {
 }
 
 async function verifiedSynthesizedNarration(subtitlePath, expectedNarration) {
-  const stat = await fsp.lstat(subtitlePath).catch(() => null);
-  if (!stat?.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > MAX_SUBTITLE_BYTES) {
+  let handle;
+  let bytes;
+  try {
+    handle = await fsp.open(subtitlePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const before = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(subtitlePath, { bigint: true });
+    if (!before.isFile() || before.size < 1n || before.size > BigInt(MAX_SUBTITLE_BYTES)
+      || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+      || before.dev !== namedBefore.dev || before.ino !== namedBefore.ino) {
+      throw new Error("subtitle_not_regular");
+    }
+    bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(subtitlePath, { bigint: true });
+    if (!after.isFile() || !namedAfter.isFile() || namedAfter.isSymbolicLink()
+      || before.dev !== after.dev || before.ino !== after.ino
+      || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs
+      || after.dev !== namedAfter.dev || after.ino !== namedAfter.ino
+      || after.size !== namedAfter.size || after.mtimeNs !== namedAfter.mtimeNs
+      || BigInt(bytes.length) !== after.size) {
+      throw new Error("subtitle_changed_during_read");
+    }
+  } catch {
     throw new Error("Edge TTS 没有生成大小合规的本地字幕证据");
+  } finally {
+    await handle?.close().catch(() => {});
   }
-  const bytes = await fsp.readFile(subtitlePath);
   let subtitle;
   try { subtitle = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { throw new Error("Edge TTS 字幕不是有效 UTF-8"); }
