@@ -256,14 +256,25 @@ test("local agent integrates content packages, approval gates, and exclusive ser
   });
 
   await t.test("视频号可用性探针与卡片解析共用配置的自定义引擎端口", async () => {
+    const body = {
+      objectId: "14950209185632029317",
+      nonceId: "custom_port_nonce_1",
+      title: "自定义端口卡片",
+      source: "fixture",
+    };
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const nonce = "channels_card_custom_port_123456";
+    const signature = `v1=${createHmac("sha256", webhookSecret)
+      .update(`${timestamp}.${nonce}.${JSON.stringify(body)}`)
+      .digest("hex")}`;
     const created = await requestJson(baseUrl, "/api/v1/channels/card", {
       method: "POST",
-      body: {
-        objectId: "14950209185632029317",
-        nonceId: "custom_port_nonce_1",
-        title: "自定义端口卡片",
-        source: "fixture",
+      headers: {
+        "X-Zhitai-Timestamp": timestamp,
+        "X-Zhitai-Nonce": nonce,
+        "X-Zhitai-Signature": signature,
       },
+      body,
     });
     assert.equal(created.response.status, 202);
     const completed = await waitFor(async () => {
