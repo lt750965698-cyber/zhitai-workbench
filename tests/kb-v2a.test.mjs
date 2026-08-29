@@ -22,28 +22,31 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, copyFile, readFile, rm, readdir, stat as fsStat } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, copyFile, readFile, rm, readdir, stat as fsStat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer as createHttpServer } from "node:http";
 import { createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
-const MOOV_AT_END_MP4 = join(testsDir, "fixtures", "media", "sample-moov-at-end.mp4");
 const WATCHABLE_MP4 = join(testsDir, "fixtures", "media", "sample-watchable.mp4");
-const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
+const BASE_MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
-const ROOT = join(tmpdir(), `kb_v2a_test_${Date.now()}`);
+const ROOT = await mkdtemp(join(tmpdir(), "kb_v2a_test_"));
+const MOCK_ENRICH = join(ROOT, "mock-enrich-pathname.mjs");
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "real.mp4");
 const WATCH_DIR = join(ROOT, "watch-kuaidian");
 const WATCH_DIR2 = join(ROOT, "watch-mandian");
+const TEMP_HOME = join(ROOT, "home");
+const TEMP_APPDATA = join(TEMP_HOME, "AppData", "Roaming");
+const TEMP_LOCALAPPDATA = join(TEMP_HOME, "AppData", "Local");
 
 let server;
 let baseUrl;
@@ -86,7 +89,19 @@ before(async () => {
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(WATCH_DIR, { recursive: true });
   await mkdir(WATCH_DIR2, { recursive: true });
-  await copyFile(TEST_MP4, SANDBOX_MP4);
+  await mkdir(TEMP_APPDATA, { recursive: true });
+  await mkdir(TEMP_LOCALAPPDATA, { recursive: true });
+  // watcher ignores files below 100 KiB; keep this fixture just above that product threshold.
+  await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2a-base", payloadBytes: 128 * 1024 });
+  // 稳定分享 URL 不保留查询参数；测试桩从 pathname 的最后一段取帖子标记。
+  await writeFile(MOCK_ENRICH, [
+    `import baseEnrich from ${JSON.stringify(pathToFileURL(BASE_MOCK_ENRICH).href)};`,
+    "export default function pathnameEnrich(sourceUrl) {",
+    "  const url = new URL(String(sourceUrl || 'https://invalid.local/'));",
+    "  const marker = url.pathname.match(/\\/mock-([A-Za-z0-9_]+)\\/?$/)?.[1];",
+    "  return baseEnrich(marker ? `${url.origin}${url.pathname}?post=${encodeURIComponent(marker)}` : sourceUrl);",
+    "}",
+  ].join("\n"));
 
   // 本地 HTTP 直链服务（供 downloadUrl 下载测试；签名参数测试也用它）
   httpServer = createHttpServer((req, res) => {
@@ -126,9 +141,15 @@ before(async () => {
     cwd: repoRoot,
     env: {
       ...process.env,
+      HOME: TEMP_HOME,
+      USERPROFILE: TEMP_HOME,
+      APPDATA: TEMP_APPDATA,
+      LOCALAPPDATA: TEMP_LOCALAPPDATA,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: DATA_DIR,
       ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(DATA_DIR, "matrix-partitions"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -191,11 +212,11 @@ test("batchId 先行：adapter 前失败也有 import_item/download_receipt/inge
 });
 
 /* ─────────── ⑤ 签名 URL 不落库/API + canonicalize 剥敏感参数 ─────────── */
-test("签名 URL 不落库/API；canonicalizeSourceUrl 剥 auth_key/wsSecret/wsTime/Expires/X-Amz-*", async () => {
+test("签名 URL 不落库/API；稳定分享 URL 移除全部查询参数", async () => {
   const { canonicalizeSourceUrl } = await import("../local-agent/downloader-adapter.mjs");
   const signed = "https://weixin.qq.com/sph/abc123?auth_key=SECRET&wsSecret=S&wsTime=1720000000&Expires=9999999999&X-Amz-Signature=deadbeef&X-Amz-Credential=CRED&x-cos-security-token=TOK&keep=1";
   const cleaned = canonicalizeSourceUrl(signed);
-  assert.ok(cleaned.includes("keep=1"), "非敏感参数保留");
+  assert.equal(cleaned, "https://weixin.qq.com/sph/abc123", "稳定分享 URL 应移除全部 query（包括非敏感参数）");
   for (const bad of ["auth_key", "wsSecret", "wsTime", "Expires", "X-Amz-Signature", "X-Amz-Credential", "x-cos-security-token"]) {
     assert.ok(!cleaned.includes(bad), `应剥除 ${bad} → ${cleaned}`);
   }
@@ -220,7 +241,7 @@ test("签名 URL 不落库/API；canonicalizeSourceUrl 剥 auth_key/wsSecret/wsT
 /* ─────────── ④ temporary 清理（success + duplicate） ─────────── */
 test("downloadUrl 临时文件在 success 与 duplicate 后均被清理", async () => {
   const dl = `http://127.0.0.1:${httpPort}/v.mp4`;
-  const beforeFiles = new Set((await readdir("/tmp")).filter((f) => f.startsWith("kb_dl_")));
+  const beforeFiles = new Set((await readdir(tmpdir())).filter((f) => f.startsWith("zhitai-kb-download-")));
   // 第一次：success
   const r1 = await request("/api/v1/kuaidian", { method: "POST", body: { downloadUrl: dl, title: "临时清理测试" } });
   assert.equal(r1.status, 202);
@@ -229,7 +250,7 @@ test("downloadUrl 临时文件在 success 与 duplicate 后均被清理", async 
   const r2 = await request("/api/v1/kuaidian", { method: "POST", body: { downloadUrl: dl, title: "临时清理测试2" } });
   assert.equal(r2.status, 202);
   await new Promise((res) => setTimeout(res, 2500));
-  const afterFiles = (await readdir("/tmp")).filter((f) => f.startsWith("kb_dl_"));
+  const afterFiles = (await readdir(tmpdir())).filter((f) => f.startsWith("zhitai-kb-download-"));
   const leaked = afterFiles.filter((f) => !beforeFiles.has(f));
   assert.deepEqual(leaked, [], `临时文件应全部清理，残留: ${leaked.join(",")}`);
 });
@@ -239,15 +260,18 @@ test("同 sha 同 sourceUrl 二次上报去重 + refresh-metadata 仅元数据�
   // 用独立 localPath 副本（同 sha 同 sourceUrl）
   const dupFile = join(ROOT, "dup.mp4");
   await copyFile(SANDBOX_MP4, dupFile);
-  const post1 = "https://weixin.qq.com/sph/mock?post=snap1";
+  const post1 = "https://weixin.qq.com/sph/mock-snap1";
   const r1 = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: dupFile, sourceUrl: post1, title: "快照测试1" } });
   const r1b = await r1.json();
   assert.equal(r1.status, 202);
-  // 等待首次导入完成，定位资产（q 命中 source_url/platform_post.title）
+  // 等待首次导入完成，用平台 content_id/source_url 事实键定位，不依赖客户端标题。
   let assetId = null;
   for (let i = 0; i < 30; i++) {
-    const v = await (await request("/api/v1/kb/videos?q=snap1")).json();
-    if (v.items.length) { assetId = v.items[0].id; break; }
+    const rows = await dbQuery(
+      "SELECT asset_id FROM platform_post WHERE content_id = ? OR url = ? LIMIT 1",
+      ["mock_export_snap1", post1],
+    );
+    if (rows.length) { assetId = rows[0].asset_id; break; }
     await new Promise((res) => setTimeout(res, 300));
   }
   assert.ok(assetId, "首次导入后应能找到资产");
@@ -292,15 +316,19 @@ test("metadata.files 使用实际 videoName/ext：stat 存在且 size/sha 一致
   const fdF = await openF(f, "a");
   await fdF.write("META_MARKER");
   await fdF.close();
-  const r = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: f, sourceUrl: "https://weixin.qq.com/sph/meta?post=meta1", title: "元数据路径测试" } });
+  const metadataSourceUrl = "https://weixin.qq.com/sph/mock-meta1";
+  const r = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: f, sourceUrl: metadataSourceUrl, title: "元数据路径测试" } });
   assert.equal(r.status, 202);
-  // 轮询等待 ingest 完成（含 ffprobe 探测回退，稍慢）
-  let videos = { items: [] };
-  for (let i = 0; i < 20 && !videos.items.length; i++) {
+  // 轮询等待 ingest 完成（含 ffprobe 探测回退，稍慢）；按规范 source_url/content_id 定位。
+  let item = null;
+  for (let i = 0; i < 20 && !item; i++) {
     await new Promise((res) => setTimeout(res, 500));
-    videos = await (await request("/api/v1/kb/videos?q=元数据路径测试")).json();
+    const rows = await dbQuery(
+      "SELECT asset_id FROM platform_post WHERE content_id = ? OR url = ? LIMIT 1",
+      ["mock_export_meta1", metadataSourceUrl],
+    );
+    if (rows.length) item = { id: rows[0].asset_id };
   }
-  const item = videos.items[0];
   assert.ok(item, "应有资产");
   // 从 DB 拿 package_path（内部验证用，API 不返回）
   const rows = await dbQuery("SELECT package_path, sha256 FROM video_asset WHERE id = ?", [item.id]);
@@ -320,7 +348,7 @@ test("metadata.files 使用实际 videoName/ext：stat 存在且 size/sha 一致
 /* ─────────── ⑥ 合法 mdat→moov 合成夹具 → ok ─────────── */
 test("非 fast-start（ftyp→mdat→moov）合成视频被 probeLocalMedia 判 ok", async () => {
   const out = join(ROOT, "no-faststart.m4v");
-  await copyFile(MOOV_AT_END_MP4, out);
+  await writeSyntheticMp4(out, { mdatBeforeMoov: true, marker: "kb-v2a-mdat-before-moov" });
   const { probeLocalMedia } = await import("../local-agent/downloader-adapter.mjs");
   const media = await probeLocalMedia(out);
   assert.equal(media.mediaValidation, "ok", `合法 mdat→moov 必须 ok，实际 ${media.mediaValidation}`);
@@ -620,11 +648,7 @@ test("迁移幂等：无 capturedAt 包用 metadata 文件 mtime 稳定回退；
   const files = [];
   for (let i = 0; i < 6; i++) {
     const f = join(migDir, `src_${i}.mp4`);
-    await copyFile(TEST_MP4, f);
-    const { open } = await import("node:fs/promises");
-    const fd = await open(f, "a");
-    await fd.write(`MARKER_${i}`);
-    await fd.close();
+    await writeSyntheticMp4(f, { marker: `kb-v2a-migration-${i}` });
     files.push(f);
   }
   for (let i = 0; i < 10; i++) {

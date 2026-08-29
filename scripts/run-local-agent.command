@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+umask 077
 
 script_dir="${0:A:h}"
 project_dir="${script_dir:h}"

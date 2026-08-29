@@ -21,6 +21,8 @@
   <string>__ZHITAI_ERROR_LOG__</string>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>LANG</key>

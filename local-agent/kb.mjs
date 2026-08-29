@@ -48,10 +48,35 @@ async function withShaLock(sha, task) {
   }
 }
 
-function isSqliteBusy(error) {
+export function isSqliteBusyError(error) {
   return error?.errcode === 5
     || error?.errcode === 517
     || /(?:database is locked|SQLITE_BUSY)/i.test(String(error?.message || error || ""));
+}
+
+/**
+ * DatabaseSync 的 busy_timeout 会占住 Node 事件循环。写操作在短 timeout 失败后改用
+ * 异步退避，让同进程持锁任务的文件/子进程回调能够继续运行。调用方必须
+ * 保证 operation 可重试（通常是单条 CAS SQL 或 BEGIN IMMEDIATE）。
+ */
+export async function retrySqliteBusy(operation, {
+  timeoutMs = 20_000,
+  minDelayMs = 25,
+  maxDelayMs = 250,
+} = {}) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      if (!isSqliteBusyError(error) || Date.now() >= deadline) throw error;
+      const exponential = Math.max(1, Number(minDelayMs) || 1) * (2 ** Math.min(attempt, 4));
+      const delayMs = Math.min(Math.max(exponential, 1), Math.max(1, Number(maxDelayMs) || 1));
+      attempt += 1;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+  }
 }
 
 /**
@@ -59,22 +84,11 @@ function isSqliteBusy(error) {
  * 把 timeout 拉长反而会自锁。这里用短 busy_timeout + 异步退避，让持锁任务有机会继续，
  * 同时覆盖两个本地节点进程并发写同一 WAL 的情况。
  */
-async function beginImmediateWithRetry(db, { timeoutMs = 6_000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  let attempt = 0;
-  for (;;) {
-    try {
-      db.exec("BEGIN IMMEDIATE");
-      return;
-    } catch (error) {
-      if (!isSqliteBusy(error) || Date.now() >= deadline) throw error;
-      attempt += 1;
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(150, 20 + attempt * 10)));
-    }
-  }
+export async function beginImmediateWithRetry(db, { timeoutMs = 20_000 } = {}) {
+  return retrySqliteBusy(() => db.exec("BEGIN IMMEDIATE"), { timeoutMs });
 }
 
-async function withImmediateTransactionRetry(db, task, options) {
+export async function withImmediateTransactionRetry(db, task, options) {
   await beginImmediateWithRetry(db, options);
   try {
     const result = await task();
@@ -85,6 +99,321 @@ async function withImmediateTransactionRetry(db, task, options) {
       try { db.exec("ROLLBACK"); } catch { /* 调用方会收到原始失败 */ }
     }
     throw error;
+  }
+}
+
+export const ZHITAI_SEEDANCE_ENGINE = "ZhitaiSeedance";
+export const ZHITAI_LOCAL_MOTION_ENGINE = "ZhitaiLocalMotion";
+export const STRICT_ZHITAI_GENERATION_ENGINES = Object.freeze([
+  ZHITAI_SEEDANCE_ENGINE,
+  ZHITAI_LOCAL_MOTION_ENGINE,
+]);
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256Buffer(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function strictWorkflowSha256(workflow) {
+  return sha256Text(canonicalJson(workflow));
+}
+
+function localMotionProvenancePayload(manifest = {}) {
+  return {
+    schemaVersion: manifest.schemaVersion,
+    engine: manifest.engine,
+    evidenceMode: manifest.evidenceMode,
+    jobId: manifest.jobId,
+    assetId: manifest.assetId,
+    pipelineVersion: manifest.pipelineVersion,
+    preset: manifest.preset,
+    trigger: manifest.trigger,
+    environment: manifest.environment,
+    storyboardFingerprint: manifest.storyboardFingerprint,
+    storyboards: manifest.storyboards,
+    segments: manifest.segments,
+    visualVideo: manifest.visualVideo,
+  };
+}
+
+export function localMotionStoryboardFingerprint(storyboards) {
+  return sha256Text(canonicalJson(storyboards));
+}
+
+export function localMotionGenerationProvenanceSha256(manifest) {
+  return sha256Text(canonicalJson(localMotionProvenancePayload(manifest)));
+}
+
+export function localMotionManifestSha256(manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return null;
+  const canonical = { ...manifest };
+  delete canonical.manifestSha256;
+  return sha256Text(canonicalJson(canonical));
+}
+
+function validSha256(value) {
+  return /^[a-f0-9]{64}$/iu.test(String(value || ""));
+}
+
+function cleanBundleName(value, pattern) {
+  const name = String(value || "").trim();
+  return basename(name) === name && pattern.test(name) ? name : null;
+}
+
+async function inspectBoundFile(bundleDir, name, expected = {}) {
+  const filePath = join(bundleDir, name);
+  let handle;
+  try {
+    handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const openedInfo = await handle.stat();
+    const pathInfo = await lstat(filePath);
+    if (!openedInfo.isFile() || openedInfo.size <= 0
+      || !pathInfo.isFile() || pathInfo.isSymbolicLink()
+      || openedInfo.dev !== pathInfo.dev || openedInfo.ino !== pathInfo.ino) {
+      throw new Error(`local_motion_file_invalid:${name}`);
+    }
+
+    const bytes = await handle.readFile();
+    const afterRead = await handle.stat();
+    const afterPath = await lstat(filePath);
+    if (bytes.length !== openedInfo.size
+      || !afterRead.isFile() || !afterPath.isFile() || afterPath.isSymbolicLink()
+      || afterRead.dev !== openedInfo.dev || afterRead.ino !== openedInfo.ino
+      || afterRead.size !== openedInfo.size || afterRead.mtimeMs !== openedInfo.mtimeMs
+      || afterPath.dev !== openedInfo.dev || afterPath.ino !== openedInfo.ino
+      || afterPath.size !== openedInfo.size || afterPath.mtimeMs !== openedInfo.mtimeMs) {
+      throw new Error(`local_motion_file_changed:${name}`);
+    }
+
+    const sha256 = sha256Buffer(bytes);
+    if (Number(expected.sizeBytes) !== openedInfo.size || String(expected.sha256 || "").toLowerCase() !== sha256) {
+      throw new Error(`local_motion_file_binding_mismatch:${name}`);
+    }
+    return { name, sizeBytes: openedInfo.size, sha256, bytes };
+  } finally {
+    try { await handle?.close(); } catch { /* preserve the original validation error */ }
+  }
+}
+
+/**
+ * Verify the complete local storyboard-motion bundle. The engine is derived only
+ * from this manifest after every referenced byte, canonical digest and fixed
+ * 1080x1920/30fps/750-frame/25-second contract has been checked.
+ */
+export async function validateLocalMotionManifestBundle({
+  bundleDir,
+  finalPath = null,
+  expectedJobId = null,
+  expectedAssetId = null,
+  expectedWorkflowSha256 = null,
+  expectedFinalSizeBytes = null,
+  expectedFinalSha256 = null,
+} = {}) {
+  let raw;
+  let manifest;
+  try {
+    raw = await readFile(join(bundleDir, "local-motion-manifest.json"), "utf8");
+    manifest = JSON.parse(raw);
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "missing" : "invalid_json" };
+  }
+  try {
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
+      || Number(manifest.schemaVersion) !== 1
+      || manifest.engine !== ZHITAI_LOCAL_MOTION_ENGINE
+      || manifest.evidenceMode !== "local_storyboard_motion") {
+      throw new Error("contract");
+    }
+    if (expectedJobId !== null && String(manifest.jobId || "") !== String(expectedJobId)) throw new Error("job_binding");
+    if (expectedAssetId !== null && String(manifest.assetId || "") !== String(expectedAssetId)) throw new Error("asset_binding");
+    if (!String(manifest.pipelineVersion || "").trim()
+      || !manifest.preset || typeof manifest.preset !== "object"
+      || !manifest.trigger || typeof manifest.trigger !== "object"
+      || !manifest.environment || typeof manifest.environment !== "object") {
+      throw new Error("provenance_fields");
+    }
+    const computedManifestSha256 = localMotionManifestSha256(manifest);
+    if (!validSha256(manifest.manifestSha256)
+      || String(manifest.manifestSha256).toLowerCase() !== computedManifestSha256) {
+      throw new Error("manifest_sha256");
+    }
+    const storyboards = Array.isArray(manifest.storyboards) ? manifest.storyboards : [];
+    const segments = Array.isArray(manifest.segments) ? manifest.segments : [];
+    if (storyboards.length !== 3 || segments.length !== 3) throw new Error("segment_count");
+
+    const checkedStoryboards = [];
+    for (let offset = 0; offset < storyboards.length; offset += 1) {
+      const item = storyboards[offset];
+      const index = offset + 1;
+      const name = cleanBundleName(item?.name, /^storyboard-\d+\.png$/iu);
+      if (Number(item?.index) !== index || !name) throw new Error("storyboard_order");
+      const checked = await inspectBoundFile(bundleDir, name, item);
+      checkedStoryboards.push({
+        index,
+        name,
+        sizeBytes: checked.sizeBytes,
+        sha256: checked.sha256,
+        width: Number(item?.width),
+        height: Number(item?.height),
+      });
+      if (!(Number(item?.width) > 0) || !(Number(item?.height) > 0)) throw new Error("storyboard_dimensions");
+    }
+    if (!validSha256(manifest.storyboardFingerprint)
+      || localMotionStoryboardFingerprint(checkedStoryboards) !== String(manifest.storyboardFingerprint).toLowerCase()) {
+      throw new Error("storyboard_fingerprint");
+    }
+
+    const checkedSegments = [];
+    for (let offset = 0; offset < segments.length; offset += 1) {
+      const item = segments[offset];
+      const index = offset + 1;
+      const clipName = cleanBundleName(item?.clipName, /^clip-\d+\.mp4$/iu);
+      const sourceStoryboard = cleanBundleName(item?.sourceStoryboard, /^storyboard-\d+\.png$/iu);
+      const storyboard = checkedStoryboards[index - 1];
+      if (Number(item?.index) !== index || !clipName || !sourceStoryboard
+        || sourceStoryboard !== storyboard.name
+        || String(item?.sourceStoryboardSha256 || "").toLowerCase() !== storyboard.sha256
+        || Number(item?.width) !== 1080
+        || Number(item?.height) !== 1920
+        || Number(item?.fps) !== 30
+        || Number(item?.frameCount) !== 250) {
+        throw new Error("segment_contract");
+      }
+      const checked = await inspectBoundFile(bundleDir, clipName, {
+        sizeBytes: item?.clipSizeBytes,
+        sha256: item?.clipSha256,
+      });
+      checkedSegments.push({
+        index,
+        sourceStoryboard,
+        sourceStoryboardSha256: storyboard.sha256,
+        clipName,
+        clipSizeBytes: checked.sizeBytes,
+        clipSha256: checked.sha256,
+        width: 1080,
+        height: 1920,
+        fps: 30,
+        frameCount: 250,
+        durationMs: Number(item?.durationMs),
+      });
+    }
+    if (new Set(checkedSegments.map((item) => item.clipSha256)).size !== checkedSegments.length
+      || checkedSegments.reduce((sum, item) => sum + item.frameCount, 0) !== 750
+      || Math.abs(checkedSegments.reduce((sum, item) => sum + item.durationMs, 0) - 25_000) > 2) {
+      throw new Error("segment_timeline");
+    }
+
+    const visual = manifest.visualVideo || {};
+    const visualName = cleanBundleName(visual.name, /^final\.visual\.mp4$/iu);
+    if (!visualName
+      || Number(visual.width) !== 1080
+      || Number(visual.height) !== 1920
+      || Number(visual.fps) !== 30
+      || Number(visual.totalFrames) !== 750
+      || Number(visual.durationMs) !== 25_000) {
+      throw new Error("visual_contract");
+    }
+    await inspectBoundFile(bundleDir, visualName, visual);
+
+    const finalVideo = manifest.finalVideo || {};
+    if (String(finalVideo.name || "") !== "final.mp4"
+      || Number(finalVideo.width) !== 1080
+      || Number(finalVideo.height) !== 1920
+      || Number(finalVideo.fps) !== 30
+      || Number(finalVideo.totalFrames) !== 750
+      || Number(finalVideo.durationMs) !== 25_000
+      || String(finalVideo.audio?.codec || "").toLowerCase() !== "aac"
+      || finalVideo.audio?.narrationComplete !== true) {
+      throw new Error("final_contract");
+    }
+    const finalBytes = await readFile(finalPath || join(bundleDir, "final.mp4"));
+    const finalSha256 = sha256Buffer(finalBytes);
+    const finalSizeBytes = finalBytes.length;
+    if (Number(finalVideo.sizeBytes) !== finalSizeBytes
+      || String(finalVideo.sha256 || "").toLowerCase() !== finalSha256
+      || (expectedFinalSizeBytes !== null && Number(expectedFinalSizeBytes) !== finalSizeBytes)
+      || (expectedFinalSha256 !== null && String(expectedFinalSha256).toLowerCase() !== finalSha256)) {
+      throw new Error("final_binding");
+    }
+
+    const audioName = cleanBundleName(manifest.audioQuality?.name, /^audio-quality\.json$/iu);
+    if (!audioName) throw new Error("audio_quality_contract");
+    const checkedAudio = await inspectBoundFile(bundleDir, audioName, manifest.audioQuality);
+    const audioReport = JSON.parse(checkedAudio.bytes.toString("utf8"));
+    const narration = String(audioReport?.narration || "");
+    const narrationSha256 = sha256Text(narration);
+    if (audioReport?.status !== "passed"
+      || String(audioReport?.jobId || "") !== String(manifest.jobId || "")
+      || Number(audioReport?.outputSizeBytes) !== finalSizeBytes
+      || String(audioReport?.outputSha256 || "").toLowerCase() !== finalSha256
+      || !narration
+      || audioReport?.narrationComplete !== true
+      || String(audioReport?.narrationSha256 || "").toLowerCase() !== narrationSha256
+      || audioReport?.timingVerified !== true
+      || Number(audioReport?.narrationDurationMs) !== Number(manifest.audioQuality?.narrationDurationMs)
+      || Number(audioReport?.narrationDurationMs) > 24_950
+      || Number(audioReport?.finalDurationMs) !== 25_000
+      || !Number.isFinite(Number(audioReport?.outputDurationMs))
+      || Math.abs(Number(audioReport?.outputDurationMs) - 25_000) > 80
+      || !Number.isFinite(Number(audioReport?.meanVolumeDb))
+      || !Number.isFinite(Number(audioReport?.maxVolumeDb))
+      || Number(audioReport?.meanVolumeDb) < -34
+      || Number(audioReport?.maxVolumeDb) < -18
+      || manifest.audioQuality?.status !== "passed"
+      || Number(manifest.audioQuality?.meanVolumeDb) !== Number(audioReport?.meanVolumeDb)
+      || Number(manifest.audioQuality?.maxVolumeDb) !== Number(audioReport?.maxVolumeDb)
+      || manifest.audioQuality?.narrationComplete !== true
+      || String(manifest.audioQuality?.narrationSha256 || "").toLowerCase() !== narrationSha256
+      || !(Number(manifest.audioQuality?.narrationDurationMs) > 0)
+      || Number(manifest.audioQuality?.narrationDurationMs) > Number(manifest.audioQuality?.finalDurationMs)
+      || Number(manifest.audioQuality?.finalDurationMs) !== 25_000) {
+      throw new Error("audio_quality_binding");
+    }
+
+    const workflowSha256 = String(manifest.workflow?.sha256 || "").toLowerCase();
+    if (!validSha256(workflowSha256)
+      || (expectedWorkflowSha256 !== null && workflowSha256 !== String(expectedWorkflowSha256).toLowerCase())) {
+      throw new Error("workflow_binding");
+    }
+    const generationProvenanceSha256 = localMotionGenerationProvenanceSha256(manifest);
+    if (!validSha256(manifest.generationProvenanceSha256)
+      || String(manifest.generationProvenanceSha256).toLowerCase() !== generationProvenanceSha256) {
+      throw new Error("generation_provenance");
+    }
+    return {
+      ok: true,
+      engine: ZHITAI_LOCAL_MOTION_ENGINE,
+      evidenceMode: "local_storyboard_motion",
+      manifest,
+      manifestSha256: computedManifestSha256,
+      generationProvenanceSha256,
+      storyboardFingerprint: String(manifest.storyboardFingerprint).toLowerCase(),
+      storyboards: checkedStoryboards,
+      segments: checkedSegments,
+      visual: { width: 1080, height: 1920, fps: 30, totalFrames: 750, durationMs: 25_000 },
+      final: { name: "final.mp4", sizeBytes: finalSizeBytes, sha256: finalSha256, audioCodec: "aac" },
+      audio: {
+        codec: "aac",
+        narrationComplete: true,
+        narrationSha256,
+        narrationDurationMs: Number(manifest.audioQuality.narrationDurationMs),
+        finalDurationMs: 25_000,
+        outputDurationMs: Number(audioReport.outputDurationMs),
+        timingVerified: true,
+        meanVolumeDb: Number(audioReport.meanVolumeDb),
+        maxVolumeDb: Number(audioReport.maxVolumeDb),
+      },
+      workflowSha256,
+    };
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error || "invalid").slice(0, 100) };
   }
 }
 
@@ -830,7 +1159,7 @@ export async function ingestOne(db, { receipt, input, input_kind, batchId, ctx =
         }
 
         // ── staging 建包（视频+6 文件写完校验后原子 rename；失败不留 searchable asset） ──
-        const titleGuess = receipt?.title || (input_kind === "file" ? (input.split("/").pop() || "未命名视频") : "未命名视频");
+        const titleGuess = receipt?.title || (input_kind === "file" ? (basename(input) || "未命名视频") : "未命名视频");
         const category = await categorize(titleGuess);
         const { assetId, pkgDir, stagingDir, assetsDir } = await makePackageStaging(category);
 
@@ -1077,8 +1406,16 @@ export async function ingestOne(db, { receipt, input, input_kind, batchId, ctx =
     return { status: "failed", error: sanitizeFailureText(String((e && e.message) || e)).slice(0, 500) };
   } finally {
     // 临时文件统一清理（success 已复制 / duplicate / partial / 异常）
-    if (receipt?.temporary && localPath) {
-      await rm(localPath, { force: true }).catch(() => {});
+    if (receipt?.temporary) {
+      const temporaryRoot = receipt?.temporaryRoot ? resolve(String(receipt.temporaryRoot)) : null;
+      const managedTemporaryRoot = temporaryRoot && localPath
+        && /^zhitai-kb-download-[A-Za-z0-9_-]+$/u.test(basename(temporaryRoot))
+        && resolve(String(localPath)) === join(temporaryRoot, "media.mp4");
+      if (managedTemporaryRoot) {
+        await rm(temporaryRoot, { recursive: true, force: true }).catch(() => {});
+      } else if (localPath) {
+        await rm(localPath, { force: true }).catch(() => {});
+      }
     }
   }
 }
@@ -1917,6 +2254,8 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
   let sourceStat;
   let media;
   let sha256;
+  let generationEngine = ZHITAI_SEEDANCE_ENGINE;
+  let localMotionEvidence = null;
   try {
     stagingHandle = await open(staging, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     sourceStat = await stagingHandle.stat();
@@ -1955,6 +2294,36 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
           : "generated_video_audio_quality_failed",
       };
     }
+    let localMotionManifestPresent = false;
+    try {
+      await stat(resolve(generationRoot, jobId, "local-motion-manifest.json"));
+      localMotionManifestPresent = true;
+    } catch { /* Seedance 任务没有本地动画 manifest */ }
+    if (localMotionManifestPresent) {
+      let workflowSha256 = null;
+      try {
+        const row = db.prepare("SELECT plan_json FROM remake_plan WHERE asset_id=?").get(assetId);
+        const plan = row?.plan_json ? JSON.parse(row.plan_json) : null;
+        if (plan?.seedanceWorkflow) workflowSha256 = strictWorkflowSha256(plan.seedanceWorkflow);
+      } catch { /* 下方验证会失败关闭 */ }
+      localMotionEvidence = await validateLocalMotionManifestBundle({
+        bundleDir: resolve(generationRoot, jobId),
+        finalPath: staging,
+        expectedJobId: jobId,
+        expectedAssetId: assetId,
+        expectedWorkflowSha256: workflowSha256,
+        expectedFinalSizeBytes: sourceStat.size,
+        expectedFinalSha256: sha256,
+      });
+      if (!workflowSha256 || !localMotionEvidence.ok) {
+        return {
+          ok: false,
+          status: 400,
+          error: `generated_local_motion_manifest_invalid:${localMotionEvidence?.reason || "workflow_binding"}`,
+        };
+      }
+      generationEngine = localMotionEvidence.engine;
+    }
     await rename(staging, target);
     const targetPathStat = await lstat(target);
     const committedStat = await stagingHandle.stat();
@@ -1979,14 +2348,42 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
   await mkdir(artifactStaging, { recursive: true });
   const archivedArtifacts = [];
   for (const entry of await readdir(join(generationRoot, jobId), { withFileTypes: true })) {
-    if (!entry.isFile() || !/^(?:storyboard-\d+\.png|clip-\d+\.mp4|run-state\.json|audio-quality\.json|narration\.mp3|subtitles\.srt)$/i.test(entry.name)) continue;
+    if (!entry.isFile() || !/^(?:storyboard-\d+\.png|clip-\d+\.mp4|final\.visual\.mp4|run-state\.json|audio-quality\.json|local-motion-manifest\.json|narration\.mp3|subtitles\.srt)$/i.test(entry.name)) continue;
     await copyFile(join(generationRoot, jobId, entry.name), join(artifactStaging, entry.name));
     archivedArtifacts.push(entry.name);
   }
+  if (localMotionEvidence) {
+    const archivedLocalMotion = await validateLocalMotionManifestBundle({
+      bundleDir: artifactStaging,
+      finalPath: target,
+      expectedJobId: jobId,
+      expectedAssetId: assetId,
+      expectedWorkflowSha256: localMotionEvidence.workflowSha256,
+      expectedFinalSizeBytes: sourceStat.size,
+      expectedFinalSha256: sha256,
+    });
+    if (!archivedLocalMotion.ok
+      || archivedLocalMotion.manifestSha256 !== localMotionEvidence.manifestSha256) {
+      await rm(artifactStaging, { recursive: true, force: true });
+      await rm(target, { force: true });
+      return {
+        ok: false,
+        status: 400,
+        error: `generated_local_motion_archive_invalid:${archivedLocalMotion.reason || "manifest_binding"}`,
+      };
+    }
+  }
   await writeFile(join(artifactStaging, "generation-manifest.json"), `${JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     jobId,
     assetId,
+    engine: generationEngine,
+    evidenceMode: localMotionEvidence?.evidenceMode || "seedance_web_generation",
+    ...(localMotionEvidence ? {
+      generationProvenanceSha256: localMotionEvidence.generationProvenanceSha256,
+      storyboardFingerprint: localMotionEvidence.storyboardFingerprint,
+      motionManifestSha256: localMotionEvidence.manifestSha256,
+    } : {}),
     finalVideo: fileName,
     artifacts: archivedArtifacts,
     promptFiles: ["gpt-image-prompts.md", "seedance-prompts.md", "seedance-workflow.json", "reproduction.json"],
@@ -1997,11 +2394,12 @@ export async function persistZhitaiGeneration(db, assetId, input = {}) {
   db.prepare(`INSERT OR REPLACE INTO remake_generation
     (id, asset_id, engine, engine_task_id, status, file_name, size_bytes, sha256, subject, created_at, completed_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, assetId, "ZhitaiSeedance", jobId, "completed", fileName, sourceStat.size, sha256,
+    id, assetId, generationEngine, jobId, "completed", fileName, sourceStat.size, sha256,
     String(input.subject || "").trim().slice(0, 500) || null, now, now,
   );
   return {
-    ok: true, id, assetId, jobId, fileName, sizeBytes: sourceStat.size, sha256,
+    ok: true, id, assetId, jobId, engine: generationEngine, fileName, sizeBytes: sourceStat.size, sha256,
+    ...(localMotionEvidence ? { localMotionEvidence } : {}),
     quality,
     filePath: target,
     artifactDir: join("remake-output", artifactDirName),

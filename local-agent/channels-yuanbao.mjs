@@ -19,7 +19,7 @@ import { readFile, writeFile, mkdir, rename, stat, rm } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { join, dirname } from "node:path";
+import { basename, join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -469,7 +469,7 @@ export async function downloadChannelsVideo(media, targetDir, { onProgress } = {
 
   await rename(tempPath, finalPath);
   const finalSize = (await stat(finalPath)).size;
-  return { path: finalPath, filename: finalPath.split("/").pop(), size: finalSize, expected: total };
+  return { path: finalPath, filename: basename(finalPath), size: finalSize, expected: total };
 }
 
 /** 一步到位：链接 → 落地文件 */

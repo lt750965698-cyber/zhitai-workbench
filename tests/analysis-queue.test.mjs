@@ -84,6 +84,8 @@ test("持久分析队列首次失败进入退避，随后自动重试并成功",
   let calls = 0;
   let releaseRetryEvent;
   const retryEvent = new Promise((resolve) => { releaseRetryEvent = resolve; });
+  let releaseCompletedEvent;
+  const completedEvent = new Promise((resolve) => { releaseCompletedEvent = resolve; });
   const events = [];
   const queue = new AnalysisQueue({
     filePath,
@@ -96,6 +98,7 @@ test("持久分析队列首次失败进入退避，随后自动重试并成功",
     onEvent: async (kind) => {
       events.push(kind);
       if (kind === "retry") releaseRetryEvent();
+      if (kind === "completed") releaseCompletedEvent();
     },
   });
 
@@ -120,6 +123,7 @@ test("持久分析队列首次失败进入退避，随后自动重试并成功",
   assert.equal(completed.progress, 100);
   assert.equal(completed.error, null);
   assert.equal(completed.nextAttemptAt, null);
+  await completedEvent;
   assert.deepEqual(events, ["retry", "completed"]);
 
   const persisted = JSON.parse(await readFile(filePath, "utf8"));
@@ -181,6 +185,10 @@ test("自动重试耗尽后进入 needs_attention，人工 retry 可重新排队
   t.after(() => rm(root, { recursive: true, force: true }));
 
   let calls = 0;
+  let releaseFailedEvent;
+  let releaseCompletedEvent;
+  const failedEvent = new Promise((resolve) => { releaseFailedEvent = resolve; });
+  const completedEvent = new Promise((resolve) => { releaseCompletedEvent = resolve; });
   const events = [];
   const queue = new AnalysisQueue({
     filePath,
@@ -192,7 +200,11 @@ test("自动重试耗尽后进入 needs_attention，人工 retry 可重新排队
         ? { ok: false, error: `fixture_failure_${calls}` }
         : { ok: true };
     },
-    onEvent: async (kind) => { events.push(kind); },
+    onEvent: async (kind) => {
+      events.push(kind);
+      if (kind === "failed") releaseFailedEvent();
+      if (kind === "completed") releaseCompletedEvent();
+    },
   });
 
   await queue.init();
@@ -207,6 +219,7 @@ test("自动重试耗尽后进入 needs_attention，人工 retry 可重新排队
   assert.equal(exhausted.maxAttempts, 2);
   assert.equal(exhausted.error, "fixture_failure_2");
   assert.equal(exhausted.nextAttemptAt, null);
+  await failedEvent;
   assert.deepEqual(events, ["retry", "failed"]);
   assert.deepEqual(await queue.counts(), {
     total: 1,
@@ -231,5 +244,6 @@ test("自动重试耗尽后进入 needs_attention，人工 retry 可重新排队
   assert.equal(completed.attempts, 3);
   assert.equal((await queue.counts()).needsAttention, 0);
   assert.equal((await queue.counts()).remaining, 0);
+  await completedEvent;
   assert.deepEqual(events, ["retry", "failed", "completed"]);
 });

@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   classifyMatrixPublishResult,
+  cliPublish,
+  createMatrixAuthStateStore,
   createPublishReceiptStore,
   publishAccountFingerprint,
   publishModeFor,
@@ -39,7 +41,8 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     out: JSON.stringify({ status: "published", postId: "note-1", url: "https://example.com/note-1" }),
     err: "",
   }, { mode: "public" });
-  assert.equal(published.state, "public");
+  assert.equal(published.state, "submitted");
+  assert.equal(published.adapterReportedState, "public");
   assert.equal(published.postId, "note-1");
   assert.equal(published.resultUrl, "https://example.com/note-1");
 
@@ -48,7 +51,8 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     out: JSON.stringify({ status: "success", data: { publishStatus: "published", id: "post-task-2" } }),
     err: "",
   }, { mode: "public" });
-  assert.equal(nestedPublished.state, "public");
+  assert.equal(nestedPublished.state, "submitted");
+  assert.equal(nestedPublished.adapterReportedState, "public");
   assert.equal(nestedPublished.taskId, "post-task-2");
 
   const scheduled = classifyMatrixPublishResult({
@@ -56,10 +60,10 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     out: JSON.stringify({ status: "success", taskId: "schedule-1" }),
     err: "",
   }, { mode: "scheduled" });
-  assert.equal(scheduled.state, "scheduled");
+  assert.equal(scheduled.state, "submitted");
   assert.equal(scheduled.taskId, "schedule-1");
 
-  assert.equal(classifyMatrixPublishResult({ code: 0, out: "ok", err: "" }, { mode: "draft" }).state, "draft");
+  assert.equal(classifyMatrixPublishResult({ code: 0, out: "ok", err: "" }, { mode: "draft" }).state, "submitted");
   const publicFallback = classifyMatrixPublishResult({ code: 4, out: "saved", err: "" }, { mode: "public" });
   assert.equal(publicFallback.state, "draft");
   assert.equal(publicFallback.accepted, false, "正式发布降级到草稿不能算成功");
@@ -70,6 +74,47 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     classifyMatrixPublishResult({ code: 3, out: "", err: "account 13800138000 expired" }, { mode: "public" }).platformMessage,
     "account [account] expired",
   );
+});
+
+test("真实发布接受会持久验证账号，视频号登录页重定向会立即使账号失效", async (t) => {
+  const sandbox = await mkdtemp(join(tmpdir(), "zhitai-matrix-publish-auth-"));
+  t.after(() => rm(sandbox, { recursive: true, force: true }));
+  const authStore = createMatrixAuthStateStore({ path: join(sandbox, "auth.json") });
+  const target = {
+    platform: "sph",
+    phone: "13800138000",
+    partition: "persist:13800138000视频号",
+  };
+  const payload = {
+    platforms: [target],
+    file: "/private/fixture.mp4",
+    title: "小户型卫生间四区动线",
+    draft: true,
+  };
+
+  const accepted = await cliPublish(payload, {
+    authStateStore: authStore,
+    run: async () => ({ code: 0, out: JSON.stringify({ status: "saved_draft", message: "草稿已保存" }), err: "" }),
+  });
+  assert.equal(accepted.results[0].state, "submitted");
+  assert.equal((await authStore.get("sph", target)).authState, "verified");
+
+  const rejected = await cliPublish(payload, {
+    authStateStore: authStore,
+    run: async () => ({
+      code: 3,
+      out: "",
+      err: "[auth] 视频号登录状态已失效，请重新登录后再试: https://channels.weixin.qq.com/login.html\n登录态异常或未登录",
+    }),
+  });
+  assert.equal(rejected.results[0].state, "failed");
+  const invalid = await authStore.get("sph", target);
+  assert.equal(invalid.authState, "invalid");
+  assert.equal(invalid.reasonCode, "sph_login_redirect");
+
+  const disk = await readFile(join(sandbox, "auth.json"), "utf8");
+  assert.equal(disk.includes("13800138000"), false);
+  assert.equal(disk.includes("channels.weixin.qq.com"), false, "平台原始失败消息不得进入认证账本");
 });
 
 test("发布回执按平台、账号、媒体 SHA、模式和排期时间持久幂等", async (t) => {

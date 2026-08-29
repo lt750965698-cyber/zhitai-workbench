@@ -22,8 +22,10 @@
 | --- | --- | --- |
 | [React](https://github.com/facebook/react) / React DOM / Scheduler | MIT | 用户界面 |
 | [Drizzle ORM](https://github.com/drizzle-team/drizzle-orm) | Apache-2.0 | 数据访问 |
+| [@electron/asar](https://github.com/electron/asar) | MIT | Electron 应用归档与打包工具 |
+| [electron-squirrel-startup](https://github.com/mongodb-js/electron-squirrel-startup) | Apache-2.0 | 处理 Windows Squirrel 安装、更新和卸载启动事件 |
 
-开发、构建和桌面依赖还包括 TypeScript、Vite、Tailwind CSS、ESLint、Wrangler、Electron 等。完整版本由 pnpm-lock.yaml、desktop/package-lock.json 和各包中的 LICENSE 文件确定。
+上表只列直接生产/运行时依赖摘要，不是完整依赖树或法律归类。开发、构建和桌面依赖还包括 TypeScript、Vite、Vinext、Tailwind CSS、ESLint、Wrangler、Electron、Electron Forge 和 Squirrel.Windows 相关工具等。完整组件、精确版本和许可条款由对应发行提交的 `pnpm-lock.yaml`、实际构建产物以及各包随附的 LICENSE/NOTICE 文件共同确定。
 
 可在干净安装后运行以下命令审计当前解析结果：
 
@@ -31,7 +33,18 @@
 pnpm licenses list --json
 ~~~
 
-该命令只审计根 pnpm 依赖树。desktop 使用独立的 npm lockfile，必须另行检查 desktop/package-lock.json、安装后的 npm 依赖树和每个包的 LICENSE。构建或再分发时必须保留全部依赖要求的版权和许可证通知。
+该命令审计根 pnpm 依赖树，Windows 发行构建以该根依赖树和锁文件为准。`desktop/package-lock.json` 只描述对应目录的独立 npm 开发树，不能代替对 Windows 最终产物和根锁文件的核对。构建或再分发时必须保留全部依赖要求的版权、NOTICE 和许可证文件。
+
+## Windows 桌面发行物
+
+Windows 安装包和便携包不是只含织台自身源码的产物。它们会包含：
+
+- [Electron](https://github.com/electron/electron) 运行时，其中包含 Chromium、Node.js 及 Electron 使用的第三方组件；
+- [Vinext](https://github.com/cloudflare/vinext) standalone 服务端产物以及启动该产物所需的锁定运行时依赖；
+- `@electron/asar`、`electron-squirrel-startup` 以及锁文件解析出的相关传递依赖（以实际发行产物为准）；
+- 上述组件随包分发的许可证与第三方通知，包括 Electron/Chromium 发行物提供的 LICENSE 和 `LICENSES.chromium.html`，以及随 Vinext standalone 依赖保留的 LICENSE/NOTICE 文件。
+
+Electron 项目本身使用 MIT License，Vinext 上游仓库声明 MIT License；这不代表它们捆绑或传递依赖也统一适用 MIT。Chromium、Node.js、Squirrel.Windows 及每个 npm 依赖仍以自身随附的许可证、NOTICE 和版权文件为准。用户或下游分发者不应把织台的 MIT License 解释为对这些第三方权利的再授权。
 
 ## 外置引擎
 
@@ -53,6 +66,14 @@ pnpm licenses list --json
 | [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo/blob/main/LICENSE) | MIT | 模型、素材 API、字体、音乐和生成结果另受各自条款约束 |
 
 以上清单表示潜在兼容接口，不表示项目维护者认可、担保、托管或分发这些工具。
+
+### xiaohongshu-mcp 可选源码补丁
+
+仓库内的 `patches/xiaohongshu-mcp-ai-declaration.patch` 是对
+`xpzouying/xiaohongshu-mcp` 精确提交
+`6fb866a7db4e3dcce8dc00a0dde07370f3b12946` 的修改，沿用上游
+Apache License 2.0。补丁加入 AI 合成内容声明与发布前失败回执；织台不分发
+应用补丁后的二进制。来源、验证方式和修改范围见 `patches/README.md`。
 
 ## 可选模块更新器
 

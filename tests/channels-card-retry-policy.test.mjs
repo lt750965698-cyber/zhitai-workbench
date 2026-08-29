@@ -13,9 +13,16 @@ const runChannelsCardSource = serverSource.slice(runStart, runEnd);
 test("视频号卡片外层只重试已经进入下载后的瞬态 HTTP 错误", () => {
   assert.ok(runStart >= 0 && runEnd > runStart, "runChannelsCard implementation should be discoverable");
 
-  const firstParse = runChannelsCardSource.indexOf("await parseChannelsCard(");
+  const parserBinding = runChannelsCardSource.indexOf("const parseCard = () => parseChannelsCard(");
+  const firstParse = runChannelsCardSource.indexOf("media = await parseCard();");
   const downloadLoop = runChannelsCardSource.indexOf("for (let attempt = 1;");
-  assert.ok(firstParse >= 0 && firstParse < downloadLoop, "the initial card parse must happen outside the download retry loop");
+  assert.ok(parserBinding >= 0 && parserBinding < firstParse,
+    "the recovery-aware parser must still delegate to the card adapter");
+  assert.ok(firstParse >= 0 && firstParse < downloadLoop,
+    "the initial card parse must happen outside the download retry loop");
+  assert.match(runChannelsCardSource, /const baseUrl = configuredChannelsCardBaseUrl\(\);/,
+    "the parser and readiness probe must use the same configured engine origin");
+  assert.match(runChannelsCardSource, /baseUrl \? \{ baseUrl \} : \{\}/);
 
   const policySource = runChannelsCardSource.match(/const transientDownload = \/(.*?)\/([a-z]*)\.test\(code\);/);
   assert.ok(policySource, "download retry policy should remain explicit and testable");
@@ -25,6 +32,8 @@ test("视频号卡片外层只重试已经进入下载后的瞬态 HTTP 错误",
   assert.equal(policy.test("channels_card_object_missing"), false);
   assert.equal(policy.test("channels_card_profile_jsapi_jsonparse_failed"), false);
   assert.equal(policy.test("channels_card_profile_upstream_-71042"), false);
+  assert.match(serverSource, /"channels_card_engine_starting"/,
+    "status-endpoint startup responses must remain recoverable");
 });
 
 test("profile 解析错误有安全中文说明且不会回显上游内容", () => {

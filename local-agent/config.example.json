@@ -14,6 +14,18 @@
     "intervalMs": 1000,
     "timeoutMs": 1800000
   },
+  "diagnostics": {
+    "retention": {
+      "maxAgeMs": 86400000,
+      "maxFiles": 100,
+      "maxBytes": 5242880,
+      "maxEventBytes": 16384
+    },
+    "debug": {
+      "enabled": false,
+      "expiresAt": null
+    }
+  },
   "adapters": {
     "douyin": {
       "enabled": false,
@@ -165,7 +177,7 @@
           "com.zhitai.openclaw-weixin"
         ]
       },
-      "notes": "可选备用通道与手机控制：官方微信长轮询由 launchd 常驻；私聊直链、固定命令和成片审核均在模型分发前处理，不依赖 Codex。它离线不阻断文件传输助手主入口。人工终审以“选择 N”为主并兼容“发布 N”，批准只创建多平台草稿待办，不公开发布。"
+      "notes": "可选备用通道与手机控制：官方微信长轮询由 launchd 常驻；私聊直链和固定命令在模型分发前处理，不依赖 Codex。它离线不阻断文件传输助手主入口。成片由织台执行严格自审；‘选择 N’及‘发布 N’仅作为兼容查询入口，不能绕过自审或直接放行。"
     },
     "pywechat_file_transfer": {
       "label": "文件传输助手监听（Windows 实验）",
@@ -221,7 +233,7 @@
       "installChecks": [
         "~/.local/share/zhitai-runtime/engines/xiaohongshu-mcp-current/xiaohongshu-mcp"
       ],
-      "notes": "小红书图文/多图/标签/定时发布；登录二维码在织台内显示。"
+      "notes": "小红书图文/多图/标签/定时发布；账号隔离运行时按需启动，AI 生成内容必须设置并回读平台声明后才允许发布。"
     },
     "ai_goofish_monitor": {
       "label": "闲鱼商品监控",

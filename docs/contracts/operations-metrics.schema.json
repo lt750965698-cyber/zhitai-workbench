@@ -1,0 +1,3669 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.zhitai.local/operations-metrics/1.0.0",
+  "title": "Zhitai Operations Metrics Report",
+  "description": "Machine-readable contract for Zhitai operational KPIs, lineage, periodic platform snapshots, OFAT experiment cards, and 7/14/30-day reviews.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contract",
+    "reportId",
+    "reportRevision",
+    "reportType",
+    "dataMode",
+    "syntheticNotice",
+    "asOf",
+    "timezone",
+    "period",
+    "reviewAnchorAt",
+    "lineage",
+    "snapshots",
+    "kpis",
+    "funnels",
+    "experiments",
+    "reviews",
+    "provenance",
+    "limitations"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "contract": {
+      "const": "zhitai.operations_metrics"
+    },
+    "contractVersion": {
+      "description": "Legacy renderer compatibility alias of schemaVersion.",
+      "const": "1.0.0"
+    },
+    "reportId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "reportRevision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reportType": {
+      "enum": [
+        "daily",
+        "review",
+        "acceptance"
+      ]
+    },
+    "dataMode": {
+      "$ref": "#/$defs/dataMode"
+    },
+    "synthetic": {
+      "description": "Legacy renderer compatibility flag; it MUST agree with dataMode.",
+      "type": "boolean"
+    },
+    "syntheticNotice": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "asOf": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "generatedAt": {
+      "description": "Legacy renderer timestamp. The current deterministic report builder sets it equal to asOf.",
+      "$ref": "#/$defs/timestamp"
+    },
+    "timezone": {
+      "const": "Asia/Shanghai"
+    },
+    "period": {
+      "$ref": "#/$defs/reportPeriod"
+    },
+    "reviewAnchorAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "lineage": {
+      "$ref": "#/$defs/lineage"
+    },
+    "snapshots": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/metricSnapshot"
+      }
+    },
+    "kpis": {
+      "description": "Canonical, formula-bearing KPI structure. The legacy metrics projection is separately retained for the existing renderer.",
+      "$ref": "#/$defs/kpiSet"
+    },
+    "funnels": {
+      "description": "Canonical four-grain funnel structure. The legacy feedbackFunnel projection is separately retained for the existing renderer.",
+      "$ref": "#/$defs/funnelSet"
+    },
+    "experiments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/experimentCard"
+      }
+    },
+    "reviews": {
+      "description": "Canonical D7/D14/D30 review frames. The legacy reviewFramework projection is separately retained for the existing renderer.",
+      "$ref": "#/$defs/reviewSet"
+    },
+    "metrics": {
+      "description": "Renderer-compatible KPI projection retained by contract 1.0.0. Runtime validation MUST cross-check its values and states against the normalized kpis structure.",
+      "$ref": "#/$defs/legacyMetricsProjection"
+    },
+    "feedbackFunnel": {
+      "description": "Renderer-compatible funnel projection retained by contract 1.0.0. Runtime validation MUST cross-check its stage and outcome counts against normalized funnels.",
+      "$ref": "#/$defs/legacyFeedbackFunnelProjection"
+    },
+    "reviewFramework": {
+      "description": "Renderer-compatible review projection retained by contract 1.0.0. Runtime validation MUST cross-check due dates, cutoffs, statuses, and horizons against normalized reviews.",
+      "$ref": "#/$defs/legacyReviewFrameworkProjection"
+    },
+    "policy": {
+      "$ref": "#/$defs/reportPolicy"
+    },
+    "snapshotCoverage": {
+      "$ref": "#/$defs/snapshotCoverageProjection"
+    },
+    "platformMetricStates": {
+      "$ref": "#/$defs/platformMetricStateCounts"
+    },
+    "dailyOperations": {
+      "$ref": "#/$defs/dailyOperationsProjection"
+    },
+    "provenance": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/provenanceSource"
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    },
+    "validationErrors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/validationError"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "dataMode": {
+            "const": "synthetic"
+          }
+        },
+        "required": [
+          "dataMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "syntheticNotice": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "合成"
+          },
+          "synthetic": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "syntheticNotice": {
+            "type": "null"
+          },
+          "synthetic": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "dataMode": {
+      "enum": [
+        "observed",
+        "synthetic"
+      ]
+    },
+    "valueStatus": {
+      "enum": [
+        "available",
+        "unavailable",
+        "not_collected",
+        "permission_denied"
+      ]
+    },
+    "snapshotOffset": {
+      "enum": [
+        "PT1H",
+        "P1D",
+        "P7D",
+        "P30D"
+      ]
+    },
+    "factorName": {
+      "enum": [
+        "topic",
+        "hook_3s",
+        "cover",
+        "title",
+        "duration",
+        "publish_time"
+      ]
+    },
+    "kpiKey": {
+      "enum": [
+        "collection_volume",
+        "ingestion_success_rate",
+        "analysis_backlog",
+        "generation_success_rate",
+        "rework_rate",
+        "review_duration",
+        "draft_rate",
+        "public_rate",
+        "receipt_latency",
+        "metric_freshness"
+      ]
+    },
+    "reportPeriod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startAt",
+        "endAt",
+        "cohortAnchor"
+      ],
+      "properties": {
+        "startAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "endAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "cohortAnchor": {
+          "enum": [
+            "material_first_ingested_at",
+            "event_occurred_at",
+            "review_anchor_at"
+          ]
+        }
+      }
+    },
+    "reportPeriodProjection": {
+      "description": "Legacy period projection accepted at adapter boundaries only. Canonical reports use reportPeriod with startAt/endAt/cohortAnchor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to",
+        "asOf",
+        "timezone"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "to": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "asOf": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "timezone": {
+          "const": "Asia/Shanghai"
+        }
+      }
+    },
+    "reportPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zeroIsAvailable",
+        "submittedIsPublic",
+        "causalClaimsAllowedByDefault",
+        "futureDataExcluded"
+      ],
+      "properties": {
+        "zeroIsAvailable": {
+          "const": true
+        },
+        "submittedIsPublic": {
+          "const": false
+        },
+        "causalClaimsAllowedByDefault": {
+          "const": false
+        },
+        "futureDataExcluded": {
+          "const": true
+        }
+      }
+    },
+    "snapshotCoverageBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duePosts",
+        "notDuePosts",
+        "recordedPosts",
+        "availablePosts",
+        "missingPosts",
+        "anchorMissingPosts",
+        "collectionCoverage",
+        "valueCoverage"
+      ],
+      "properties": {
+        "duePosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "notDuePosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recordedPosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "availablePosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missingPosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "anchorMissingPosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "collectionCoverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "valueCoverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "snapshotCoverageProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "PT1H",
+        "P1D",
+        "P7D",
+        "P30D"
+      ],
+      "properties": {
+        "PT1H": {
+          "$ref": "#/$defs/snapshotCoverageBucket"
+        },
+        "P1D": {
+          "$ref": "#/$defs/snapshotCoverageBucket"
+        },
+        "P7D": {
+          "$ref": "#/$defs/snapshotCoverageBucket"
+        },
+        "P30D": {
+          "$ref": "#/$defs/snapshotCoverageBucket"
+        }
+      }
+    },
+    "platformMetricStateCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "unavailable",
+        "not_collected",
+        "permission_denied",
+        "availableZero"
+      ],
+      "properties": {
+        "available": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unavailable": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_collected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "permission_denied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "availableZero": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "dailyOperationsProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "pendingReviews",
+        "needsRevision",
+        "approvedReviews"
+      ],
+      "properties": {
+        "state": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "pendingReviews": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "needsRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "approvedReviews": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "metricValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "value",
+        "reasonCode",
+        "rawValue",
+        "approximate"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/valueStatus"
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reasonCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        },
+        "rawValue": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
+        },
+        "approximate": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0
+              },
+              "reasonCode": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "type": "null"
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          }
+        }
+      ]
+    },
+    "statusCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "unavailable",
+        "notCollected",
+        "permissionDenied"
+      ],
+      "properties": {
+        "available": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unavailable": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "notCollected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "permissionDenied": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "eligibleCount",
+        "includedCount",
+        "excludedCount",
+        "coverageRatio",
+        "statusCounts"
+      ],
+      "properties": {
+        "eligibleCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "includedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excludedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "coverageRatio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "statusCounts": {
+          "$ref": "#/$defs/statusCounts"
+        }
+      }
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sampleCount",
+        "p50",
+        "p90",
+        "max"
+      ],
+      "properties": {
+        "sampleCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "p50": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "p90": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "openCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "openAgeP50Seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "distinctResolvedAssets": {
+          "description": "Auxiliary distinct material count resolved by intake attempts. It never replaces collection_volume's intake-attempt grain.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "operationalKpi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "grain",
+        "unit",
+        "formula",
+        "status",
+        "value",
+        "reasonCode",
+        "numerator",
+        "denominator",
+        "coverage",
+        "statistics",
+        "asOf"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/kpiKey"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "grain": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "unit": {
+          "enum": [
+            "count",
+            "ratio",
+            "seconds"
+          ]
+        },
+        "formula": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "status": {
+          "$ref": "#/$defs/valueStatus"
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reasonCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        },
+        "numerator": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "denominator": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "statistics": {
+          "$ref": "#/$defs/statistics"
+        },
+        "asOf": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0
+              },
+              "reasonCode": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "type": "null"
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          }
+        }
+      ]
+    },
+    "countKpi": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operationalKpi"
+        },
+        {
+          "properties": {
+            "unit": {
+              "const": "count"
+            },
+            "value": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "ratioKpi": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operationalKpi"
+        },
+        {
+          "properties": {
+            "unit": {
+              "const": "ratio"
+            },
+            "value": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        }
+      ]
+    },
+    "secondsKpi": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operationalKpi"
+        },
+        {
+          "properties": {
+            "unit": {
+              "const": "seconds"
+            }
+          }
+        }
+      ]
+    },
+    "kpiSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collectionVolume",
+        "ingestionSuccessRate",
+        "analysisBacklog",
+        "generationSuccessRate",
+        "reworkRate",
+        "reviewDurationSeconds",
+        "draftRate",
+        "publicRate",
+        "receiptLatencySeconds",
+        "metricFreshnessSeconds"
+      ],
+      "properties": {
+        "collectionVolume": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/countKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "collection_volume"
+                },
+                "statistics": {
+                  "required": [
+                    "distinctResolvedAssets"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "ingestionSuccessRate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ratioKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "ingestion_success_rate"
+                }
+              }
+            }
+          ]
+        },
+        "analysisBacklog": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/countKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "analysis_backlog"
+                }
+              }
+            }
+          ]
+        },
+        "generationSuccessRate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ratioKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "generation_success_rate"
+                }
+              }
+            }
+          ]
+        },
+        "reworkRate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ratioKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "rework_rate"
+                }
+              }
+            }
+          ]
+        },
+        "reviewDurationSeconds": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/secondsKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "review_duration"
+                }
+              }
+            }
+          ]
+        },
+        "draftRate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ratioKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "draft_rate"
+                }
+              }
+            }
+          ]
+        },
+        "publicRate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ratioKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "public_rate"
+                }
+              }
+            }
+          ]
+        },
+        "receiptLatencySeconds": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/secondsKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "receipt_latency"
+                }
+              }
+            }
+          ]
+        },
+        "metricFreshnessSeconds": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/secondsKpi"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "metric_freshness"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "firstIngestedAt",
+        "analysisEligible",
+        "source",
+        "isSynthetic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "firstIngestedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "analysisEligible": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      }
+    },
+    "generatedVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "materialIds",
+        "generationAttemptId",
+        "status",
+        "engine",
+        "createdAt",
+        "completedAt",
+        "isSynthetic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "materialIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          }
+        },
+        "generationAttemptId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "status": {
+          "enum": [
+            "queued",
+            "running",
+            "completed",
+            "failed",
+            "timed_out",
+            "invalid_output",
+            "canceled"
+          ]
+        },
+        "engine": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "completedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      }
+    },
+    "entityReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "material",
+            "generated_video"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        }
+      }
+    },
+    "platformPostState": {
+      "enum": [
+        "observed_source",
+        "workbench_draft",
+        "queued",
+        "scheduled",
+        "running",
+        "platform_draft",
+        "submitted",
+        "public_confirmed",
+        "failed",
+        "needs_attention",
+        "permission_denied"
+      ]
+    },
+    "platformPost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "materialId",
+        "sourceRef",
+        "role",
+        "platform",
+        "requestedMode",
+        "state",
+        "publisherReceiptId",
+        "publishedAt",
+        "externalPostId",
+        "externalUrl",
+        "isSynthetic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "materialId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "sourceRef": {
+          "$ref": "#/$defs/entityReference"
+        },
+        "role": {
+          "enum": [
+            "source",
+            "published"
+          ]
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "requestedMode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "workbench_draft",
+            "platform_draft",
+            "publish",
+            null
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/platformPostState"
+        },
+        "publisherReceiptId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "publishedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "externalPostId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "externalUrl": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri",
+          "maxLength": 2000
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "materials",
+        "generatedVideos",
+        "platformPosts"
+      ],
+      "properties": {
+        "materials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/material"
+          }
+        },
+        "generatedVideos": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/generatedVideo"
+          }
+        },
+        "platformPosts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/platformPost"
+          }
+        }
+      }
+    },
+    "reportLineageMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "createdAt"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        }
+      }
+    },
+    "reportLineageGeneratedVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "materialId",
+        "status",
+        "completedAt"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "materialId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "completedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        }
+      }
+    },
+    "reportLineagePlatformPost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "materialId",
+        "generatedVideoId",
+        "platform",
+        "contentId",
+        "publishedAt",
+        "role"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "materialId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "generatedVideoId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "contentId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "publishedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "role": {
+          "const": "published"
+        }
+      }
+    },
+    "reportLineageProjection": {
+      "description": "Legacy compact lineage projection for adapter validation only. Canonical report roots use lineage; cross-record material ownership is enforced at runtime.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "materials",
+        "generatedVideos",
+        "platformPosts"
+      ],
+      "properties": {
+        "materials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reportLineageMaterial"
+          }
+        },
+        "generatedVideos": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reportLineageGeneratedVideo"
+          }
+        },
+        "platformPosts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reportLineagePlatformPost"
+          }
+        }
+      }
+    },
+    "metricSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "platformPostId",
+        "platform",
+        "snapshotKind",
+        "snapshotOffset",
+        "revision",
+        "observationId",
+        "targetAt",
+        "sourceEventAt",
+        "observedAt",
+        "ingestedAt",
+        "source",
+        "values",
+        "isSynthetic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "platformPostId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "snapshotKind": {
+          "enum": [
+            "scheduled",
+            "ad_hoc"
+          ]
+        },
+        "snapshotOffset": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/snapshotOffset"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observationId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "targetAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "sourceEventAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "observedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "ingestedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]{0,79}$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/metricValue"
+          }
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "snapshotKind": {
+                "const": "scheduled"
+              }
+            },
+            "required": [
+              "snapshotKind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "snapshotOffset": {
+                "$ref": "#/$defs/snapshotOffset"
+              },
+              "targetAt": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "snapshotOffset": {
+                "type": "null"
+              },
+              "targetAt": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "funnelCohort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anchor",
+        "startAt",
+        "endAt",
+        "asOf"
+      ],
+      "properties": {
+        "anchor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "startAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "endAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "asOf": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "funnelStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "status",
+        "count",
+        "reasonCode",
+        "conversionFromPrevious"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "status": {
+          "$ref": "#/$defs/valueStatus"
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reasonCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        },
+        "conversionFromPrevious": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "reasonCode": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "count": {
+                "type": "null"
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          }
+        }
+      ]
+    },
+    "funnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "grain",
+        "cohort",
+        "stages"
+      ],
+      "properties": {
+        "key": {
+          "enum": [
+            "content",
+            "generation_attempts",
+            "creative_reviews",
+            "platform_posts"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "grain": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "cohort": {
+          "$ref": "#/$defs/funnelCohort"
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/funnelStage"
+          }
+        }
+      }
+    },
+    "funnelSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "generationAttempts",
+        "creativeReviews",
+        "platformPosts"
+      ],
+      "properties": {
+        "content": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/funnel"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "content"
+                }
+              }
+            }
+          ]
+        },
+        "generationAttempts": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/funnel"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "generation_attempts"
+                }
+              }
+            }
+          ]
+        },
+        "creativeReviews": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/funnel"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "creative_reviews"
+                }
+              }
+            }
+          ]
+        },
+        "platformPosts": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/funnel"
+            },
+            {
+              "properties": {
+                "key": {
+                  "const": "platform_posts"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "factorValue": {
+      "type": [
+        "string",
+        "number",
+        "boolean",
+        "object",
+        "array"
+      ]
+    },
+    "heldConstant": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 5,
+      "maxProperties": 5,
+      "properties": {
+        "topic": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "hook_3s": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "cover": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "title": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "duration": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "publish_time": {
+          "$ref": "#/$defs/factorValue"
+        }
+      }
+    },
+    "experimentBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "windowStartAt",
+        "windowEndAt",
+        "metricKey",
+        "metricValue",
+        "sampleSize"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "historical",
+            "concurrent_control",
+            "synthetic"
+          ]
+        },
+        "windowStartAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "windowEndAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "metricKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "metricValue": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "sampleSize": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sampleSizePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "control",
+        "variant"
+      ],
+      "properties": {
+        "unit": {
+          "enum": [
+            "platform_post",
+            "generated_video",
+            "material"
+          ]
+        },
+        "control": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "variant": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "successMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "direction",
+        "minimumDetectableEffect",
+        "unit",
+        "observationOffset"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "direction": {
+          "enum": [
+            "increase",
+            "decrease",
+            "non_inferior"
+          ]
+        },
+        "minimumDetectableEffect": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "observationOffset": {
+          "$ref": "#/$defs/snapshotOffset"
+        }
+      }
+    },
+    "stopConditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimumSamplePerArm",
+        "minimumDurationDays",
+        "maximumDurationDays",
+        "peekingPolicy",
+        "guardrails",
+        "dataQualityChecks"
+      ],
+      "properties": {
+        "minimumSamplePerArm": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimumDurationDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maximumDurationDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "peekingPolicy": {
+          "enum": [
+            "fixed_horizon",
+            "pre_registered_sequential"
+          ]
+        },
+        "guardrails": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        },
+        "dataQualityChecks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        }
+      }
+    },
+    "experimentConclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "observedEffect",
+        "intervalLower",
+        "intervalUpper",
+        "sampleSizeControl",
+        "sampleSizeVariant",
+        "coverage",
+        "decision",
+        "limitations",
+        "causalClaim"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pending",
+            "insufficient_data",
+            "supports_continue",
+            "no_clear_signal",
+            "stop"
+          ]
+        },
+        "observedEffect": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "intervalLower": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "intervalUpper": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sampleSizeControl": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sampleSizeVariant": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "decision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "causalClaim": {
+          "const": false
+        }
+      }
+    },
+    "experimentCard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status",
+        "primaryFactor",
+        "hypothesis",
+        "allocationMethod",
+        "evidenceLevel",
+        "analysisUnit",
+        "platforms",
+        "control",
+        "variant",
+        "heldConstant",
+        "baseline",
+        "sampleSizePlan",
+        "successMetric",
+        "stopConditions",
+        "conclusionTemplate",
+        "conclusion",
+        "createdAt",
+        "startedAt",
+        "endedAt",
+        "isSynthetic"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "running",
+            "stopped",
+            "completed",
+            "invalid"
+          ]
+        },
+        "primaryFactor": {
+          "$ref": "#/$defs/factorName"
+        },
+        "hypothesis": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "allocationMethod": {
+          "enum": [
+            "randomized",
+            "matched",
+            "observational"
+          ]
+        },
+        "evidenceLevel": {
+          "enum": [
+            "descriptive",
+            "associational",
+            "causal_randomized"
+          ]
+        },
+        "analysisUnit": {
+          "enum": [
+            "platform_post",
+            "generated_video",
+            "material"
+          ]
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "control": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "variant": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "heldConstant": {
+          "$ref": "#/$defs/heldConstant"
+        },
+        "baseline": {
+          "$ref": "#/$defs/experimentBaseline"
+        },
+        "sampleSizePlan": {
+          "$ref": "#/$defs/sampleSizePlan"
+        },
+        "successMetric": {
+          "$ref": "#/$defs/successMetric"
+        },
+        "stopConditions": {
+          "$ref": "#/$defs/stopConditions"
+        },
+        "conclusionTemplate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "conclusion": {
+          "$ref": "#/$defs/experimentConclusion"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "endedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "primaryFactor": {
+                "const": "topic"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "heldConstant": {
+                "required": [
+                  "hook_3s",
+                  "cover",
+                  "title",
+                  "duration",
+                  "publish_time"
+                ],
+                "not": {
+                  "required": [
+                    "topic"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "primaryFactor": {
+                "const": "hook_3s"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "heldConstant": {
+                "required": [
+                  "topic",
+                  "cover",
+                  "title",
+                  "duration",
+                  "publish_time"
+                ],
+                "not": {
+                  "required": [
+                    "hook_3s"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "primaryFactor": {
+                "const": "cover"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "heldConstant": {
+                "required": [
+                  "topic",
+                  "hook_3s",
+                  "title",
+                  "duration",
+                  "publish_time"
+                ],
+                "not": {
+                  "required": [
+                    "cover"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "primaryFactor": {
+                "const": "title"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "heldConstant": {
+                "required": [
+                  "topic",
+                  "hook_3s",
+                  "cover",
+                  "duration",
+                  "publish_time"
+                ],
+                "not": {
+                  "required": [
+                    "title"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "primaryFactor": {
+                "const": "duration"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "heldConstant": {
+                "required": [
+                  "topic",
+                  "hook_3s",
+                  "cover",
+                  "title",
+                  "publish_time"
+                ],
+                "not": {
+                  "required": [
+                    "duration"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "primaryFactor": {
+                "const": "publish_time"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "heldConstant": {
+                "required": [
+                  "topic",
+                  "hook_3s",
+                  "cover",
+                  "title",
+                  "duration"
+                ],
+                "not": {
+                  "required": [
+                    "publish_time"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reviewStatus": {
+      "enum": [
+        "not_due",
+        "ready",
+        "missing_data"
+      ]
+    },
+    "reviewFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "horizonDays",
+        "status",
+        "dueAt",
+        "dataCutoffAt",
+        "generatedAt",
+        "revision",
+        "dataMode",
+        "isSynthetic",
+        "sampleSize",
+        "coverage",
+        "snapshotOffsets",
+        "kpiKeys",
+        "summary",
+        "limitations",
+        "decisions"
+      ],
+      "properties": {
+        "horizonDays": {
+          "enum": [
+            7,
+            14,
+            30
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/reviewStatus"
+        },
+        "dueAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "dataCutoffAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "generatedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dataMode": {
+          "$ref": "#/$defs/dataMode"
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        },
+        "sampleSize": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "snapshotOffsets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/snapshotOffset"
+          }
+        },
+        "kpiKeys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/kpiKey"
+          }
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "not_due"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "generatedAt": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "generatedAt": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reviewSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "day7",
+        "day14",
+        "day30"
+      ],
+      "properties": {
+        "day7": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/reviewFrame"
+            },
+            {
+              "properties": {
+                "horizonDays": {
+                  "const": 7
+                }
+              }
+            }
+          ]
+        },
+        "day14": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/reviewFrame"
+            },
+            {
+              "properties": {
+                "horizonDays": {
+                  "const": 14
+                }
+              }
+            }
+          ]
+        },
+        "day30": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/reviewFrame"
+            },
+            {
+              "properties": {
+                "horizonDays": {
+                  "const": 30
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "reportExperimentArm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "topic",
+        "hook_3s",
+        "cover",
+        "title",
+        "duration",
+        "publish_time"
+      ],
+      "properties": {
+        "topic": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "hook_3s": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "cover": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "title": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "duration": {
+          "$ref": "#/$defs/factorValue"
+        },
+        "publish_time": {
+          "$ref": "#/$defs/factorValue"
+        }
+      }
+    },
+    "reportExperimentMetricValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "value",
+        "raw",
+        "reasonCode",
+        "sourceErrorCode"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/valueStatus"
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "raw": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "reasonCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        },
+        "sourceErrorCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0
+              },
+              "reasonCode": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "type": "null"
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reportExperimentBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "referenceId",
+        "window",
+        "sampleSize",
+        "metric"
+      ],
+      "properties": {
+        "referenceId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "window": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "sampleSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "metric": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/reportExperimentMetricValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "reportExperimentSuccessMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "direction",
+        "horizon",
+        "minimumDetectableEffect"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "direction": {
+          "enum": [
+            "increase",
+            "decrease",
+            "within_range"
+          ]
+        },
+        "horizon": {
+          "$ref": "#/$defs/snapshotOffset"
+        },
+        "minimumDetectableEffect": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "reportExperimentStopConditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimumSampleSize",
+        "minimumPerArm",
+        "minimumDurationDays",
+        "maxDurationDays",
+        "noPeekingBeforeMinimum",
+        "guardrails",
+        "dataQuality"
+      ],
+      "properties": {
+        "minimumSampleSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimumPerArm": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimumDurationDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxDurationDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "noPeekingBeforeMinimum": {
+          "type": "boolean"
+        },
+        "guardrails": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        },
+        "dataQuality": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        }
+      }
+    },
+    "reportExperimentCard": {
+      "description": "Legacy OFAT card shape accepted by adapters only. Canonical report roots use experimentCard; exact one-factor change and locked conditions are enforced at runtime.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "contractVersion",
+        "id",
+        "dataMode",
+        "status",
+        "primaryFactor",
+        "hypothesis",
+        "control",
+        "variant",
+        "heldConstant",
+        "baseline",
+        "sampleUnit",
+        "plannedSampleSize",
+        "minimumSampleSize",
+        "assignmentMethod",
+        "evidenceLevel",
+        "platforms",
+        "successMetric",
+        "stopConditions",
+        "conclusionTemplate",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "enum": [
+            1,
+            "1.0.0"
+          ]
+        },
+        "contractVersion": {
+          "const": "1.0.0"
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "dataMode": {
+          "$ref": "#/$defs/dataMode"
+        },
+        "status": {
+          "enum": [
+            "planned",
+            "running",
+            "stopped",
+            "completed",
+            "invalid"
+          ]
+        },
+        "primaryFactor": {
+          "$ref": "#/$defs/factorName"
+        },
+        "hypothesis": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "control": {
+          "$ref": "#/$defs/reportExperimentArm"
+        },
+        "variant": {
+          "$ref": "#/$defs/reportExperimentArm"
+        },
+        "heldConstant": {
+          "$ref": "#/$defs/heldConstant"
+        },
+        "baseline": {
+          "$ref": "#/$defs/reportExperimentBaseline"
+        },
+        "sampleUnit": {
+          "enum": [
+            "platform_post",
+            "generated_video",
+            "material",
+            "account"
+          ]
+        },
+        "plannedSampleSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimumSampleSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "assignmentMethod": {
+          "enum": [
+            "randomized",
+            "matched",
+            "observational"
+          ]
+        },
+        "evidenceLevel": {
+          "enum": [
+            "descriptive",
+            "associational",
+            "causal_randomized"
+          ]
+        },
+        "platforms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "successMetric": {
+          "$ref": "#/$defs/reportExperimentSuccessMetric"
+        },
+        "stopConditions": {
+          "$ref": "#/$defs/reportExperimentStopConditions"
+        },
+        "conclusionTemplate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "legacyMetricProjectionValue": {
+      "description": "Compatibility-only value emitted by the pre-canonical operations prototype. Adapters normalize units and expand coverage before populating kpis.",
+      "type": "object",
+      "required": [
+        "status",
+        "value",
+        "unit"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/valueStatus"
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "reasonCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        }
+      },
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "type": "null"
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            },
+            "required": [
+              "reasonCode"
+            ]
+          }
+        }
+      ]
+    },
+    "legacyMetricsProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collection_volume",
+        "ingestion_success_rate",
+        "analysis_backlog",
+        "generation_success_rate",
+        "rework_rate",
+        "review_duration",
+        "draft_rate",
+        "public_rate",
+        "receipt_latency",
+        "metric_freshness"
+      ],
+      "properties": {
+        "collection_volume": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "required": [
+                "distinctResolvedAssets"
+              ],
+              "properties": {
+                "unit": {
+                  "const": "intake_items"
+                },
+                "distinctResolvedAssets": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        },
+        "ingestion_success_rate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ratio"
+                },
+                "value": {
+                  "maximum": 1
+                }
+              }
+            }
+          ]
+        },
+        "analysis_backlog": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "assets"
+                }
+              }
+            }
+          ]
+        },
+        "generation_success_rate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ratio"
+                },
+                "value": {
+                  "maximum": 1
+                }
+              }
+            }
+          ]
+        },
+        "rework_rate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ratio"
+                },
+                "value": {
+                  "maximum": 1
+                }
+              }
+            }
+          ]
+        },
+        "review_duration": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "seconds_p50"
+                }
+              }
+            }
+          ]
+        },
+        "draft_rate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ratio"
+                },
+                "value": {
+                  "maximum": 1
+                }
+              }
+            }
+          ]
+        },
+        "public_rate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ratio"
+                },
+                "value": {
+                  "maximum": 1
+                }
+              }
+            }
+          ]
+        },
+        "receipt_latency": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "seconds_p50"
+                }
+              }
+            }
+          ]
+        },
+        "metric_freshness": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/legacyMetricProjectionValue"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "seconds_p90"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "legacyFunnelProjectionStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "count"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "legacyFunnelProjectionRail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "stages"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "cohort": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/legacyFunnelProjectionStage"
+          }
+        },
+        "outcomes": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[A-Za-z][A-Za-z0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "publishedPosts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "postsWithMetricObservation": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "legacyFeedbackFunnelProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "generationAttempts",
+        "review",
+        "distribution"
+      ],
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/legacyFunnelProjectionRail"
+        },
+        "generationAttempts": {
+          "$ref": "#/$defs/legacyFunnelProjectionRail"
+        },
+        "review": {
+          "$ref": "#/$defs/legacyFunnelProjectionRail"
+        },
+        "distribution": {
+          "$ref": "#/$defs/legacyFunnelProjectionRail"
+        }
+      }
+    },
+    "legacyReviewFrameworkItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "day",
+        "horizons",
+        "focus",
+        "dueAt",
+        "asOf",
+        "timezone",
+        "status",
+        "dataCutoff",
+        "conclusionTemplate"
+      ],
+      "properties": {
+        "day": {
+          "enum": [
+            7,
+            14,
+            30
+          ]
+        },
+        "horizons": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "PT1H",
+              "P1D",
+              "P7D",
+              "P30D"
+            ]
+          }
+        },
+        "focus": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        },
+        "dueAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "asOf": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "timezone": {
+          "const": "Asia/Shanghai"
+        },
+        "status": {
+          "$ref": "#/$defs/reviewStatus"
+        },
+        "dataCutoff": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "conclusionTemplate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        }
+      }
+    },
+    "legacyReviewFrameworkProjection": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/legacyReviewFrameworkItem"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "day": {
+                "const": 7
+              }
+            },
+            "required": [
+              "day"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "day": {
+                "const": 14
+              }
+            },
+            "required": [
+              "day"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "day": {
+                "const": 30
+              }
+            },
+            "required": [
+              "day"
+            ]
+          }
+        }
+      ]
+    },
+    "reportProvenanceProjection": {
+      "description": "Legacy compact provenance projection for adapter validation only. Canonical report roots use provenanceSource.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "mode",
+        "records"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "mode": {
+          "enum": [
+            "read_only",
+            "caller_supplied"
+          ]
+        },
+        "records": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          }
+        }
+      }
+    },
+    "provenanceSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "recordCount",
+        "latestObservedAt",
+        "notes"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 80
+        },
+        "recordCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "latestObservedAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1000
+        }
+      }
+    },
+    "validationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "recordType",
+        "recordId",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "recordType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "recordId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "publisherReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receiptId",
+        "revision",
+        "publishTaskId",
+        "materialId",
+        "generatedVideoId",
+        "platformPostId",
+        "platform",
+        "accountRef",
+        "requestedMode",
+        "status",
+        "sourceEventAt",
+        "observedAt",
+        "externalPostId",
+        "externalUrl",
+        "source",
+        "isSynthetic"
+      ],
+      "properties": {
+        "receiptId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "publishTaskId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "materialId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "generatedVideoId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "platformPostId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "accountRef": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "requestedMode": {
+          "enum": [
+            "workbench_draft",
+            "platform_draft",
+            "publish"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/platformPostState"
+        },
+        "sourceEventAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "observedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "externalPostId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "externalUrl": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri",
+          "maxLength": 2000
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "public_confirmed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "externalPostId": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "externalUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "creativeReviewEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewEventId",
+        "reviewCycleId",
+        "materialId",
+        "generatedVideoId",
+        "eventType",
+        "decision",
+        "submittedAt",
+        "decisionAt",
+        "reasonCodes",
+        "source",
+        "isSynthetic"
+      ],
+      "properties": {
+        "reviewEventId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "reviewCycleId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "materialId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "generatedVideoId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "eventType": {
+          "enum": [
+            "submitted",
+            "decision",
+            "withdrawn"
+          ]
+        },
+        "decision": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "approved",
+            "changes_requested",
+            "rejected",
+            null
+          ]
+        },
+        "submittedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "decisionAt": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "reasonCodes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          }
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "isSynthetic": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "decision"
+              }
+            },
+            "required": [
+              "eventType"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "approved",
+                  "changes_requested",
+                  "rejected"
+                ]
+              },
+              "decisionAt": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "decision": {
+                "type": "null"
+              },
+              "decisionAt": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dailyCreativeEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "date",
+        "timezone",
+        "asOf",
+        "contractVersion",
+        "dataMode",
+        "operationsReportId",
+        "syntheticNotice"
+      ],
+      "properties": {
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "timezone": {
+          "const": "Asia/Shanghai"
+        },
+        "asOf": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "contractVersion": {
+          "const": "1.0.0"
+        },
+        "dataMode": {
+          "$ref": "#/$defs/dataMode"
+        },
+        "operationsReportId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "syntheticNotice": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "dataMode": {
+                "const": "synthetic"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "syntheticNotice": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "合成"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "syntheticNotice": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

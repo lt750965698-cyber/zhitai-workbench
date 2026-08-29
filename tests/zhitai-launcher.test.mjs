@@ -23,6 +23,7 @@ function setupFake(spawnLog, httpUpResult = false) {
     runtimeScript: RUNTIME_SCRIPT,
     analyzerScript: path.join(PROJECT_DIR, "scripts", "video-analysis-server.mjs"),
     logDir: path.join(os.tmpdir(), "zhitai-test-logs"),
+    nodeBin: NODE_BIN,
     xhsAccountsDir: path.join(os.tmpdir(), `zhitai-launcher-xhs-${process.pid}`),
     xhsLegacyCookiesPath: path.join(os.tmpdir(), `zhitai-launcher-missing-legacy-${process.pid}.json`),
     xhsBinary: path.join(os.tmpdir(), "fake-xiaohongshu-mcp"),
@@ -61,16 +62,75 @@ test("分析器（process.execPath 为 Electron）子进程显式 ELECTRON_RUN_A
   assert.equal(options.env && options.env.ELECTRON_RUN_AS_NODE, "1", "analyzer 子进程必须进入 Node 模式");
 });
 
-// ---- 3. 织台页面用绝对 node + vinext 生产构建，不依赖 Finder PATH / npm 生命周期 ----
-test("织台页面使用明确现有 node 与 vinext CLI 绝对路径", async () => {
+// ---- 3. 织台页面用绝对 node + standalone 生产构建，不依赖 Finder PATH / npm 生命周期 ----
+test("织台页面使用明确现有 node 与 standalone 入口", async () => {
   const spawnLog = [];
   setupFake(spawnLog);
   mockNoWeb();
   await ensureService("web");
   const call = spawnLog.find(([cmd]) => cmd === NODE_BIN);
   assert.ok(call, "web 必须用绝对 node 启动");
-  assert.equal(call[1][0], path.join(PROJECT_DIR, "node_modules", "vinext", "dist", "cli.js"));
-  assert.deepEqual(call[1].slice(1), ["start", "--port", "3001", "--hostname", "127.0.0.1"]);
+  assert.deepEqual(call[1], [path.join(PROJECT_DIR, "dist", "standalone", "server.js")]);
+  assert.equal(call[2].cwd, path.join(PROJECT_DIR, "dist", "standalone"));
+  assert.equal(call[2].env.PORT, "3001");
+  assert.equal(call[2].env.HOST, "127.0.0.1");
+});
+
+test("织台页面探测与返回地址固定使用 IPv4 回环地址", async () => {
+  setupFake([], false);
+  let probedUrl = null;
+  globalThis.fetch = async (url) => {
+    probedUrl = String(url);
+    return new Response("workbench-shell", { status: 200 });
+  };
+  const state = await ensureService("web");
+  assert.equal(probedUrl, "http://127.0.0.1:3000/");
+  assert.equal(state.url, "http://127.0.0.1:3000");
+});
+
+test("vinext 子进程：nodeBin 为指向另一路径 Electron 的符号链接时进入 Node 模式", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zhitai-electron-node-link-"));
+  const electronBin = path.join(root, "alternate", "Electron");
+  const nodeLink = path.join(root, "bin", "node");
+  fs.mkdirSync(path.dirname(electronBin), { recursive: true });
+  fs.mkdirSync(path.dirname(nodeLink), { recursive: true });
+  fs.writeFileSync(electronBin, "fixture", { mode: 0o755 });
+  fs.symlinkSync(electronBin, nodeLink);
+  const spawnLog = [];
+  setupFake(spawnLog);
+  init({ nodeBin: nodeLink });
+  mockNoWeb();
+  try {
+    await ensureService("web");
+    const call = spawnLog.find(([cmd]) => cmd === nodeLink);
+    assert.ok(call, "web 应使用选中的 node 符号链接启动");
+    assert.equal(call[2]?.env?.ELECTRON_RUN_AS_NODE, "1");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("vinext 子进程：真实 Node 保留现有环境且不强制 Electron 模式", async () => {
+  const savedMarker = process.env.ZHITAI_TEST_WEB_ENV;
+  const savedRunAsNode = process.env.ELECTRON_RUN_AS_NODE;
+  process.env.ZHITAI_TEST_WEB_ENV = "preserved";
+  delete process.env.ELECTRON_RUN_AS_NODE;
+  const spawnLog = [];
+  setupFake(spawnLog);
+  init({ nodeBin: process.execPath });
+  mockNoWeb();
+  try {
+    await ensureService("web");
+    const call = spawnLog.find(([cmd]) => cmd === process.execPath);
+    assert.ok(call, "web 应使用真实 Node 启动");
+    assert.equal(call[2]?.env?.ZHITAI_TEST_WEB_ENV, "preserved");
+    assert.equal(call[2]?.env?.ELECTRON_RUN_AS_NODE, undefined);
+  } finally {
+    if (savedMarker === undefined) delete process.env.ZHITAI_TEST_WEB_ENV;
+    else process.env.ZHITAI_TEST_WEB_ENV = savedMarker;
+    if (savedRunAsNode === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+    else process.env.ELECTRON_RUN_AS_NODE = savedRunAsNode;
+  }
 });
 
 test("npm-locate：PATH 无 npm 时回退到绝对候选路径（不依赖 Finder PATH）", () => {
@@ -212,7 +272,7 @@ test("vinext start 子进程 env：干净 PATH 下 PATH 以 node 目录开头、
     await ensureService("web");
     const call = spawnLog.find(([cmd]) => cmd === NODE_BIN);
     assert.ok(call, "web 必须用绝对 node 启动");
-    assert.deepEqual(call[1], [path.join(PROJECT_DIR, "node_modules", "vinext", "dist", "cli.js"), "start", "--port", "3001", "--hostname", "127.0.0.1"]);
+    assert.deepEqual(call[1], [path.join(PROJECT_DIR, "dist", "standalone", "server.js")]);
     const env = call[2]?.env || {};
     const nodeDir = path.dirname(NODE_BIN);
     assert.ok(env.PATH.startsWith(nodeDir + path.delimiter), "PATH 必须以 node 目录开头：实际 " + env.PATH);

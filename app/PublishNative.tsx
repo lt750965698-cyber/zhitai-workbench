@@ -164,6 +164,155 @@ function reconcileImageTextAccountChoice(
   return next;
 }
 
+const PUBLISH_PLATFORM_LABELS: Record<string, string> = {
+  dy: "抖音",
+  douyin: "抖音",
+  tt: "今日头条",
+  toutiao: "今日头条",
+  jinritoutiao: "今日头条",
+  ks: "快手",
+  kuaishou: "快手",
+  blbl: "哔哩哔哩",
+  bilibili: "哔哩哔哩",
+  bjh: "百家号",
+  baijiahao: "百家号",
+  sph: "视频号",
+  channels: "视频号",
+  wechat_channels: "视频号",
+  xhs: "小红书",
+  xiaohongshu: "小红书",
+  fqsp: "番茄视频",
+  fanqie: "番茄视频",
+  wechat_official: "微信公众号",
+  wechat_official_account: "微信公众号",
+  wechatofficial: "微信公众号",
+};
+
+// 这里覆盖本地调度器、本地回执和 Matrix 历史三类状态。
+// 未识别值只显示中文保守结论，不把引擎英文直出给用户。
+const PUBLISH_STATUS_LABELS: Record<string, string> = {
+  scheduled: "已排期",
+  queued: "等待执行",
+  pending: "等待执行",
+  preflighting: "发布前检查中",
+  preparing: "准备发布中",
+  submitting: "正在上传",
+  processing: "平台处理中",
+  public: "已公开发布",
+  published: "已公开发布",
+  draft: "已保存到平台草稿",
+  platform_draft: "已保存到平台草稿",
+  submitted: "已上传，公开状态待核实",
+  accepted: "已上传，公开状态待核实",
+  submitted_unverified: "已上传，公开状态待核实",
+  success: "平台已接收，公开状态待核实",
+  completed: "任务已完成",
+  failed: "发布失败，未完成",
+  failure: "发布失败，未完成",
+  error: "发布失败，未完成",
+  rejected: "平台拒绝，未完成",
+  needs_attention: "未完成，需要处理",
+  needs_reconciliation: "已提交，平台结果待核对",
+  retry_wait: "临时故障，等待自动重试",
+  expired: "排期已过期，未执行",
+  cancelled: "已取消，未执行",
+  canceled: "已取消，未执行",
+  unknown: "平台状态待核实",
+  unverified: "平台状态待核实",
+};
+
+function normalizedPublishToken(value: unknown): string {
+  return String(value || "")
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function formatBeijingDateTime(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  const date = new Date(value as string | number | Date);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
+function publishStatusText(value: unknown, record: Record<string, unknown> | null = null): string {
+  const status = normalizedPublishToken(value) || "unknown";
+  if (status === "scheduled") {
+    const scheduledAt = formatBeijingDateTime(record?.scheduledAt);
+    const prefix = normalizedPublishToken(record?.schedulerState) === "scheduler_inactive"
+      ? "旧排期未被织台接管，不会自动执行"
+      : PUBLISH_STATUS_LABELS.scheduled;
+    return scheduledAt ? `${prefix}：北京时间 ${scheduledAt}` : `${prefix}（发布时间未返回）`;
+  }
+  if (status === "retry_wait") {
+    const nextAttemptAt = formatBeijingDateTime(record?.nextAttemptAt);
+    return nextAttemptAt
+      ? `${PUBLISH_STATUS_LABELS.retry_wait}：北京时间 ${nextAttemptAt}`
+      : PUBLISH_STATUS_LABELS.retry_wait;
+  }
+  return PUBLISH_STATUS_LABELS[status] || "平台状态待核实";
+}
+
+function historyStatusText(record: Record<string, unknown>): string {
+  const state = firstText(record, ["state", "status", "publishStatus"]) || "unknown";
+  return publishStatusText(state, record);
+}
+
+function publishPlatformLabel(value: unknown): string | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const token = normalizedPublishToken(raw.split(":", 1)[0]);
+  if (!token || token === "unknown") return null;
+  if (PUBLISH_PLATFORM_LABELS[token]) return PUBLISH_PLATFORM_LABELS[token];
+  // 平台若已返回中文名称则保留；其他未知代码不直出英文。
+  return /[\u3400-\u9fff]/.test(raw) ? raw : "其他平台";
+}
+
+function historyPlatformText(record: Record<string, unknown>): string {
+  const values: unknown[] = [];
+  if (record.platform) values.push(record.platform);
+  if (record.destination) values.push(record.destination);
+  if (Array.isArray(record.targets)) {
+    for (const rawTarget of record.targets) {
+      if (typeof rawTarget === "string") {
+        values.push(rawTarget);
+        continue;
+      }
+      const target = recordOf(rawTarget);
+      values.push(target?.destination ?? target?.platform ?? target?.id ?? null);
+    }
+  }
+  const labels = values.map(publishPlatformLabel).filter((label): label is string => Boolean(label));
+  return [...new Set(labels)].join("、") || "平台未返回";
+}
+
+function historyRecordTimeText(record: Record<string, unknown>): string {
+  const time = [record.time, record.updatedAt, record.created_at, record.createdAt]
+    .map(formatBeijingDateTime)
+    .find(Boolean);
+  return time ? `记录时间：北京时间 ${time}` : "记录时间未返回";
+}
+
+function publishFailureText(value: unknown): string {
+  const raw = String(value || "").trim();
+  if (/48001/.test(raw)) return "账号没有正式发布权限，任务未完成";
+  if (/ai.{0,20}(statement|declaration)|statement.{0,20}ai/i.test(raw)) return "无法确认 AI 生成声明，任务未完成";
+  if (/login|auth|credential|unauthorized|forbidden|cookie/i.test(raw)) return "需要重新登录或检查账号权限，任务未完成";
+  if (/timeout|timed out/i.test(raw)) return "平台响应超时，任务未完成";
+  if (/[\u3400-\u9fff]/.test(raw)) return raw.slice(0, 160);
+  return "发布服务未返回可读原因，任务未完成";
+}
+
 export function PublishNative({
   libraryItems,
   initialVideoId,
@@ -195,7 +344,7 @@ export function PublishNative({
   const [submitting, setSubmitting] = useState(false);
   const [loginPlatform, setLoginPlatform] = useState<"dy" | "sph">("dy");
   const [loginPhone, setLoginPhone] = useState("");
-  const [login, setLogin] = useState<{ id: string; status: string; message: string; interactionMode?: "inline_qr" | "window"; qrData?: string | null } | null>(null);
+  const [login, setLogin] = useState<{ id: string; status: string; message: string; interactionMode?: "inline_qr" | "window"; qrAvailable?: boolean } | null>(null);
   const [imageTextStatus, setImageTextStatus] = useState<ImageTextStatus | null>(null);
   const [xhsAccounts, setXhsAccounts] = useState<ImageTextAccount[]>([]);
   const [wechatAccounts, setWechatAccounts] = useState<ImageTextAccount[]>([]);
@@ -467,8 +616,17 @@ export function PublishNative({
         mode: imageTextMode,
         scheduledAt: scheduledAt || undefined,
       }, { timeoutMs: 10 * 60_000, confirmedAction: true });
+      const resultRecord = recordOf(result.body);
+      const taskRecord = recordOf(resultRecord?.task);
       const rows = (result.body as { results?: Array<{ destination: string; success: boolean; status: string; error?: string }> } | null)?.results || [];
-      setMsg(rows.length ? rows.map((row) => row.destination + "：" + (row.success ? row.status : row.error || row.status)).join("；") : "图文任务未返回结果");
+      const resultScheduledAt = taskRecord?.scheduledAt || scheduledAt || null;
+      setMsg(rows.length ? rows.map((row) => {
+        const platform = publishPlatformLabel(row.destination) || "平台";
+        const detail = row.success
+          ? publishStatusText(row.status, { scheduledAt: resultScheduledAt })
+          : publishFailureText(row.error || row.status);
+        return `${platform}：${detail}`;
+      }).join("；") : "图文任务未返回结果");
     } finally { setSubmitting(false); }
   }
 
@@ -501,11 +659,28 @@ export function PublishNative({
         }),
       });
       const data = await res.json().catch(() => null);
-      if (!res.ok) { setMsg("提交失败：" + String((data && (data.error || data.message)) || `HTTP ${res.status}`)); return; }
-      setMsg(`已提交 ${data?.results?.total ?? selectedPlatforms.length} 个平台（MatrixMedia 状态：${data?.results?.detail?.status ?? "submitted"}）`);
+      if (!res.ok) { setMsg("提交失败：" + publishFailureText(data && (data.error || data.message))); return; }
+      const responseTask = recordOf(data?.task);
+      const responseResults = recordOf(data?.results);
+      const responseDetail = recordOf(responseResults?.detail);
+      const responseStatus = firstText(responseDetail, ["status"])
+        || firstText(responseTask, ["status"])
+        || (data?.scheduled === true ? "scheduled" : "submitted");
+      const responseScheduledAt = responseTask?.scheduledAt || scheduledAt || null;
+      const responseTotal = typeof responseResults?.total === "number" ? responseResults.total : selectedPlatforms.length;
+      const statusText = publishStatusText(responseStatus, { scheduledAt: responseScheduledAt });
+      if (data?.businessSuccess === true) {
+        setMsg(`平台已回读公开：${responseTotal} 个目标`);
+      } else if (data?.requiresReadback === true && ["submitted", "submitted_unverified"].includes(normalizedPublishToken(responseStatus))) {
+        setMsg(mode === "publish"
+          ? `已受理 ${responseTotal} 个平台，等待独立平台回读；当前不算公开成功`
+          : `已受理 ${responseTotal} 个平台，等待平台草稿回读；当前尚未确认草稿保存`);
+      } else {
+        setMsg(`已受理 ${responseTotal} 个平台：${statusText}`);
+      }
       void loadAll();
     } catch (e) {
-      setMsg("提交失败：" + (e instanceof Error ? e.message : String(e)));
+      setMsg("提交失败：" + publishFailureText(e instanceof Error ? e.message : e));
     } finally {
       setSubmitting(false);
     }
@@ -548,8 +723,7 @@ export function PublishNative({
           <button className="lime-button" type="button" onClick={() => void startLogin()}>{loginPlatform === "sph" ? "打开登录窗口" : "生成二维码"}</button>
         </div>
         {login && <div className="publisher-login-result">
-          {login.qrData && <img src={login.qrData} alt="发布账号登录二维码" /> /* eslint-disable-line @next/next/no-img-element -- 本地临时二维码不经过图片优化 */}
-          <div><strong>{login.status === "success" ? "账号已连接" : login.status === "failed" ? "登录需要处理" : login.interactionMode === "window" ? "完成官方登录" : "等待扫码"}</strong><p>{login.message}</p></div>
+          <div><strong>{login.status === "success" ? "账号已连接" : login.status === "failed" ? "登录需要处理" : login.qrAvailable ? "二维码已安全发送到手机" : login.interactionMode === "window" ? "正在准备官方登录" : "正在生成二维码"}</strong><p>{login.message}</p></div>
         </div>}
         {noAccounts ? <div className="publisher-empty-line"><strong>还没有可用的视频账号</strong><span>在上方生成二维码并扫码；完成后账号会自动出现在这里。</span></div> : (
           <div className="data-table task-table">
@@ -721,9 +895,8 @@ export function PublishNative({
           <div className="table-row table-header"><span>内容</span><span>状态</span><span /></div>
           {history.map((item, i) => {
             const rec = item as Record<string, unknown>;
-            const t = String(rec.title || rec.name || JSON.stringify(rec)).slice(0, 60);
-            const st = String(rec.status || rec.state || "submitted");
-            return <div className="table-row" key={i}><div className="table-content-cell"><p><strong>{t}</strong><small>{String(rec.platform || "")} · {String(rec.time || rec.created_at || "")}</small></p></div><span>{st}</span><span /></div>;
+            const t = String(rec.title || rec.name || "未命名内容").slice(0, 60);
+            return <div className="table-row" key={i}><div className="table-content-cell"><p><strong>{t}</strong><small>{historyPlatformText(rec)} · {historyRecordTimeText(rec)}</small></p></div><span>{historyStatusText(rec)}</span><span /></div>;
           })}
           {!history.length && <div className="empty-state"><span>↗</span><strong>暂无发布记录</strong><p>发布引擎尚无发布记录。</p></div>}
         </div>

@@ -25,6 +25,12 @@ import { homedir } from "node:os";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
+import {
+  hardenMatrixMediaAsar,
+  matrixMediaAsarHeaderSha256,
+  migrateMatrixMediaDataWithoutOverwrite,
+} from "./matrixmedia-upgrade-hardening.mjs";
+
 const RUNTIME_ROOT = resolve(process.env.ZHITAI_RUNTIME_ROOT
   || join(homedir(), ".local", "share", "zhitai-runtime"));
 const APPLICATIONS_ROOT = resolve(process.env.ZHITAI_APPLICATIONS_DIR
@@ -34,6 +40,10 @@ const XIANYU_ROOT = resolve(process.env.ZHITAI_XIANYU_ROOT
 const ENGINE_ROOT = join(RUNTIME_ROOT, "engines");
 const UPDATE_ROOT = join(RUNTIME_ROOT, "updates");
 const BACKUP_ROOT = join(RUNTIME_ROOT, "backups");
+const MATRIXMEDIA_LEGACY_DATA_ROOT = resolve(process.env.ZHITAI_MATRIXMEDIA_LEGACY_DATA_ROOT
+  || join(homedir(), "Documents", "MatrixMedia", "data"));
+const MATRIXMEDIA_USER_DATA_ROOT = resolve(process.env.ZHITAI_MATRIXMEDIA_USER_DATA_ROOT
+  || join(homedir(), "Library", "Application Support", "matrix-video", "MatrixMedia", "data"));
 
 const MODULES = {
   "mcp-video-analyzer": { repo: "guimatheus92/mcp-video-analyzer" },
@@ -130,15 +140,24 @@ export function assertTrustedGithubUrl(value, policy, redirect = false) {
   throw new Error("更新器缺少下载地址策略");
 }
 
-function run(command, args, { cwd, timeoutMs = 120_000, allowedCodes = [0] } = {}) {
+function run(command, args, {
+  cwd,
+  timeoutMs = 120_000,
+  allowedCodes = [0],
+  env: environment = {},
+  unsetEnv = [],
+} = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
+    const childEnvironment = {
+      ...process.env,
+      PATH: [dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
+      NO_PROXY: "localhost,127.0.0.1,::1,github.com,api.github.com,raw.githubusercontent.com",
+      ...environment,
+    };
+    for (const key of unsetEnv) delete childEnvironment[key];
     const child = spawn(command, args, {
       cwd,
-      env: {
-        ...process.env,
-        PATH: [dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
-        NO_PROXY: "localhost,127.0.0.1,::1,github.com,api.github.com,raw.githubusercontent.com",
-      },
+      env: childEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -318,6 +337,36 @@ async function assertExpectedRelease(release, expectedVersion) {
   return latest;
 }
 
+async function setMatrixMediaAsarIntegrity(plistPath, digest) {
+  const plistBuddy = "/usr/libexec/PlistBuddy";
+  const entry = ":ElectronAsarIntegrity:Resources/app.asar";
+  const algorithm = await run(plistBuddy, ["-c", `Set ${entry}:algorithm SHA256`, plistPath], { allowedCodes: [0, 1] });
+  const hash = await run(plistBuddy, ["-c", `Set ${entry}:hash ${digest}`, plistPath], { allowedCodes: [0, 1] });
+  if (algorithm.code !== 0 || hash.code !== 0) {
+    await run(plistBuddy, ["-c", `Delete ${entry}`, plistPath], { allowedCodes: [0, 1] });
+    await run(plistBuddy, ["-c", "Add :ElectronAsarIntegrity dict", plistPath], { allowedCodes: [0, 1] });
+    await run(plistBuddy, ["-c", `Add ${entry} dict`, plistPath]);
+    await run(plistBuddy, ["-c", `Add ${entry}:algorithm string SHA256`, plistPath]);
+    await run(plistBuddy, ["-c", `Add ${entry}:hash string ${digest}`, plistPath]);
+  }
+  const verifiedAlgorithm = (await run(plistBuddy, ["-c", `Print ${entry}:algorithm`, plistPath])).out.trim();
+  const verifiedHash = (await run(plistBuddy, ["-c", `Print ${entry}:hash`, plistPath])).out.trim();
+  if (verifiedAlgorithm !== "SHA256" || verifiedHash !== digest) {
+    throw new Error("MatrixMedia ElectronAsarIntegrity 写入复核失败；拒绝更新");
+  }
+}
+
+async function smokeMatrixMediaCli(binary) {
+  const options = {
+    timeoutMs: 30_000,
+    env: { MATRIXMEDIA_DISABLE_TELEMETRY: "1" },
+    unsetEnv: ["ELECTRON_RUN_AS_NODE"],
+  };
+  await run(binary, ["cli", "--help"], options);
+  await run(binary, ["cli", "accounts", "--json"], options);
+  await run(binary, ["cli", "history", "--json"], options);
+}
+
 async function installMatrixMedia(release, expectedVersion) {
   const version = await assertExpectedRelease(release, expectedVersion);
   const asset = chooseReleaseAsset("matrixmedia", release);
@@ -355,15 +404,19 @@ async function installMatrixMedia(release, expectedVersion) {
   const stagedVersion = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1];
   if (normalizedVersion(stagedVersion) !== version) throw new Error(`旁路版本校验失败（安装包 ${stagedVersion || "未知"}，Release ${version}）`);
   const stagedBinary = join(staged, "Contents", "MacOS", "matrixmedia");
+  const stagedPlist = join(staged, "Contents", "Info.plist");
+  const stagedAsar = join(staged, "Contents", "Resources", "app.asar");
   const frameworkLink = await readlink(join(staged, "Contents", "Frameworks", "Electron Framework.framework", "Electron Framework"));
   if (frameworkLink.startsWith("/")) throw new Error("旁路应用包含指向临时挂载盘的绝对 Framework 链接，拒绝切换");
+  await hardenMatrixMediaAsar(stagedAsar, workspace);
+  await migrateMatrixMediaDataWithoutOverwrite(MATRIXMEDIA_LEGACY_DATA_ROOT, MATRIXMEDIA_USER_DATA_ROOT);
+  await setMatrixMediaAsarIntegrity(stagedPlist, matrixMediaAsarHeaderSha256(stagedAsar));
   // 织台只使用 CLI；把官方 Electron bundle 标记为后台附件，避免每次
   // 账号查询/发布时 Dock 短暂出现图标。修改 plist 后用本机 ad-hoc 重签名。
-  const stagedPlist = join(staged, "Contents", "Info.plist");
   const setAgent = await run("/usr/libexec/PlistBuddy", ["-c", "Set :LSUIElement true", stagedPlist], { allowedCodes: [0, 1] });
   if (setAgent.code !== 0) await run("/usr/libexec/PlistBuddy", ["-c", "Add :LSUIElement bool true", stagedPlist]);
   await run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", staged], { timeoutMs: 120_000 });
-  await run(stagedBinary, ["cli", "--help"], { timeoutMs: 30_000 });
+  await smokeMatrixMediaCli(stagedBinary);
 
   const target = join(ENGINE_ROOT, "matrixmedia.app");
   let currentVersion = "unknown";
@@ -377,7 +430,7 @@ async function installMatrixMedia(release, expectedVersion) {
   try {
     await rename(staged, target);
     // 在最终路径再跑一次，防止旁路目录可用但切换后的 bundle 失效。
-    await run(join(target, "Contents", "MacOS", "matrixmedia"), ["cli", "--help"], { timeoutMs: 30_000 });
+    await smokeMatrixMediaCli(join(target, "Contents", "MacOS", "matrixmedia"));
   }
   catch (error) {
     if (await exists(target)) await rename(target, join(workspace, "failed-matrixmedia.app"));

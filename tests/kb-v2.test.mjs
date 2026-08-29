@@ -6,21 +6,26 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, copyFile, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, copyFile, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
-const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
+const BASE_MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
-const ROOT = join(tmpdir(), `kb_v3_test_${Date.now()}`);
+const ROOT = await mkdtemp(join(tmpdir(), "kb_v3_test_"));
+const MOCK_ENRICH = join(ROOT, "mock-enrich-pathname.mjs");
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "real.mp4");
+const TEMP_HOME = join(ROOT, "home");
+const TEMP_APPDATA = join(TEMP_HOME, "AppData", "Roaming");
+const TEMP_LOCALAPPDATA = join(TEMP_HOME, "AppData", "Local");
+const WATCH_DIR = join(ROOT, "watch");
 
 let server;
 let baseUrl;
@@ -58,7 +63,21 @@ async function reservePort() {
 before(async () => {
   await mkdir(KB_ROOT, { recursive: true });
   await mkdir(DATA_DIR, { recursive: true });
-  await copyFile(TEST_MP4, SANDBOX_MP4);
+  await Promise.all([
+    mkdir(TEMP_APPDATA, { recursive: true }),
+    mkdir(TEMP_LOCALAPPDATA, { recursive: true }),
+    mkdir(WATCH_DIR, { recursive: true }),
+  ]);
+  await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2-base" });
+  // 分享链接的查询参数会在隐私边界被全部移除；测试桩改从稳定 pathname 读取帖子标记。
+  await writeFile(MOCK_ENRICH, [
+    `import baseEnrich from ${JSON.stringify(pathToFileURL(BASE_MOCK_ENRICH).href)};`,
+    "export default function pathnameEnrich(sourceUrl) {",
+    "  const url = new URL(String(sourceUrl || 'https://invalid.local/'));",
+    "  const marker = url.pathname.match(/\\/mock-([A-Za-z0-9_]+)\\/?$/)?.[1];",
+    "  return baseEnrich(marker ? `${url.origin}${url.pathname}?post=${encodeURIComponent(marker)}` : sourceUrl);",
+    "}",
+  ].join("\n"));
   port = await reservePort();
   const config = {
     host: "127.0.0.1",
@@ -66,6 +85,7 @@ before(async () => {
     knowledgeBase: KB_ROOT,
     allowedOrigins: ["http://localhost:3000"],
     polling: { intervalMs: 250, timeoutMs: 5000 },
+    watcher: { intervalMs: 5000, maxRetries: 3, roots: [{ dir: WATCH_DIR, channel: "kuaidian", recursive: true }] },
     services: {},
     adapters: {},
   };
@@ -75,9 +95,15 @@ before(async () => {
     cwd: repoRoot,
     env: {
       ...process.env,
+      HOME: TEMP_HOME,
+      USERPROFILE: TEMP_HOME,
+      APPDATA: TEMP_APPDATA,
+      LOCALAPPDATA: TEMP_LOCALAPPDATA,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: DATA_DIR,
       ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(DATA_DIR, "matrix-partitions"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -89,8 +115,22 @@ before(async () => {
 
 after(async () => {
   if (serverErr.trim()) console.log("SERVER_STDERR:", serverErr.slice(-800));
-  try { server.kill(); } catch { /* ignore */ }
-  await rm(ROOT, { recursive: true, force: true });
+  if (server && server.exitCode === null && server.signalCode === null) {
+    const closed = new Promise((resolve) => server.once("close", () => resolve(true)));
+    try { server.kill(); } catch { /* ignore */ }
+    const exited = await Promise.race([
+      closed,
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    if (!exited) {
+      try { server.kill("SIGKILL"); } catch { /* ignore */ }
+      await Promise.race([
+        closed,
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+    }
+  }
+  await rm(ROOT, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 /* ─────────── 用例 1：nested enrich 映射 + 6 文件 + 无敏感键 ─────────── */
@@ -144,10 +184,10 @@ test("enrich 映射：作者=作者、likes=12000、contentId=media.postId；6 �
 
 /* ─────────── 用例 2：一资产两帖子 ─────────── */
 test("一资产两帖子：list 1 条；platform 筛选 200；detail 两帖子", async () => {
-  // 同 localPath（同 sha），第二个 sourceUrl（post=2 → 不同 contentId）
+  // 同 localPath（同 sha），第二个 sourceUrl 用稳定 pathname 标记不同帖子。
   const r2 = await request("/api/v1/kuaidian", {
     method: "POST",
-    body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock?post=2", title: "第二帖子" },
+    body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock-2", title: "第二帖子" },
   });
   assert.equal(r2.status, 202);
   await new Promise((r) => setTimeout(r, 1200));
@@ -261,10 +301,7 @@ test("迁移夹具：6 assets / 10 legacy_package / 原 capturedAt 快照 / 两�
   const files = [];
   for (let i = 0; i < 6; i++) {
     const f = join(fixtureRoot, `src_${i}.mp4`);
-    await copyFile(TEST_MP4, f);
-    const fd = await import("node:fs/promises").then((m) => m.open(f, "a"));
-    await fd.write(`MARKER_${i}`);
-    await fd.close();
+    await writeSyntheticMp4(f, { marker: `kb-v2-migration-${i}` });
     files.push(f);
   }
   const pkgs = [
@@ -334,7 +371,7 @@ test("同 SHA 再经 kuaidian 导入：不复制文件，但 download_receipt �
   const shaBefore = before.prepare("SELECT sha256 FROM video_asset WHERE channel='kuaidian' LIMIT 1").get()?.sha256;
   before.close();
 
-  const r = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock?post=repeat", title: "重复导入" } });
+  const r = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock-repeat", title: "重复导入" } });
   assert.equal(r.status, 202);
   await new Promise((r) => setTimeout(r, 1200));
 

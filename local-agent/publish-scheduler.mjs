@@ -15,6 +15,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 export const PUBLISH_TASK_STATUSES = Object.freeze([
   "scheduled",
   "queued",
+  "retry_wait",
   "preflighting",
   "submitting",
   "public",
@@ -27,7 +28,10 @@ export const PUBLISH_TASK_STATUSES = Object.freeze([
 
 const STORE_VERSION = 1;
 const MAX_TIMER_DELAY_MS = 2_147_000_000;
+const DEFAULT_RETRY_BASE_DELAY_MS = 15_000;
+const DEFAULT_RETRY_MAX_DELAY_MS = 2 * 60_000;
 const EXTERNAL_TARGET_STATUSES = new Set(["public", "draft", "submitted", "unknown"]);
+const ACTIVE_TASK_STATUSES = new Set(["scheduled", "queued", "retry_wait"]);
 const TERMINAL_TASK_STATUSES = new Set([
   "public",
   "platform_draft",
@@ -180,6 +184,43 @@ function safeError(error, fallback = "publish_target_failed") {
     .slice(0, 500);
 }
 
+/**
+ * Automatic retries are allowed only when the executor explicitly proves that
+ * it failed before contacting the platform. Message matching is deliberately
+ * forbidden: a bare CLI timeout can also happen after a platform accepted the
+ * post, in which case retrying could publish a duplicate.
+ */
+function retryableBeforeExternalCall(error) {
+  const explicitlySafe = error?.beforeExternalCall === true
+    || error?.retryableBeforeExternalCall === true;
+  if (!explicitlySafe) return false;
+  if (error?.externalCallStarted === true || error?.externalReceipt === true) return false;
+  if (error?.observedState !== undefined && error?.observedState !== null) return false;
+  const status = String(error?.status || "").trim().toLowerCase();
+  return !EXTERNAL_TARGET_STATUSES.has(status)
+    && !["needs_reconciliation", "submitted_unverified"].includes(status);
+}
+
+function normalizeThrownTargetError(error) {
+  const status = String(error?.status || error?.observedState || "").trim().toLowerCase();
+  const externalReceipt = error?.externalReceipt === true
+    || error?.externalCallStarted === true
+    || (error?.observedState !== undefined && error?.observedState !== null)
+    || EXTERNAL_TARGET_STATUSES.has(status)
+    || ["needs_reconciliation", "submitted_unverified"].includes(status);
+  if (!externalReceipt) {
+    return { status: "failed", receipt: null, error: safeError(error), externalReceipt: false };
+  }
+  const normalizedStatus = status || "needs_reconciliation";
+  return normalizeTargetResult({
+    status: normalizedStatus,
+    externalReceipt: true,
+    ...(error?.observedState !== undefined ? { observedState: error.observedState } : {}),
+    error: safeError(error),
+    message: safeError(error),
+  });
+}
+
 function targetHasExternalReceipt(target) {
   return Boolean(target?.externalReceiptAt) || EXTERNAL_TARGET_STATUSES.has(String(target?.status || ""));
 }
@@ -256,11 +297,15 @@ export class PublishScheduler {
     clearTimeout: clearTimer = globalThis.clearTimeout,
     preflight = async () => ({ ok: true }),
     executeTarget,
+    onEvent = async () => {},
     gracePeriodMs = 20 * 60_000,
+    retryBaseDelayMs = DEFAULT_RETRY_BASE_DELAY_MS,
+    retryMaxDelayMs = DEFAULT_RETRY_MAX_DELAY_MS,
     lockStaleMs = 30_000,
   }) {
     if (!filePath) throw new Error("publish_scheduler_file_path_required");
     if (typeof executeTarget !== "function") throw new Error("publish_scheduler_execute_target_required");
+    if (typeof onEvent !== "function") throw new Error("publish_scheduler_on_event_invalid");
     this.filePath = filePath;
     this.lockPath = `${filePath}.lock`;
     this.now = now;
@@ -268,7 +313,13 @@ export class PublishScheduler {
     this.clearTimer = clearTimer;
     this.preflight = preflight;
     this.executeTarget = executeTarget;
+    this.onEvent = onEvent;
     this.gracePeriodMs = Math.max(1, Number(gracePeriodMs) || 1);
+    this.retryBaseDelayMs = Math.max(1, Number(retryBaseDelayMs) || DEFAULT_RETRY_BASE_DELAY_MS);
+    this.retryMaxDelayMs = Math.max(
+      this.retryBaseDelayMs,
+      Number(retryMaxDelayMs) || DEFAULT_RETRY_MAX_DELAY_MS,
+    );
     this.lockStaleMs = Math.max(1_000, Number(lockStaleMs) || 30_000);
     this.ownerId = `scheduler_${randomUUID()}`;
     this.timers = new Map();
@@ -317,10 +368,11 @@ export class PublishScheduler {
           task.claim = null;
           task.updatedAt = nowIso;
         }
-        if (["scheduled", "queued"].includes(task.status) && nowMs > Date.parse(task.expiresAt)) {
+        if (ACTIVE_TASK_STATUSES.has(task.status) && nowMs > Date.parse(task.expiresAt)) {
           task.status = "needs_attention";
           task.error = "schedule_expired";
           task.claim = null;
+          task.nextAttemptAt = null;
           task.updatedAt = nowIso;
         }
       }
@@ -328,7 +380,7 @@ export class PublishScheduler {
     });
     this.initialized = true;
     for (const task of tasks) {
-      if (["scheduled", "queued"].includes(task.status)) await this.#arm(task.id);
+      if (ACTIVE_TASK_STATUSES.has(task.status)) await this.#arm(task.id);
     }
     return tasks;
   }
@@ -355,6 +407,7 @@ export class PublishScheduler {
         receipt: null,
         error: null,
         externalReceiptAt: null,
+        nextAttemptAt: null,
         updatedAt: null,
       };
     });
@@ -369,6 +422,7 @@ export class PublishScheduler {
       preflight: null,
       claim: null,
       error: null,
+      nextAttemptAt: null,
       createdAt: nowIso,
       updatedAt: nowIso,
       finishedAt: null,
@@ -433,6 +487,7 @@ export class PublishScheduler {
       task.status = "cancelled";
       task.claim = null;
       task.error = null;
+      task.nextAttemptAt = null;
       task.cancelledAt = nowIso;
       task.finishedAt = nowIso;
       task.updatedAt = nowIso;
@@ -465,6 +520,7 @@ export class PublishScheduler {
         target.receipt = null;
         target.error = null;
         target.externalReceiptAt = null;
+        target.nextAttemptAt = null;
         target.updatedAt = new Date(nowMs).toISOString();
       }
       task.status = "queued";
@@ -472,6 +528,7 @@ export class PublishScheduler {
       task.expiresAt = new Date(expiresMs).toISOString();
       task.claim = null;
       task.error = null;
+      task.nextAttemptAt = null;
       task.finishedAt = null;
       task.updatedAt = new Date(nowMs).toISOString();
       return cloneJson(task);
@@ -483,7 +540,11 @@ export class PublishScheduler {
   run(taskId) {
     const id = String(taskId);
     if (this.running.has(id)) return this.running.get(id);
-    const promise = this.#runClaimed(id).finally(() => {
+    const promise = this.#runClaimed(id).then(async (task) => {
+      try { await this.onEvent(cloneJson(task, "event")); }
+      catch { /* 通知失败不得篡改已经持久化的发布结果 */ }
+      return task;
+    }).finally(() => {
       if (this.running.get(id) === promise) this.running.delete(id);
     });
     this.running.set(id, promise);
@@ -511,16 +572,19 @@ export class PublishScheduler {
     const claimed = await this.#mutate((store) => {
       const task = store.tasks.find((candidate) => candidate.id === taskId);
       if (!task) throw new Error("publish_task_not_found");
-      if (!["scheduled", "queued"].includes(task.status) || task.claim) {
+      if (!ACTIVE_TASK_STATUSES.has(task.status) || task.claim) {
         return { action: "skip", task: cloneJson(task) };
       }
       const nowMs = this.#nowMs();
-      const scheduledMs = Date.parse(task.scheduledAt);
+      const scheduledMs = task.status === "retry_wait" && task.nextAttemptAt
+        ? Date.parse(task.nextAttemptAt)
+        : Date.parse(task.scheduledAt);
       if (nowMs < scheduledMs) return { action: "future", task: cloneJson(task) };
       if (nowMs > Date.parse(task.expiresAt)) {
         const nowIso = new Date(nowMs).toISOString();
         task.status = "needs_attention";
         task.error = "schedule_expired";
+        task.nextAttemptAt = null;
         task.finishedAt = nowIso;
         task.updatedAt = nowIso;
         return { action: "expired", task: cloneJson(task) };
@@ -528,6 +592,7 @@ export class PublishScheduler {
       const nowIso = new Date(nowMs).toISOString();
       task.status = "queued";
       task.claim = { token: claimToken, ownerId: this.ownerId, claimedAt: nowIso };
+      task.nextAttemptAt = null;
       task.updatedAt = nowIso;
       return { action: "claimed", task: cloneJson(task) };
     });
@@ -573,6 +638,7 @@ export class PublishScheduler {
         task.status = "needs_attention";
         task.error = "schedule_expired_after_preflight";
         task.claim = null;
+        task.nextAttemptAt = null;
         task.preflight = { ok: true, result: cloneResult(preflightResult), checkedAt: nowIso };
         task.finishedAt = nowIso;
         task.updatedAt = nowIso;
@@ -605,6 +671,7 @@ export class PublishScheduler {
         target.status = "submitting";
         target.attempts = (Number(target.attempts) || 0) + 1;
         target.error = null;
+        target.nextAttemptAt = null;
         target.updatedAt = this.#nowIso();
         task.updatedAt = target.updatedAt;
         return { action: "execute", task: cloneJson(task), target: cloneJson(target) };
@@ -622,7 +689,12 @@ export class PublishScheduler {
         const raw = await this.executeTarget(this.#targetInvocation(beforeSubmit, targetId));
         outcome = normalizeTargetResult(raw);
       } catch (error) {
-        outcome = { status: "failed", receipt: null, error: safeError(error) };
+        if (retryableBeforeExternalCall(error)) {
+          const waiting = await this.#scheduleRetryWait(taskId, targetId, claimToken, error);
+          if (waiting.retryScheduled && !this.stopped) await this.#arm(taskId);
+          return waiting.task;
+        }
+        outcome = normalizeThrownTargetError(error);
       }
       const persisted = await this.#persistTargetOutcome(taskId, targetId, claimToken, outcome);
       // The post-submit read is intentional: if an external actor changed the task to cancelled,
@@ -639,6 +711,7 @@ export class PublishScheduler {
       const nowIso = this.#nowIso();
       task.status = aggregateTaskStatus(task);
       task.claim = null;
+      task.nextAttemptAt = null;
       task.error = task.status === "needs_attention" ? "one_or_more_targets_failed" : null;
       task.finishedAt = nowIso;
       task.updatedAt = nowIso;
@@ -674,6 +747,7 @@ export class PublishScheduler {
       target.receipt = outcome.receipt;
       target.error = outcome.error;
       target.externalReceiptAt = outcome.externalReceipt === true || EXTERNAL_TARGET_STATUSES.has(outcome.status) ? nowIso : null;
+      target.nextAttemptAt = null;
       target.updatedAt = nowIso;
       task.updatedAt = nowIso;
       if (outcome.status === "needs_reconciliation") {
@@ -695,6 +769,68 @@ export class PublishScheduler {
         return { stop: true, task: cloneJson(task) };
       }
       return { stop: outcome.status === "needs_reconciliation", task: cloneJson(task) };
+    });
+  }
+
+  async #scheduleRetryWait(taskId, targetId, claimToken, error) {
+    return this.#mutate((store) => {
+      const task = store.tasks.find((candidate) => candidate.id === taskId);
+      if (!task) throw new Error("publish_task_not_found");
+      const target = task.targets.find((candidate) => candidate.id === targetId);
+      if (!target) throw new Error("publish_target_not_found");
+      if (task.status === "cancelled") return { retryScheduled: false, task: cloneJson(task) };
+      if (task.status !== "submitting" || task.claim?.token !== claimToken || target.status !== "submitting") {
+        return { retryScheduled: false, task: cloneJson(task) };
+      }
+      // A contradictory receipt marker always wins over a retry hint.
+      if (targetHasExternalReceipt(target) || !retryableBeforeExternalCall(error)) {
+        const nowIso = this.#nowIso();
+        target.status = "needs_reconciliation";
+        target.error = safeError(error);
+        target.updatedAt = nowIso;
+        task.status = "needs_reconciliation";
+        task.error = "retry_blocked_by_external_receipt";
+        task.claim = null;
+        task.nextAttemptAt = null;
+        task.updatedAt = nowIso;
+        return { retryScheduled: false, task: cloneJson(task) };
+      }
+
+      const nowMs = this.#nowMs();
+      const expiresMs = Date.parse(task.expiresAt);
+      const exponent = Math.min(30, Math.max(0, (Number(target.attempts) || 1) - 1));
+      const delayMs = Math.min(this.retryMaxDelayMs, this.retryBaseDelayMs * (2 ** exponent));
+      const nextAttemptMs = nowMs + delayMs;
+      const nowIso = new Date(nowMs).toISOString();
+      const message = safeError(error);
+      if (!Number.isFinite(expiresMs) || nextAttemptMs > expiresMs) {
+        target.status = "failed";
+        target.error = message;
+        target.nextAttemptAt = null;
+        target.updatedAt = nowIso;
+        task.status = aggregateTaskStatus(task);
+        task.error = "retry_window_exhausted";
+        task.claim = null;
+        task.nextAttemptAt = null;
+        task.finishedAt = nowIso;
+        task.updatedAt = nowIso;
+        return { retryScheduled: false, task: cloneJson(task) };
+      }
+
+      const nextAttemptAt = new Date(nextAttemptMs).toISOString();
+      target.status = "pending";
+      target.receipt = null;
+      target.error = message;
+      target.externalReceiptAt = null;
+      target.nextAttemptAt = nextAttemptAt;
+      target.updatedAt = nowIso;
+      task.status = "retry_wait";
+      task.error = message;
+      task.claim = null;
+      task.nextAttemptAt = nextAttemptAt;
+      task.finishedAt = null;
+      task.updatedAt = nowIso;
+      return { retryScheduled: true, task: cloneJson(task) };
     });
   }
 
@@ -721,12 +857,15 @@ export class PublishScheduler {
   async #arm(taskId) {
     if (this.stopped) return;
     const task = await this.get(taskId);
-    if (!task || !["scheduled", "queued"].includes(task.status)) {
+    if (!task || !ACTIVE_TASK_STATUSES.has(task.status)) {
       this.#clearTaskTimer(taskId);
       return;
     }
     this.#clearTaskTimer(taskId);
-    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, Date.parse(task.scheduledAt) - this.#nowMs()));
+    const dueAt = task.status === "retry_wait" && task.nextAttemptAt
+      ? task.nextAttemptAt
+      : task.scheduledAt;
+    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, Date.parse(dueAt) - this.#nowMs()));
     const handle = this.setTimer(() => {
       this.timers.delete(taskId);
       if (!this.stopped) void this.run(taskId);

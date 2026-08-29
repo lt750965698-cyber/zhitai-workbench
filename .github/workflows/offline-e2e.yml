@@ -1,0 +1,89 @@
+name: Offline chain E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OFFLINE_E2E_IMAGE: node:22.13.0-bookworm-slim@sha256:f5a0871ab03b035c58bdb3007c3d177b001c2145c18e81817b71624dcf7d8bff
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull fixed Node runtime before isolation
+        run: docker pull "$OFFLINE_E2E_IMAGE"
+      - name: Prepare fail-closed report directory
+        id: report_path
+        shell: bash
+        run: |
+          test ! -L "$GITHUB_WORKSPACE/.artifacts"
+          test ! -L "$GITHUB_WORKSPACE/.artifacts/offline-e2e"
+          mkdir -p "$GITHUB_WORKSPACE/.artifacts/offline-e2e"
+          artifact_dir="$(realpath "$GITHUB_WORKSPACE/.artifacts/offline-e2e")"
+          test "$artifact_dir" = "$GITHUB_WORKSPACE/.artifacts/offline-e2e"
+      - name: Run offline E2E with kernel network isolation
+        shell: bash
+        run: |
+          artifact_dir="$(realpath "$GITHUB_WORKSPACE/.artifacts/offline-e2e")"
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 128 \
+            --user "$(id -u):$(id -g)" \
+            --workdir /workspace \
+            --env CI=true \
+            --env HOME=/tmp/home \
+            --env TMPDIR=/tmp \
+            --env XDG_CONFIG_HOME=/tmp/xdg-config \
+            --env XDG_DATA_HOME=/tmp/xdg-data \
+            --env XDG_CACHE_HOME=/tmp/xdg-cache \
+            --env ZHITAI_E2E_KERNEL_NETWORK=none \
+            --env E2E_SECRET_ENV_SENTINEL=E2E_ENV_SECRET_SENTINEL_9c40a7 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace,readonly" \
+            --mount "type=bind,src=$artifact_dir,dst=/workspace/.artifacts/offline-e2e" \
+            "$OFFLINE_E2E_IMAGE" \
+            npm run test:offline-e2e
+      - name: Upload machine-readable report
+        if: always() && steps.report_path.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhitai-offline-e2e-report
+          path: .artifacts/offline-e2e/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  portable-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js and pnpm
+        uses: pnpm/setup@v2
+        with:
+          runtime: node@22.13.0
+          cache: true
+      - name: Run portable offline E2E on Windows
+        run: pnpm run test:offline-e2e
+      - name: Upload Windows machine-readable report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhitai-offline-e2e-report-windows
+          path: .artifacts/offline-e2e/*.json
+          if-no-files-found: error
+          retention-days: 14

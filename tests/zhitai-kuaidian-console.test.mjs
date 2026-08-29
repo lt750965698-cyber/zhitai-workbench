@@ -122,16 +122,25 @@ async function loadCompanionFns() {
 test.before(async () => {
   dataDir = await mkdtemp(join(tmpdir(), "zhitai-kuaidian-console-"));
   const kbRoot = join(dataDir, "kb");
-  await mkdir(kbRoot, { recursive: true });
+  const temporaryHome = join(dataDir, "home");
+  const temporaryAppData = join(temporaryHome, "AppData", "Roaming");
+  const temporaryLocalAppData = join(temporaryHome, "AppData", "Local");
+  const watcherRoot = join(dataDir, "watcher");
+  await Promise.all([
+    mkdir(kbRoot, { recursive: true }),
+    mkdir(temporaryAppData, { recursive: true }),
+    mkdir(temporaryLocalAppData, { recursive: true }),
+    mkdir(watcherRoot, { recursive: true }),
+  ]);
   configPath = join(dataDir, "config.json");
   await writeFile(configPath, JSON.stringify({
     host: "127.0.0.1",
     port: 17890,
     knowledgeBase: kbRoot,
     allowedOrigins: ["http://localhost:3000"],
-    webhookSecret: "",
+    webhookSecret: "fixture-kuaidian-console-secret",
     polling: { intervalMs: 250, timeoutMs: 5000 },
-    watcher: { intervalMs: 5000, roots: [] },
+    watcher: { intervalMs: 5000, roots: [{ dir: watcherRoot, channel: "kuaidian", recursive: true }] },
     adapters: {},
     services: {},
     mediaFallback: { enabled: false },
@@ -140,10 +149,17 @@ test.before(async () => {
   serverProcess = spawn(process.execPath, [AGENT_ENTRY], {
     env: {
       ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      APPDATA: temporaryAppData,
+      LOCALAPPDATA: temporaryLocalAppData,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: dataDir,
       ZHITAI_PORT: String(port),
+      ZHITAI_WEBHOOK_SECRET: "fixture-kuaidian-console-secret",
       ZHITAI_KUAIDIAN_TTL_MS: "400",
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(dataDir, "matrix-partitions"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -401,4 +417,6 @@ test("前端/Edge：控制台状态卡/过滤器/详情/重试按钮；显式 Mi
   assert.ok(sv.includes('"-a"') || sv.includes('"-a",'), "兜底 open -a 显式 Edge 应用");
   assert.ok(sv.includes("filehelper.weixin.qq.com"), "打开 filehelper URL");
   assert.ok(sv.includes("const legacyRetryMatch") && sv.includes('retryMode: "legacy_retry"'), "server 暴露受控的 legacy 卡片重试端点");
+  assert.ok(sv.includes("watcherScanInFlight") && sv.includes("scanWatcherLibsSingleFlight"), "目录扫描必须单飞，避免卡住时耗尽线程池");
+  assert.doesNotMatch(sv, /setInterval\(\(\) => scanWatcherLibs\(\)/, "定时器不得叠加目录扫描");
 });

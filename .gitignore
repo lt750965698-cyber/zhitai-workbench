@@ -13,12 +13,14 @@
 
 # testing
 /coverage
+/.artifacts/
 /.nyc_output/
 
 # next.js
 /.next/
 /.vinext/
 /out/
+/desktop/assets/icon.ico
 
 # misc
 .DS_Store

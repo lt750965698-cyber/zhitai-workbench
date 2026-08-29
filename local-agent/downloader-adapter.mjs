@@ -18,10 +18,10 @@
  *   - 新增 makeFailReceipt：adapter 前失败也生成收据，供 import_item/download_receipt/observation 记录。
  */
 import { createHash } from "node:crypto";
-import { stat, writeFile, mkdir, rm, open } from "node:fs/promises";
-import { createWriteStream, createReadStream } from "node:fs";
+import { chmod, stat, writeFile, mkdir, mkdtemp, rm, open } from "node:fs/promises";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -49,7 +49,7 @@ const FFPROBE_CANDIDATES = [
 const MAX_REDIRECTS = 5;
 
 /* ─────────── DownloadReceipt ─────────── */
-export function makeReceipt({ channel, sourceUrl = null, contentId = null, localPath = null, sha256 = null, mediaValidation = "unknown", startedAt, fallbackReason = null, rawRef = null, media = null, sizeBytes = null, title = null, temporary = false, validationEvidence = null, downloadUrl = null, error = null }) {
+export function makeReceipt({ channel, sourceUrl = null, contentId = null, localPath = null, sha256 = null, mediaValidation = "unknown", startedAt, fallbackReason = null, rawRef = null, media = null, sizeBytes = null, title = null, temporary = false, temporaryRoot = null, validationEvidence = null, downloadUrl = null, error = null }) {
   return {
     channel,
     sourceUrl,          // 稳定分享链接（sph/sf），可为 null；绝不含 downloadUrl
@@ -66,6 +66,7 @@ export function makeReceipt({ channel, sourceUrl = null, contentId = null, local
     sizeBytes,
     title,
     temporary,          // localPath 是否临时文件（链接下载产物）
+    temporaryRoot,      // 仅用于当前进程清理 mkdtemp 私有目录；绝不落库或返回 API
     validationEvidence, // { ftyp, moov, mdat, durationMs, source }
     error,              // adapter 前失败原因（仅用于 import_item/receipt 记录）
   };
@@ -350,9 +351,11 @@ export async function probeLocalMedia(filePath) {
 }
 
 /* ─────────── 流式下载（大小上限 + 超时 + manual redirect 每跳校验 + 清理） ─────────── */
-export async function downloadToTemp(url, { timeoutMs = 60000, maxBytes = 512 * 1024 * 1024, dir = "/tmp" } = {}) {
-  await mkdir(dir, { recursive: true });
-  const tmpPath = join(dir, `kb_dl_${Date.now()}_${Math.random().toString(16).slice(2, 6)}.mp4`);
+export async function downloadToTemp(url, { timeoutMs = 60000, maxBytes = 512 * 1024 * 1024, dir = tmpdir() } = {}) {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const temporaryRoot = await mkdtemp(join(dir, "zhitai-kb-download-"));
+  await chmod(temporaryRoot, 0o700);
+  const tmpPath = join(temporaryRoot, "media.mp4");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let received = 0;
@@ -382,7 +385,8 @@ export async function downloadToTemp(url, { timeoutMs = 60000, maxBytes = 512 * 
     if (!resp.ok) throw new Error(`download_http_${resp.status}`);
     const declared = Number(resp.headers.get("content-length") || 0);
     if (declared > maxBytes) throw new Error("download_too_large");
-    const out = createWriteStream(tmpPath, { flags: "wx", mode: 0o600 });
+    if (!resp.body) throw new Error("download_body_missing");
+    const out = await open(tmpPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const reader = resp.body.getReader();
     try {
       for (;;) {
@@ -390,18 +394,22 @@ export async function downloadToTemp(url, { timeoutMs = 60000, maxBytes = 512 * 
         if (done) break;
         received += value.length;
         if (received > maxBytes) throw new Error("download_too_large");
-        if (!out.write(Buffer.from(value))) await new Promise((r) => out.once("drain", r));
+        const chunk = Buffer.from(value);
+        let offset = 0;
+        while (offset < chunk.length) {
+          const { bytesWritten } = await out.write(chunk, offset, chunk.length - offset);
+          if (bytesWritten <= 0) throw new Error("download_write_failed");
+          offset += bytesWritten;
+        }
       }
     } finally {
       reader.releaseLock();
+      await out.close().catch(() => {});
     }
-    await new Promise((resolve, reject) => {
-      out.end((err) => (err ? reject(err) : resolve()));
-    });
     if (received < 10_000) throw new Error("download_too_small");
-    return { path: tmpPath, sizeBytes: received };
+    return { path: tmpPath, sizeBytes: received, temporaryRoot };
   } catch (e) {
-    await rm(tmpPath, { force: true }).catch(() => {});
+    await rm(temporaryRoot, { recursive: true, force: true }).catch(() => {});
     throw e;
   } finally {
     clearTimeout(timer);
@@ -418,6 +426,7 @@ export async function adapterKuaidian({ downloadUrl = null, localPath = null, so
   const startedAt = new Date().toISOString();
   let path = null;
   let temporary = false;
+  let temporaryRoot = null;
   // 只有稳定平台分享链接才可作为 sourceUrl；CDN 直链/签名 URL 拒绝（元数据 unavailable）
   let safeSource = null;
   if (sourceUrl && isStableShareUrl(sourceUrl)) safeSource = canonicalizeSourceUrl(sourceUrl);
@@ -431,6 +440,7 @@ export async function adapterKuaidian({ downloadUrl = null, localPath = null, so
       const r = await downloadToTemp(downloadUrl);
       path = r.path;
       temporary = true;
+      temporaryRoot = r.temporaryRoot;
     } else {
       throw new Error("no_download_source");
     }
@@ -450,10 +460,12 @@ export async function adapterKuaidian({ downloadUrl = null, localPath = null, so
       media,
       sizeBytes: media.size_bytes,
       temporary,
+      temporaryRoot,
       validationEvidence: media.container || null,
     });
   } catch (e) {
-    if (temporary && path) await rm(path, { force: true }).catch(() => {});
+    if (temporaryRoot) await rm(temporaryRoot, { recursive: true, force: true }).catch(() => {});
+    else if (temporary && path) await rm(path, { force: true }).catch(() => {});
     throw e;
   }
 }
@@ -489,6 +501,7 @@ export async function adapterFallbackYuanbao(sourceUrl, { yuanbaoParse, download
   const videoUrl = media.videoUrl || null;
   let path = null;
   let temporary = false;
+  let temporaryRoot = null;
   let mediaValidation = "unknown";
   let mediaInfo = null;
   if (videoUrl && download) {
@@ -496,10 +509,15 @@ export async function adapterFallbackYuanbao(sourceUrl, { yuanbaoParse, download
       const r = await downloadToTemp(videoUrl);
       path = r.path;
       temporary = true;
+      temporaryRoot = r.temporaryRoot;
       mediaInfo = await probeLocalMedia(path);
       mediaValidation = mediaInfo.mediaValidation; // 大概率 encrypted
     } catch {
-      if (temporary && path) await rm(path, { force: true }).catch(() => {});
+      if (temporaryRoot) await rm(temporaryRoot, { recursive: true, force: true }).catch(() => {});
+      else if (temporary && path) await rm(path, { force: true }).catch(() => {});
+      path = null;
+      temporary = false;
+      temporaryRoot = null;
       mediaValidation = "missing";
     }
   }
@@ -518,6 +536,7 @@ export async function adapterFallbackYuanbao(sourceUrl, { yuanbaoParse, download
     sizeBytes: mediaInfo?.size_bytes || null,
     title: media.title || null,
     temporary,
+    temporaryRoot,
   });
 }
 

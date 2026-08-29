@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { retrySqliteBusy } from "./kb.mjs";
 import { STRICT_POLICY } from "./originality-remediation.mjs";
 import { assessGenerationReadiness } from "./seedance-workflow.mjs";
 
@@ -102,9 +103,14 @@ export async function persistOriginalityRemediation(db, assetId, workflow) {
 
   // 只替换计划正文并做比较写入：provider/created_at 是原分析证据，不应被补救流程伪装成新分析；
   // 若期间有新分析写回，宁可让任务失败重试，也不能覆盖更新后的计划。
-  const result = db.prepare("UPDATE remake_plan SET plan_json=? WHERE asset_id=? AND plan_json=?")
-    .run(serialized, cleanId, row.plan_json);
-  if (Number(result.changes || 0) !== 1) throw new Error("remake_plan_concurrent_update");
+  const result = await retrySqliteBusy(() => db.prepare("UPDATE remake_plan SET plan_json=? WHERE asset_id=? AND plan_json=?")
+    .run(serialized, cleanId, row.plan_json));
+  if (Number(result.changes || 0) !== 1) {
+    // 另一条同资产任务可能已先写入完全相同的补救计划。这是幂等成功，
+    // 而不是并发覆盖；只有当前内容不同时才拒绝覆盖新分析结果。
+    const current = db.prepare("SELECT plan_json FROM remake_plan WHERE asset_id=?").get(cleanId);
+    if (current?.plan_json !== serialized) throw new Error("remake_plan_concurrent_update");
+  }
   const verified = db.prepare("SELECT plan_json, provider, created_at FROM remake_plan WHERE asset_id=?").get(cleanId);
   let verifiedPlan;
   try { verifiedPlan = JSON.parse(verified?.plan_json || ""); }

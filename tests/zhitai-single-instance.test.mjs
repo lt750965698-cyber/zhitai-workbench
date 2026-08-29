@@ -22,12 +22,12 @@ test("织台在申请单实例锁前设置独立应用名与 userData", () => {
 test("内部应用名保持 ASCII，避免 Electron 把中文写入 User-Agent", () => {
   assert.match(src, /app\.setName\("Zhitai"\)/);
   assert.doesNotMatch(src, /app\.setName\("织台"\)/);
-  assert.match(src, /app\.setAppUserModelId\("com\.zhitai\.desktop"\)/);
+  assert.match(src, /app\.setAppUserModelId\("com\.squirrel\.ZhitaiWorkbench\.Zhitai"\)/);
 });
 
 test("Dock 使用织台品牌图，不再显示默认 Electron 图标", () => {
   assert.match(src, /app\.dock\.setIcon\(icon\)/);
-  assert.match(src, /public["',\s]+["']og\.png/);
+  assert.match(src, /desktop["',\s]+["']assets["',\s]+["']icon\.png/);
 });
 
 test("main.js 请求单实例锁", () => {
@@ -57,4 +57,12 @@ test("所有后台创作窗口默认静音并移除媒体自动播放与循环",
   assert.match(src, /media\.muted = true/);
   assert.match(src, /keepCreativeStudioQuiet\(existing\)/);
   assert.match(src, /keepCreativeStudioQuiet\(child\)/);
+});
+
+test("主窗口进入后台时立即静音并暂停媒体，回到前台不自动续播", () => {
+  assert.match(src, /function stopWindowMediaWhenBackgrounded\(child\)/);
+  assert.match(src, /child\.on\("blur", pauseMedia\)/);
+  assert.match(src, /child\.on\("minimize", pauseMedia\)/);
+  assert.match(src, /media\.pause\(\)/);
+  assert.match(src, /stopWindowMediaWhenBackgrounded\(mainWindow\)/);
 });

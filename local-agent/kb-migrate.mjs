@@ -13,9 +13,9 @@
  *     按 import_item.input 文件 SHA 映射孤立 asset_id，无法映射标 orphaned）
  */
 import { readFile, readdir, stat as fsStat } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { join, dirname, basename } from "node:path";
-import { openKbDb } from "./kb.mjs";
+import { createHash, randomUUID } from "node:crypto";
+import { join, dirname, basename, normalize, sep } from "node:path";
+import { beginImmediateWithRetry, openKbDb, retrySqliteBusy } from "./kb.mjs";
 import { probeLocalMedia } from "./downloader-adapter.mjs";
 import { parseFormattedCount, deriveContentId, canonicalizeSourceUrl } from "./content-metadata.mjs";
 
@@ -31,38 +31,77 @@ async function stableCapturedAt(meta, metaPath) {
   }
 }
 
-export async function migrateLibraryToKb({ kbRoot, dataDir }) {
-  const db = openKbDb(join(dataDir, "kb.sqlite"));
-  ensureSchemaVersion(db);
+export async function migrateLibraryToKb({ kbRoot, dataDir, probeMedia = probeLocalMedia }) {
   const metadataFiles = [];
   await walkNamed(kbRoot, "metadata.json", metadataFiles, 0, 8);
 
   const now = new Date().toISOString();
-  const batchId = `kb_migrate_${now.replace(/[:.]/g, "").slice(0, 14)}`;
+  const batchId = `kb_migrate_${now.replace(/[:.]/g, "").slice(0, 17)}_${randomUUID().slice(0, 8)}`;
 
-  let indexed = 0, legacyRows = 0, posts = 0, snapshots = 0, skipped = 0, failed = 0, quarantined = 0;
-  db.exec("BEGIN");
+  // 两阶段迁移：扫描、JSON、stat、SHA 和 ffprobe 全部在事务外完成。
+  // DatabaseSync 的写锁期间绝不 await，否则同进程的复审/CAS 会因事件循环
+  // 被 busy_timeout 占住而自锁。
+  const prepared = [];
+  let failed = 0;
+  for (const metaPath of metadataFiles) {
+    try {
+      const meta = JSON.parse(await readFile(metaPath, "utf8"));
+      const pkgDir = dirname(metaPath);
+      const videoFile = await findVideoFile(pkgDir, meta);
+      if (!videoFile) {
+        failed += 1;
+        continue;
+      }
+      const [sha256, capturedAt, media, videoStat] = await Promise.all([
+        sha256Of(videoFile),
+        stableCapturedAt(meta, metaPath),
+        probeMedia(videoFile),
+        fsStat(videoFile),
+      ]);
+      const sourceUrl = canonicalizeSourceUrl(meta.source?.url || meta.sourceUrl) || null;
+      const legacyId = String(meta.id || basename(pkgDir));
+      const contentId = meta.identity?.contentId
+        || deriveContentId(sourceUrl, meta.platform || "wechat_channels", meta.upstream || {})
+        || meta.upstream?.exportId
+        || null;
+      prepared.push({
+        meta,
+        pkgDir,
+        videoFile,
+        videoStat,
+        sha256,
+        media,
+        sourceUrl,
+        legacyId,
+        capturedAt,
+        contentId,
+        title: meta.title || basename(videoFile) || "旧库内容",
+        fingerprint: createHash("sha256").update(JSON.stringify(meta)).digest("hex").slice(0, 24),
+        stats: parseStats(meta),
+      });
+    } catch {
+      failed += 1;
+    }
+  }
+
+  // openKbDb 的建表升级也可能撞上另一进程写锁；短 busy_timeout 后异步退避。
+  const db = await retrySqliteBusy(() => openKbDb(join(dataDir, "kb.sqlite")));
+  let indexed = 0, legacyRows = 0, posts = 0, snapshots = 0, skipped = 0, quarantined = 0;
   try {
+    await beginImmediateWithRetry(db);
+    // 从 BEGIN IMMEDIATE 到 COMMIT 只有同步 SQL，不做任何文件、哈希或媒体探测。
+    ensureSchemaVersion(db);
     db.prepare("INSERT OR IGNORE INTO import_batch (id, status, source_kind, created_at, total, succeeded, failed, skipped) VALUES (?, 'running', 'migration', ?, ?, 0, 0, 0)")
       .run(batchId, now, metadataFiles.length);
 
-    for (const metaPath of metadataFiles) {
+    for (const item of prepared) {
       try {
-        const meta = JSON.parse(await readFile(metaPath, "utf8"));
-        const pkgDir = dirname(metaPath);
-        const videoFile = await findVideoFile(pkgDir, meta);
-        if (!videoFile) { failed++; continue; }
-
-        const sha256 = await sha256Of(videoFile);
-        const sourceUrl = canonicalizeSourceUrl(meta.source?.url || meta.sourceUrl) || null;
-        const title = meta.title || basename(videoFile) || "旧库内容";
-        const legacyId = String(meta.id || basename(pkgDir));
-        const capturedAt = await stableCapturedAt(meta, metaPath);
-        const contentId = meta.identity?.contentId || deriveContentId(sourceUrl, meta.platform || "wechat_channels", meta.upstream || {}) || meta.upstream?.exportId || null;
-        const fingerprint = createHash("sha256").update(JSON.stringify(meta)).digest("hex").slice(0, 24);
+        const {
+          meta, pkgDir, videoFile, videoStat, sha256, media, sourceUrl,
+          legacyId, capturedAt, contentId, title, fingerprint, stats,
+        } = item;
 
         // 0) 媒体验证：invalid/encrypted/unknown 不得作为 ok 搜索资产 → quarantine（仅 import_item）
-        const media = await probeLocalMedia(videoFile);
         const mediaValidation = media.mediaValidation; // ok | invalid | encrypted
 
         if (mediaValidation !== "ok") {
@@ -75,14 +114,13 @@ export async function migrateLibraryToKb({ kbRoot, dataDir }) {
         // 1) 资产：同 SHA = 一资产（引用式，不复制）
         let asset = db.prepare("SELECT id, legacy_id FROM video_asset WHERE sha256 = ?").get(sha256);
         if (!asset) {
-          const st = await fsStat(videoFile);
           const assetId = `kb_mig_${sha256.slice(0, 8)}`;
           db.prepare(
             `INSERT OR IGNORE INTO video_asset (id, source_url, sha256, title, file_path, package_path, category, size_bytes, duration_ms, width, height, codec_video, codec_audio, channel, media_validation, legacy_id, captured_at, created_at, updated_at)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           ).run(
             assetId, sourceUrl, sha256, title, videoFile, pkgDir, meta.category || "其他",
-            st.size,
+            videoStat.size,
             media.duration_ms ?? null,
             media.width ?? null,
             media.height ?? null,
@@ -102,11 +140,10 @@ export async function migrateLibraryToKb({ kbRoot, dataDir }) {
         }
 
         // 2) legacy_package：每个旧包都写（唯一 legacy_id+package_path）
-        db.prepare(
+        const legacyInsert = db.prepare(
           "INSERT OR IGNORE INTO legacy_package (asset_id, legacy_id, package_path, source_url, content_id, captured_at, metadata_fingerprint) VALUES (?,?,?,?,?,?,?)",
         ).run(asset.id, legacyId, pkgDir, sourceUrl, contentId, capturedAt, fingerprint);
-        const lpChanged = db.prepare("SELECT COUNT(*) c FROM legacy_package WHERE legacy_id=? AND package_path=?").get(legacyId, pkgDir).c;
-        if (lpChanged) legacyRows++;
+        if (Number(legacyInsert.changes || 0) === 1) legacyRows++;
 
         const userNote = String(meta.source?.userNote || "").replace(/\s+/g, " ").trim().slice(0, 1_000);
         if (userNote) {
@@ -120,7 +157,6 @@ export async function migrateLibraryToKb({ kbRoot, dataDir }) {
           const postContentId = contentId || `legacy:${legacyId}`;
           const existsPost = db.prepare("SELECT id FROM platform_post WHERE asset_id=? AND content_id=?").get(asset.id, postContentId);
           if (!existsPost) {
-            const stats = parseStats(meta);
             db.prepare(
               `INSERT INTO platform_post (asset_id, content_id, post_id, url, author, publish_time, title, topics, music, platform, plays, plays_raw, likes, likes_raw, comments, comments_raw, favorites, favorites_raw, shares, shares_raw, fetched_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -141,10 +177,9 @@ export async function migrateLibraryToKb({ kbRoot, dataDir }) {
         }
 
         // 4) 指标快照：按稳定 capturedAt + observation_id=legacy:<legacyId>（同包重跑幂等；不同包全保留）
-        const stats = parseStats(meta);
         const postContentId = contentId || `legacy:${legacyId}`;
         const snapCapturedAt = capturedAt || now; // 兜底 now 仅在文件 mtime 都失败时；真实包 mtime 一定存在
-        db.prepare(
+        const snapshotInsert = db.prepare(
           "INSERT OR IGNORE INTO metric_snapshot (asset_id, content_id, captured_at, plays, plays_raw, likes, likes_raw, comments, comments_raw, favorites, favorites_raw, shares, shares_raw, source, observation_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ).run(
           asset.id, postContentId, snapCapturedAt,
@@ -155,7 +190,7 @@ export async function migrateLibraryToKb({ kbRoot, dataDir }) {
           stats.shares?.value, stats.shares?.raw,
           "legacy_metadata", `legacy:${legacyId}`,
         );
-        if (db.prepare("SELECT COUNT(*) c FROM metric_snapshot WHERE asset_id=? AND content_id=? AND source='legacy_metadata' AND observation_id=?").get(asset.id, postContentId, `legacy:${legacyId}`).c) snapshots++;
+        if (Number(snapshotInsert.changes || 0) === 1) snapshots++;
       } catch {
         failed++;
       }
@@ -166,10 +201,10 @@ export async function migrateLibraryToKb({ kbRoot, dataDir }) {
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* ignore */ }
-    db.close();
     throw new Error(`migration_failed:${String((e && e.message) || e).slice(0, 200)}`);
+  } finally {
+    db.close();
   }
-  db.close();
   return { total: metadataFiles.length, indexed, legacyRows, posts, snapshots, skipped, failed, quarantined };
 }
 
@@ -195,7 +230,7 @@ export async function upgradeV2Database({ dataDir }) {
     for (const a of assets) {
       let changed = false;
       if (!a.category && a.package_path) {
-        const seg = String(a.package_path).split("/").filter(Boolean);
+        const seg = normalize(String(a.package_path)).split(sep).filter(Boolean);
         // 内容库/<分类>/<日期>/<包> → 分类 = 倒数第 3 段
         const catIdx = seg.findIndex((s) => s === "内容库");
         const category = catIdx >= 0 && seg[catIdx + 1] ? seg[catIdx + 1] : null;

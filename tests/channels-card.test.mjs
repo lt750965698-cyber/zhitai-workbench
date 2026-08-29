@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { originalChannelsVideoUrl, parseChannelsCard } from "../local-agent/channels-card.mjs";
+import { getChannelsCardEngineStatus, originalChannelsVideoUrl, parseChannelsCard } from "../local-agent/channels-card.mjs";
 import { downloadChannelsVideo } from "../local-agent/channels-yuanbao.mjs";
 
 async function withServer(handler, run) {
@@ -204,6 +204,41 @@ test("微信视频号页面未连接时返回明确错误", async () => {
   });
 });
 
+test("视频号引擎状态严格区分 HTTP 在线与页面可用", async () => {
+  let available = false;
+  await withServer((_req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ code: 0, data: { available } }));
+  }, async (baseUrl) => {
+    assert.deepEqual(await getChannelsCardEngineStatus({ baseUrl }), { online: true, available: false });
+    available = true;
+    assert.deepEqual(await getChannelsCardEngineStatus({ baseUrl }), { online: true, available: true });
+  });
+});
+
+test("状态端点启动中的 503 或非 JSON 响应统一标记为可恢复", async () => {
+  let invalidJson = false;
+  await withServer((_req, res) => {
+    if (invalidJson) {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("starting");
+      return;
+    }
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ code: 1, msg: "starting" }));
+  }, async (baseUrl) => {
+    await assert.rejects(
+      getChannelsCardEngineStatus({ baseUrl }),
+      /channels_card_engine_starting/,
+    );
+    invalidJson = true;
+    await assert.rejects(
+      getChannelsCardEngineStatus({ baseUrl }),
+      /channels_card_engine_starting/,
+    );
+  });
+});
+
 test("文件助手桥包含卡片提取与专用上报端点", async () => {
   const source = await readFile(new URL("../local-agent/zhitai-filehelper-bridge.user.js", import.meta.url), "utf8");
   assert.match(source, /\/api\/v1\/channels\/card/);
@@ -238,5 +273,5 @@ test("快点伴生桥可从 spD 已转发记录补提取卡片", async () => {
   assert.equal(cards[0].objectId, "14989479495539628554");
   assert.equal(cards[0].nonceId, "nonce_direct_1");
   assert.equal(cards[0].deliveryId, "msg-direct-1");
-  assert.equal(cards[0].title, "最新视频");
+  assert.equal(cards[0].title, "视频号内容", "浏览器派生标题不得跨越本地 API 边界");
 });

@@ -7,7 +7,8 @@
 | 版本 | 安全更新 |
 | --- | --- |
 | 最新主分支 | 支持 |
-| v0.1.0-alpha.1 | 支持，直到下一预发布版本发布 |
+| v0.2.0-alpha.1 | 支持，直到下一预发布版本发布 |
+| v0.1.0-alpha.1 | 不支持；请升级到最新预发布版本 |
 | 更早的提交、分支或私有打包 | 不支持 |
 | 第三方外置引擎 | 由各自上游负责 |
 
@@ -66,5 +67,18 @@
 - 不复用生产账号做测试；
 - 公开发布和受管理服务使用现有确认门；对其他高影响写操作也应在流程中人工预览和确认，不要假设所有接口都已统一强制执行；
 - 定期备份内容库，并在升级或迁移前验证恢复流程。
+
+## Windows 预览版边界
+
+- 支持 Windows 10 22H2 和 Windows 11 x64，但仍属于公开预览，不等同于已完成企业级安全评估；
+- 预览安装包尚未代码签名，SmartScreen 可能显示“未知发布者”。只从 GitHub Releases 下载，并在运行前核对发布页面提供的 SHA-256；
+- 原生第三方发布、外置服务自动安装或管理、微信自动化与浏览器自动化在 Windows 上失败关闭，并以稳定错误 `unsupported_on_windows_preview` 呈现；
+- 不要因为桌面工作台可启动就绕过上述边界或手工启用未受支持的后台自动化。
+
+## Windows 构建链边界
+
+- 发行构建使用冻结的 `pnpm-lock.yaml`、官方 Electron 版本与临时 GitHub Actions Windows 环境；不要把 Electron 下载地址替换为不受信任的镜像或本地 ZIP。
+- 当前生产依赖执行 `pnpm audit --prod` 为 0 个已知漏洞；Forge 构建链中的 `tar` 与 `tmp` 已通过精确 override 升到修复版本。
+- Electron Forge 7.11.2 仍传递依赖尚无上游修复版本的 `extract-zip`（[GHSA-jmr9-qjv8-65gv](https://github.com/advisories/GHSA-jmr9-qjv8-65gv)）。它只在构建时解包由 `@electron/get` 校验的官方 Electron 归档，不进入织台运行资源；构建任务不得用它处理用户提供或来源不明的 ZIP。待 Forge 提供兼容升级后应移除这项临时边界。
 
 更多背景见 [安全模型](docs/SECURITY_MODEL.md)。

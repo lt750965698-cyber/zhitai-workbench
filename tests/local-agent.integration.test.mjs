@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { syntheticMp4Buffer } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(testsDir);
@@ -14,17 +15,18 @@ const agentEntry = join(repositoryRoot, "local-agent", "server.mjs");
 const inboxClientEntry = join(repositoryRoot, "local-agent", "inbox-submit.mjs");
 const ingestFixture = join(testsDir, "fixtures", "command-ingest-adapter.mjs");
 const serviceFixture = join(testsDir, "fixtures", "managed-service.mjs");
-const mediaFixture = join(testsDir, "fixtures", "media", "sample-moov-at-end.mp4");
-let fixtureBytes;
+const fixtureBytes = syntheticMp4Buffer({ mdatBeforeMoov: true, marker: "local-agent-integration" });
 const webhookSecret = "fixture-webhook-secret";
 
 test("local agent integrates content packages, approval gates, and exclusive services", async (t) => {
   const sandbox = await mkdtemp(join(tmpdir(), "zhitai-local-agent-test-"));
-  // 仓库内确定性合成 MP4；不调用系统转码器，也不读取用户媒体库。
-  fixtureBytes = await readFile(mediaFixture);
   const dataDir = join(sandbox, "data");
   const knowledgeBase = join(sandbox, "knowledge-base");
-  const publicKnowledgeBase = `…/${basename(knowledgeBase)}`;
+  const watcherRoot = join(sandbox, "watch");
+  const temporaryHome = join(sandbox, "home");
+  const temporaryAppData = join(temporaryHome, "AppData", "Roaming");
+  const temporaryLocalAppData = join(temporaryHome, "AppData", "Local");
+  const publicKnowledgeBase = "本机内容库";
   const sourceAsset = join(sandbox, "source-video.mp4");
   const publishAsset = join(knowledgeBase, "publish-video.mp4");
   const firstServicePidFile = join(sandbox, "service-one.pid");
@@ -32,11 +34,50 @@ test("local agent integrates content packages, approval gates, and exclusive ser
   const setupMarkerFile = join(sandbox, "setup-opened.txt");
   const configPath = join(sandbox, "config.json");
   const port = await reservePort();
+  const channelsPort = await reservePort();
+  const wrongChannelsPort = await reservePort();
   const baseUrl = `http://127.0.0.1:${port}`;
+  let channelsPageAvailable = false;
+  const channelsServer = createServer((request, response) => {
+    if (request.url === "/media.mp4") {
+      response.writeHead(200, {
+        "Content-Type": "video/mp4",
+        "Content-Length": String(fixtureBytes.length),
+      });
+      response.end(fixtureBytes);
+      return;
+    }
+    if (request.url?.startsWith("/api/channels/feed/profile?")) {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        code: 0,
+        data: {
+          data: {
+            object: {
+              contact: { nickname: "自定义端口作者" },
+              objectDesc: {
+                description: "自定义端口卡片",
+                media: [{ mediaType: 4, url: `http://127.0.0.1:${channelsPort}/media.mp4` }],
+              },
+            },
+          },
+        },
+      }));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ code: 0, data: { available: channelsPageAvailable } }));
+  });
+  await new Promise((resolvePromise) => channelsServer.listen(channelsPort, "127.0.0.1", resolvePromise));
   const serverOutput = [];
   const knownServicePids = new Set();
   let agent;
 
+  await Promise.all([
+    mkdir(watcherRoot, { recursive: true }),
+    mkdir(temporaryAppData, { recursive: true }),
+    mkdir(temporaryLocalAppData, { recursive: true }),
+  ]);
   await writeFile(sourceAsset, fixtureBytes);
   await writeFile(publishAsset, Buffer.from("publish fixture\n", "utf8"), { flag: "w" }).catch(async (error) => {
     if (error?.code !== "ENOENT") throw error;
@@ -50,6 +91,8 @@ test("local agent integrates content packages, approval gates, and exclusive ser
     knowledgeBase,
     allowedOrigins: ["http://localhost:3000"],
     polling: { intervalMs: 250, timeoutMs: 5_000 },
+    watcher: { intervalMs: 5_000, maxRetries: 3, roots: [{ dir: watcherRoot, channel: "kuaidian", recursive: true }] },
+    analysis: { yuanbaoChat: false },
     adapters: {
       douyin: {
         enabled: true,
@@ -64,6 +107,11 @@ test("local agent integrates content packages, approval gates, and exclusive ser
           "--assetPath",
           sourceAsset,
         ],
+        importMode: "copy",
+      },
+      wechat: {
+        enabled: true,
+        type: "wechat-mp-tools",
         importMode: "copy",
       },
       publisher: { enabled: false },
@@ -103,11 +151,19 @@ test("local agent integrates content packages, approval gates, and exclusive ser
         installChecks: [join(repositoryRoot, "README.md")],
         start: { command: join(repositoryRoot, "README.md"), args: [] },
       },
+      wx_channels_card: {
+        label: "Fixture WeChat Channels parser",
+        role: "ingest",
+        onDemand: true,
+        healthUrl: `http://127.0.0.1:${channelsPort}/api/channels/status`,
+        installChecks: [process.execPath],
+      },
     },
   }, null, 2)}\n`, "utf8");
 
   t.after(async () => {
     await terminateProcess(agent);
+    await new Promise((resolvePromise) => channelsServer.close(resolvePromise));
     for (const pid of knownServicePids) {
       if (processIsAlive(pid)) {
         try {
@@ -124,10 +180,18 @@ test("local agent integrates content packages, approval gates, and exclusive ser
     cwd: repositoryRoot,
     env: {
       ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      APPDATA: temporaryAppData,
+      LOCALAPPDATA: temporaryLocalAppData,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: dataDir,
       ZHITAI_PORT: String(port),
       ZHITAI_WEBHOOK_SECRET: webhookSecret,
+      ZHITAI_DISABLE_CHANNELS_PAGE_LAUNCH: "1",
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(dataDir, "matrix-partitions"),
+      ZHITAI_CHANNELS_CARD_URL: `http://127.0.0.1:${wrongChannelsPort}`,
     },
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
@@ -184,6 +248,47 @@ test("local agent integrates content packages, approval gates, and exclusive ser
     );
     // library 已统一到 kb.sqlite 数据源（与 /api/v1/kb 共享，不再双孤岛）
     assert.deepEqual(library.body, { items: [], source: "kb_unified" });
+  });
+
+  await t.test("视频号解析服务区分端口存活与页面业务就绪", async () => {
+    const disconnected = await requestJson(baseUrl, "/api/v1/services");
+    const before = disconnected.body.services.wx_channels_card;
+    assert.equal(before.running, true, "HTTP 端点可达时进程仍应标记运行");
+    assert.equal(before.healthy, false, "available:false 不得被 HTTP 200 或 onDemand 掩盖");
+    assert.equal(before.status, "degraded");
+    assert.equal(before.business.state, "page_disconnected");
+
+    channelsPageAvailable = true;
+    const connected = await requestJson(baseUrl, "/api/v1/services");
+    const after = connected.body.services.wx_channels_card;
+    assert.equal(after.running, true);
+    assert.equal(after.healthy, true);
+    assert.equal(after.status, "healthy");
+    assert.equal(after.business.ready, true);
+  });
+
+  await t.test("视频号可用性探针与卡片解析共用配置的自定义引擎端口", async () => {
+    const cardBody = {
+      objectId: "14950209185632029317",
+      nonceId: "custom_port_nonce_1",
+      title: "这个浏览器标题必须被忽略",
+      source: "fixture",
+    };
+    const created = await requestJson(baseUrl, "/api/v1/channels/card", {
+      method: "POST",
+      body: cardBody,
+      headers: signedHeaders(cardBody, "fixture-channels-card-custom-port"),
+    });
+    assert.equal(created.response.status, 202);
+    const completed = await waitFor(async () => {
+      const tasks = await requestJson(baseUrl, "/api/v1/tasks");
+      const task = tasks.body.tasks.find((item) => item.id === created.body.task.id);
+      if (task?.status === "failed") throw new Error(`card ingest failed with ${task.errorCode}`);
+      return task?.status === "completed" ? task : false;
+    }, { description: "custom-port card ingest" });
+    assert.equal(completed.title, "自定义端口卡片");
+    assert.equal(completed.platform, "视频号");
+    assert.equal(completed.sizeBytes >= fixtureBytes.length, true);
   });
 
   await t.test("signed inbox accepts one request and rejects replay or tampering", async () => {
@@ -298,6 +403,38 @@ test("local agent integrates content packages, approval gates, and exclusive ser
       stdinBytes.subarray(splitOffset),
     ]);
     assert.equal(JSON.parse(stdinOutput.stdout).ok, true);
+  });
+
+  await t.test("signed ClawBot outbound receipts update transport health without message content", async () => {
+    const report = async (value, nonce) => {
+      const body = {
+        text: JSON.stringify(value),
+        source: "openclaw_weixin_outbound_result",
+      };
+      const raw = JSON.stringify(body);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      return requestJson(baseUrl, "/api/v1/notifications/clawbot/outbound-result", {
+        method: "POST",
+        headers: {
+          "X-Zhitai-Timestamp": timestamp,
+          "X-Zhitai-Nonce": nonce,
+          "X-Zhitai-Signature": `v1=${createHmac("sha256", webhookSecret).update(`${timestamp}.${nonce}.${raw}`).digest("hex")}`,
+        },
+        body,
+      });
+    };
+
+    const failed = await report({ success: false, errorCode: "session_refresh_required" }, "clawbot_receipt_failure_123456");
+    assert.equal(failed.response.status, 200);
+    assert.deepEqual(failed.body, { ok: true, deliveryState: "session_refresh_required" });
+
+    const recovered = await report({ success: true, errorCode: null }, "clawbot_receipt_success_123456");
+    assert.equal(recovered.response.status, 200);
+    assert.deepEqual(recovered.body, { ok: true, deliveryState: "ready" });
+
+    const rejected = await report({ success: true, errorCode: null, content: "must not be accepted" }, "clawbot_receipt_extra_12345678");
+    assert.equal(rejected.response.status, 400);
+    assert.deepEqual(rejected.body, { error: "invalid_clawbot_outbound_result" });
   });
 
   await t.test("inbox client refuses redirects instead of forwarding signed content", async (subtest) => {
@@ -508,6 +645,16 @@ async function requestJson(baseUrl, path, options = {}) {
   });
   const body = await response.json();
   return { response, body };
+}
+
+function signedHeaders(body, nonce) {
+  const timestamp = String(Date.now());
+  const raw = JSON.stringify(body);
+  return {
+    "X-Zhitai-Timestamp": timestamp,
+    "X-Zhitai-Nonce": nonce,
+    "X-Zhitai-Signature": `v1=${createHmac("sha256", webhookSecret).update(`${timestamp}.${nonce}.${raw}`).digest("hex")}`,
+  };
 }
 
 async function requestRawChunks(baseUrl, path, chunks, headers) {

@@ -2,7 +2,7 @@
 
 织台使用可替换适配器连接第三方采集、分析、生成、通知和发布能力。集成是可选项；核心启动不依赖任何平台账号。
 
-本指南只描述接口和安全要求，不提供第三方源码、登录态或一键打包。启用前先阅读 [第三方声明](../THIRD_PARTY_NOTICES.md)。
+本指南只描述接口和安全要求，不提供第三方源码、登录态或一键打包。跨组件的业务状态、幂等和成功判定以 [统一内容生命周期契约](CONTENT_LIFECYCLE.md) 为准；启用前先阅读 [架构与信任边界](ARCHITECTURE.md) 和 [第三方声明](../THIRD_PARTY_NOTICES.md)。
 
 ## 集成类型
 
@@ -144,7 +144,17 @@ X-Zhitai-Signature: v1=HMAC-SHA256(timestamp + "." + nonce + "." + rawBody)
 
 默认应使用工作台草稿或平台草稿。publish 需要用户在可见界面中确认素材、标题、账号、平台、可见范围和时间，并携带操作确认标记。
 
-排期任务需要持久化、幂等、重启恢复和过期处理。验证码、登录失效、平台风控、账号异常或不确定退出码应进入 needs_attention，不循环重试。
+排期任务需要持久化、幂等、重启恢复和过期处理。当前原生发布路径由本地 `publisher-schedule.json` 持有排期 owner，并在到点后只调用立即发布；旧 `tasks.json` 排期不会自动执行。
+
+发布状态必须区分意图与结果：
+
+```text
+draft → scheduled / queued → preflighting → submitting
+      → submitted_unverified / needs_reconciliation / needs_attention
+      → public（仅逐平台独立回读）
+```
+
+HTTP 2xx、子进程退出 0、本地 `scheduled`、adapter `submitted` 和平台草稿都不是公开成功。外部调用窗口打开后若结果不确定，任务进入 `needs_reconciliation`，不得自动重发；验证码、登录失效、平台风控和明确的账号异常进入 `needs_attention` 并转人工处理。
 
 ## 浏览器用户脚本
 

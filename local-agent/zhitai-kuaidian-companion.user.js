@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         织台·快点伴生桥（V1 控制台）
 // @namespace    zhitai.local/kuaidian-companion
-// @version      0.2.7
+// @version      0.2.8
 // @description  织台知识库·快点伴生桥（V1 控制台）：每 5s 心跳（仅 version/pageKind/原版快点检测/
-//               待报数/上次结果，绝不带 cookie 或下载 URL）；观察原版快点脚本写入 localStorage 的 okd
+//               待报数/有限结果码，绝不带 cookie、标题、正文或下载 URL）；只读观察原版快点的 okd
 //               解析结果，增量去重上报 {downloadUrl, sourceUrl?, deliveryId?} 到本地节点 /api/v1/kuaidian；
 //               上报 202 后轮询 item 终态，仅 success/duplicate/linked 写入 reported，失败/部分/孤立/
 //               超时/陈旧 processing 保持可重试（needs attention）；重供命令轮询：按 deliveryId 找回
@@ -30,7 +30,7 @@
   var STATUS_POLL_MS = 2000;
   var STATUS_POLL_MAX = 45; // 45×2s≈90s 未达终态 → needs attention（可重试）
   var COMMAND_POLL_MS = 8000;
-  var VERSION = "0.2.7";
+  var VERSION = "0.2.8";
 
   /** 网页脚本在线不等于微信已登录。只根据聊天发送区判断登录态，
    *  不根据 cookie 或历史下载记录猜测，避免登录二维码页面被误报为可入库。 */
@@ -43,6 +43,37 @@
     } catch (e) {
       return false;
     }
+  }
+
+  /** FNV-1a 双 32 位指纹：仅作本机去重，GM storage 不保留 MsgId/objectId 原值。 */
+  function fingerprint(value) {
+    var text = String(value == null ? "" : value);
+    var h1 = 0x811c9dc5;
+    var h2 = 0x9e3779b9;
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0;
+    }
+    return "v2:" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+  }
+
+  function normalizeFingerprints(key) {
+    var value = GM_getValue(key, []);
+    var rows = Array.isArray(value) ? value : [];
+    var normalized = [];
+    for (var i = 0; i < rows.length; i++) {
+      var current = String(rows[i] == null ? "" : rows[i]);
+      var safe = /^v2:[0-9a-f]{16}$/.test(current) ? current : fingerprint(current);
+      if (normalized.indexOf(safe) === -1) normalized.push(safe);
+    }
+    normalized = normalized.slice(-2000);
+    if (JSON.stringify(rows) !== JSON.stringify(normalized)) GM_setValue(key, normalized);
+    return normalized;
+  }
+
+  function isRemembered(rows, value) {
+    return rows.indexOf(value) !== -1 || rows.indexOf(fingerprint(value)) !== -1;
   }
 
   function decodeSpdXml(value) {
@@ -113,13 +144,11 @@
     var objectId = (readXmlValues(xml, "objectId")[0] || "").trim();
     var nonceId = (readXmlValues(xml, "objectNonceId")[0] || "").trim();
     if (!/^[0-9]{6,32}$/.test(objectId) || !/^[A-Za-z0-9_-]{1,240}$/.test(nonceId)) return null;
-    var descriptions = readXmlValues(xml, "desc");
-    var titles = readXmlValues(xml, "title");
     var deliveryId = item.m == null ? null : String(item.m);
     return {
       objectId: objectId,
       nonceId: nonceId,
-      title: String(item.d || descriptions[descriptions.length - 1] || titles[0] || "视频号内容").slice(0, 200),
+      title: "视频号内容",
       deliveryId: deliveryId,
       key: deliveryId ? "msg:" + deliveryId : "object:" + objectId,
     };
@@ -138,18 +167,53 @@
   }
 
   /** 稳定分享 host 白名单（spD.u 回退用）：微信 sph/s/sf、视频号 mobile/sf、抖音短链、小红书短链 */
-  function isStableShareHost(u) {
-    if (typeof u !== "string") return false;
+  function canonicalStableShareUrl(value) {
+    if (typeof value !== "string") return null;
     var url;
-    try { url = new URL(u); } catch (e) { return false; }
-    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-    if (url.username || url.password || url.port) return false;
+    try { url = new URL(value); } catch (e) { return null; }
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || url.port) return null;
+    var material = String(url.pathname || "") + String(url.hash || "");
+    for (var decodeIndex = 0; decodeIndex < 2; decodeIndex++) {
+      try {
+        var decoded = decodeURIComponent(material);
+        if (decoded === material) break;
+        material = decoded;
+      } catch (e) { break; }
+    }
+    if (/(?:^|[\s?&;,/])(?:bearer(?:\s+|[A-Za-z0-9._~+/-])|(?:access[_-]?token|auth(?:orization)?|cookie|credential|password|pass[_-]?ticket|secret|session(?:_?id)?|signature|sig|token|uskey|x-uskey)\s*[=:])/i.test(material)
+      || /(?:\+?86[ -]?)?1[3-9]\d{9}/.test(material)
+      || /(?:^|\/)(?:Users|home|private|var|tmp|opt|srv)(?:\/|$)/i.test(material)
+      || /<(?:html|body|script|style|div|span|p|a|img|video|article|section)\b/i.test(material)) return null;
+    for (var entry of url.searchParams.entries()) {
+      var name = String(entry[0] || "").toLowerCase();
+      var queryValue = String(entry[1] || "");
+      for (var queryDecodeIndex = 0; queryDecodeIndex < 2; queryDecodeIndex++) {
+        try {
+          var decodedQuery = decodeURIComponent(queryValue);
+          if (decodedQuery === queryValue) break;
+          queryValue = decodedQuery;
+        } catch (e) { break; }
+      }
+      if (/(?:token|secret|signature|credential|session|password|auth|cookie|key)/i.test(name)
+        || /(?:token|secret|signature|credential|session|password|auth|cookie)\s*[=:]/i.test(queryValue)
+        || /(?:\+?86[ -]?)?1[3-9]\d{9}/.test(queryValue)
+        || /(?:file:\/\/\/|\/(?:Users|home|private|var|tmp|opt|srv)\/|[A-Za-z]:\\(?:Users|Documents|Desktop)\\)/i.test(queryValue)
+        || /<(?:html|body|script|style|div|span|p|a|img|video|article|section)\b/i.test(queryValue)) return null;
+    }
     var host = url.hostname.toLowerCase();
     var pathname = url.pathname;
-    if (host === "weixin.qq.com") return /^\/(?:sph|s|sf)\/[^/]+/i.test(pathname);
-    if (host === "channels.weixin.qq.com") return /^\/mobile\/sf\/[^/]+/i.test(pathname);
-    if (host === "v.douyin.com" || host === "xhslink.com") return pathname.charAt(0) === "/";
-    return false;
+    var supported = (host === "weixin.qq.com" && /^\/(?:sph|s|sf)\/[A-Za-z0-9_-]+\/?$/i.test(pathname))
+      || (host === "channels.weixin.qq.com" && /^\/mobile\/sf\/[A-Za-z0-9_-]+\/?$/i.test(pathname))
+      || (host === "v.douyin.com" && /^\/[A-Za-z0-9_-]+\/?$/i.test(pathname))
+      || (host === "xhslink.com" && /^\/[A-Za-z0-9_-]+\/?$/i.test(pathname));
+    if (!supported) return null;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  }
+
+  function isStableShareHost(u) {
+    return canonicalStableShareUrl(u) !== null;
   }
 
   /** 安全 atob 解码 spD.u 作为稳定源 URL 回退：u 可能是 ba() 的 base64 结果，或已是分享 URL。
@@ -158,12 +222,12 @@
     if (!spdItem) return null;
     var raw = spdItem.u;
     if (typeof raw !== "string" || !raw) return null;
-    if (/^https?:\/\//i.test(raw)) return isStableShareHost(raw) ? raw : null;
+    if (/^https?:\/\//i.test(raw)) return canonicalStableShareUrl(raw);
     var decoded = null;
     try { decoded = atob(String(raw)); } catch (e) { return null; }
     if (typeof decoded !== "string" || !/^https?:\/\//i.test(decoded)) return null;
     var m = decoded.match(/https?:\/\/[^\s"'<>]+/);
-    return m && isStableShareHost(m[0]) ? m[0] : null;
+    return m ? canonicalStableShareUrl(m[0]) : null;
   }
 
   /** 从 spD 原始消息 XML（C 字段）提取真实分享链接（sph/sf 等稳定 URL） */
@@ -175,12 +239,13 @@
     var urls = doc.getElementsByTagName("url");
     for (var i = 0; i < urls.length; i++) {
       var u = String(urls[i].textContent || "").trim();
-      if (isStableShareHost(u)) return u;
+      var safeUrl = canonicalStableShareUrl(u);
+      if (safeUrl) return safeUrl;
     }
     return null;
   }
 
-  /** 解析 okd 增量：返回待上报数组 [{ downloadUrl, sourceUrl, title, deliveryId, msgId }]。
+  /** 解析 okd 增量：返回待上报数组 [{ downloadUrl, sourceUrl, deliveryId, msgId }]。
    *  sourceUrl 优先取消息 XML C 的稳定 url，其次安全 atob(spD.u) 回退；两者都取不到 → null。 */
   function collectReports(okdRaw, spdRaw, reported) {
     var out = [];
@@ -216,7 +281,6 @@
       out.push({
         downloadUrl: item.u,
         sourceUrl: sourceUrl, // 取不到真实分享 URL → null（元数据 unavailable，绝不用下载直链冒充）
-        title: item.d || null,
         deliveryId: msgId, // 微信 MsgId/投递 ID，不是平台 contentId
         msgId: msgId,
       });
@@ -226,11 +290,11 @@
 
   /** 终态集合：只有这些状态才停止轮询 */
   function isTerminalStatus(s) {
-    return ["success", "duplicate", "linked", "failed", "partial", "orphaned"].indexOf(s) !== -1;
+    return ["success", "duplicate", "linked", "completed", "failed", "partial", "orphaned", "needs_attention", "cancelled"].indexOf(s) !== -1;
   }
   /** 只有成功系才可写 REPORTED_KEY */
   function isReportedSuccess(s) {
-    return ["success", "duplicate", "linked"].indexOf(s) !== -1;
+    return ["success", "duplicate", "linked", "completed"].indexOf(s) !== -1;
   }
 
   /** 有界轮询到终态：fetchStatus(cb) 每次返回 {status, itemId} 或 null（网络错）；
@@ -260,14 +324,34 @@
   var inFlight = {};
 
   function getCardReported() {
-    var value = GM_getValue(CARD_REPORTED_KEY, []);
-    return Array.isArray(value) ? value : [];
+    return normalizeFingerprints(CARD_REPORTED_KEY);
   }
 
   function rememberCardReported(key) {
     var done = getCardReported();
-    if (done.indexOf(key) === -1) done.push(key);
+    var safe = fingerprint(key);
+    if (done.indexOf(safe) === -1) done.push(safe);
     GM_setValue(CARD_REPORTED_KEY, done.slice(-2000));
+  }
+
+  function fetchTaskStatus(taskId, cb) {
+    GM_xmlhttpRequest({
+      method: "GET",
+      url: API_BASE + "/api/v1/tasks",
+      timeout: 10000,
+      onload: function (res) {
+        var body = null;
+        try { body = JSON.parse(res.responseText || "{}"); } catch (e) { /* ignore */ }
+        var tasks = body && Array.isArray(body.tasks) ? body.tasks : [];
+        var task = null;
+        for (var i = 0; i < tasks.length; i++) {
+          if (tasks[i] && tasks[i].id === taskId) { task = tasks[i]; break; }
+        }
+        cb(task ? { status: task.status, itemId: task.id } : null);
+      },
+      onerror: function () { cb(null); },
+      ontimeout: function () { cb(null); },
+    });
   }
 
   function submitCardCandidate(card) {
@@ -281,7 +365,7 @@
       data: JSON.stringify({
         objectId: card.objectId,
         nonceId: card.nonceId,
-        title: card.title,
+        title: "视频号内容",
         deliveryId: card.deliveryId,
         source: "filehelper_spd",
       }),
@@ -289,19 +373,33 @@
       onload: function (res) {
         delete inFlight[flightKey];
         if (res.status === 202) {
-          rememberCardReported(card.key);
-          lastResult = "视频号卡片已交给织台下载";
+          var body = null;
+          try { body = JSON.parse(res.responseText || "{}"); } catch (e) { /* ignore */ }
+          var taskId = body && body.task && body.task.id;
+          if (!taskId) {
+            lastResultCode = "needs_attention";
+            return;
+          }
+          lastResultCode = "card_accepted";
+          pollUntilTerminal(function (cb) { fetchTaskStatus(taskId, cb); }, {}).run(function (result) {
+            if (result.terminal && isReportedSuccess(result.status)) {
+              rememberCardReported(card.key);
+              lastResultCode = "reported_success";
+            } else {
+              lastResultCode = "needs_attention";
+            }
+          });
         } else {
-          lastResult = "卡片提交失败（" + res.status + "）";
+          lastResultCode = "card_rejected";
         }
       },
       onerror: function () {
         delete inFlight[flightKey];
-        lastResult = "卡片提交失败（本地节点不可达）";
+        lastResultCode = "card_unreachable";
       },
       ontimeout: function () {
         delete inFlight[flightKey];
-        lastResult = "卡片提交超时";
+        lastResultCode = "card_timeout";
       },
     });
   }
@@ -316,7 +414,8 @@
       // 避免安装新版后突然下载几十条旧视频。之后新增的卡片逐条处理。
       if (!GM_getValue(CARD_SEEDED_KEY, false)) {
         for (var i = 0; i < cards.length - 1; i++) {
-          if (reported.indexOf(cards[i].key) === -1) reported.push(cards[i].key);
+          var safe = fingerprint(cards[i].key);
+          if (reported.indexOf(safe) === -1) reported.push(safe);
         }
         GM_setValue(CARD_REPORTED_KEY, reported.slice(-2000));
         GM_setValue(CARD_SEEDED_KEY, true);
@@ -324,7 +423,7 @@
 
       reported = getCardReported();
       for (var j = 0; j < cards.length; j++) {
-        if (reported.indexOf(cards[j].key) !== -1) continue;
+        if (isRemembered(reported, cards[j].key)) continue;
         submitCardCandidate(cards[j]);
       }
     } catch (e) { /* localStorage/GM 不可用时不阻塞原页 */ }
@@ -350,7 +449,6 @@
     var payload = {
       downloadUrl: report.downloadUrl,
       sourceUrl: report.sourceUrl,
-      title: report.title,
       deliveryId: report.deliveryId,
     };
     GM_xmlhttpRequest({
@@ -386,7 +484,7 @@
       var okdRaw = localStorage.getItem("okd");
       if (!okdRaw) return;
       var spdRaw = localStorage.getItem("spD");
-      var reported = GM_getValue(REPORTED_KEY, []);
+      var reported = normalizeFingerprints(REPORTED_KEY);
       var reports = collectReports(okdRaw, spdRaw, reported);
       if (!reports.length) return;
       reports.forEach(function (r) {
@@ -394,12 +492,13 @@
         inFlight[r.msgId] = true;
         reportOne(r, function (result) {
           delete inFlight[r.msgId];
-          lastResult = result && result.reported
-            ? "已入库（" + (result.status || "success") + "）"
-            : (result && result.needsAttention ? "下载需处理" : "上报失败");
+          lastResultCode = result && result.reported
+            ? "reported_success"
+            : (result && result.needsAttention ? "needs_attention" : "report_failed");
           if (result && result.reported) {
-            var done = GM_getValue(REPORTED_KEY, []);
-            if (done.indexOf(r.msgId) === -1) done.push(r.msgId);
+            var done = normalizeFingerprints(REPORTED_KEY);
+            var safe = fingerprint(r.msgId);
+            if (done.indexOf(safe) === -1) done.push(safe);
             GM_setValue(REPORTED_KEY, done.slice(-2000));
           }
           // 失败/超时：不写 reported → 下次轮询仍可重试（needs attention）
@@ -421,7 +520,7 @@
     return false;
   }
 
-  var lastResult = null;
+  var lastResultCode = "idle";
 
   function getStorageSummary() {
     var forwarded = 0;
@@ -440,7 +539,7 @@
   /** 心跳：每 5s 上报安全字段（版本/页面类型/原版快点检测/待报数/上次结果），绝不含 cookie/下载 URL */
   function heartbeat() {
     try {
-      var reported = GM_getValue(REPORTED_KEY, []);
+      var reported = normalizeFingerprints(REPORTED_KEY);
       var pendingReportCount = 0;
       try {
         var reports = collectReports(
@@ -460,7 +559,8 @@
           wechatLoggedIn: detectWechatLoggedIn(),
           originalKuaidianDetected: detectOriginalKuaidian(),
           pendingReportCount: pendingReportCount,
-          lastResult: lastResult || getStorageSummary(),
+          lastResultCode: lastResultCode,
+          lastResult: lastResultCode,
         }),
         timeout: 8000,
         onload: function () {},
@@ -516,7 +616,6 @@
       data: JSON.stringify({
         downloadUrl: item.u,
         sourceUrl: sourceUrl,
-        title: item.d || null,
         deliveryId: item.m,
       }),
       timeout: 15000,
@@ -600,6 +699,8 @@
       isReportedSuccess: isReportedSuccess,
       pollUntilTerminal: pollUntilTerminal,
       getStorageSummary: getStorageSummary,
+      fingerprint: fingerprint,
+      canonicalStableShareUrl: canonicalStableShareUrl,
       API_BASE: API_BASE,
       VERSION: VERSION,
     };

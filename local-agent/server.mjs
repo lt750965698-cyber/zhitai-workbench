@@ -3,6 +3,7 @@ import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto
 import { constants as fsConstants, createReadStream } from "node:fs";
 import {
   access,
+  chmod,
   cp,
   mkdir,
   readFile,
@@ -21,28 +22,70 @@ import { CHANNELS_PROXY_PAC } from "./channels-proxy-pac.mjs";
 import { DEFAULT_KEYCHAIN_SERVICE, readKeychainSecret } from "./keychain-secret.mjs";
 import { decideInboxAuthentication } from "./inbox-auth.mjs";
 import { downloadChannelsVideo, loadYuanbaoCookie, parseChannelsVideo } from "./channels-yuanbao.mjs";
-import { parseChannelsCard } from "./channels-card.mjs";
+import { getChannelsCardEngineStatus, parseChannelsCard } from "./channels-card.mjs";
+import { createChannelsPageRecoverySupervisor } from "./channels-page-recovery.mjs";
 import { analyzeVideo } from "./analyze.mjs";
 import { initKb, handleKbRequest } from "./kb-routes.mjs";
-import { assessMediaQuality, ingestOne as kbIngestOne, openKbDb, sanitizeFailureText } from "./kb.mjs";
-import { isStableShareUrl, canonicalizeSourceUrl, probeLocalMedia, redactUrlForStorage } from "./downloader-adapter.mjs";
+import {
+  assessMediaQuality,
+  ingestOne as kbIngestOne,
+  openKbDb,
+  sanitizeFailureText,
+  STRICT_ZHITAI_GENERATION_ENGINES,
+  strictWorkflowSha256,
+  validateLocalMotionManifestBundle,
+  withImmediateTransactionRetry,
+  ZHITAI_LOCAL_MOTION_ENGINE,
+  ZHITAI_SEEDANCE_ENGINE,
+} from "./kb.mjs";
+import {
+  isStableShareUrl,
+  canonicalizeSourceUrl,
+  containsSensitiveUrlMaterial,
+  probeLocalMedia,
+  redactUrlForStorage,
+} from "./downloader-adapter.mjs";
 import { downloadSafeImage } from "./safe-image-download.mjs";
 import * as matrix from "./matrixmedia-adapter.mjs";
+import { createPlatformReceipts, persistPlatformReceipts, redactPlatformReceiptText } from "./platform-receipts.mjs";
 import * as xhsPublisher from "./xiaohongshu-publisher.mjs";
 import * as wechatOfficial from "./wechat-official-publisher.mjs";
 import { CreativeQueue } from "./creative-queue.mjs";
+import { assertLifecycleTransition, publishFailureDisposition } from "./content-lifecycle.mjs";
+import { createDiagnosticStore } from "./diagnostics.mjs";
+import {
+  childEnvironment,
+  isPathInside,
+  openLocalPath,
+  resolveExecutablePath,
+  runtimeRootForPlatform,
+  writableAppRoot,
+} from "./platform-utils.mjs";
+import {
+  assertPlatformCapability,
+  platformCapabilities,
+  WINDOWS_PREVIEW_ERROR,
+  windowsPreviewStatus,
+} from "./platform-capabilities.mjs";
 import { AnalysisQueue } from "./analysis-queue.mjs";
 import { buildRuntimeConditions, normalizeCreativeConditionReport } from "./runtime-conditions.mjs";
 import { assessGenerationReadiness } from "./seedance-workflow.mjs";
 import { ensureXBookmarkSchema, getXBookmark, importXBookmarks, queryXBookmarks, xBookmarkStatus } from "./x-bookmarks.mjs";
-import { RemoteController } from "./remote-controller.mjs";
+import { RemoteController, shouldAcknowledgeRemoteUserReply } from "./remote-controller.mjs";
 import { NotificationCenter } from "./notification-center.mjs";
 import { ClawBotNotifier } from "./clawbot-notifier.mjs";
+import { createPublisherLoginRecovery } from "./publisher-login-recovery.mjs";
+import { createClawbotKeepaliveSupervisor } from "./clawbot-keepalive-supervisor.mjs";
+import { runOpenInterpreterKeepalive } from "./open-interpreter-keepalive-runner.mjs";
 import { installModuleUpdate, moduleUpdateBlocker } from "./module-updater.mjs";
 import { validateAudioQualityReport } from "./audio-quality.mjs";
+import {
+  assessAutonomousContentReview,
+  AUTONOMOUS_REVIEW_POLICY_VERSION,
+  AUTONOMOUS_REVIEWER,
+} from "./autonomous-review.mjs";
 import { publishContentForPlan, publishSourceUrlForPlan, publishTitleForPlan, remediateToOriginalWorkflow } from "./originality-remediation.mjs";
 import { persistOriginalityRemediation } from "./originality-remediation-store.mjs";
-import { publicDisplayPath } from "./public-path.mjs";
 import {
   assertPublishScheduleBinding,
   deterministicPublishScheduleId,
@@ -54,22 +97,34 @@ import {
 import { migrateLibraryToKb } from "./kb-migrate.mjs";
 
 const agentRoot = dirname(fileURLToPath(import.meta.url));
-const runtimeRoot = resolve(process.env.ZHITAI_RUNTIME_ROOT
-  || join(homedir(), ".local", "share", "zhitai-runtime"));
+const capabilities = platformCapabilities();
+const windowsPreview = capabilities.windowsPreview === true;
+const writableRoot = writableAppRoot();
+const runtimeRoot = resolve(process.env.ZHITAI_RUNTIME_ROOT || runtimeRootForPlatform());
 const applicationsRoot = resolve(process.env.ZHITAI_APPLICATIONS_DIR
-  || join(homedir(), "Applications"));
+  || (windowsPreview ? join(writableRoot, "applications") : join(homedir(), "Applications")));
 const xianyuRoot = resolve(process.env.ZHITAI_XIANYU_ROOT
   || join(applicationsRoot, "xianyu-auto-reply-fix"));
-const configPath = process.env.ZHITAI_CONFIG_PATH || join(agentRoot, "config.local.json");
+const configPath = process.env.ZHITAI_CONFIG_PATH
+  || (windowsPreview ? join(writableRoot, "config.local.json") : join(agentRoot, "config.local.json"));
 const exampleConfigPath = join(agentRoot, "config.example.json");
 const config = await loadConfig();
 assertLoopback(config.host);
 
-const dataDir = resolve(process.env.ZHITAI_DATA_DIR || config.dataDir || join(agentRoot, "data"));
+// 自动发布登录恢复会启动 MatrixMedia 的交互式登录窗口。测试进程默认关闭，
+// 避免 node:test 及其子进程扫描或操作本机真实账号；显式设为 0 可用于专门的恢复测试。
+const publisherLoginRecoveryAutomationDisabled = process.env.ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY === "1"
+  || (process.env.ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY !== "0"
+    && Boolean(process.env.NODE_TEST_CONTEXT || process.env.NODE_TEST_WORKER_ID));
+
+const dataDir = resolve(process.env.ZHITAI_DATA_DIR
+  || (windowsPreview ? join(writableRoot, "data") : config.dataDir)
+  || join(agentRoot, "data"));
 const tasksPath = join(dataDir, "tasks.json");
 const eventsPath = join(dataDir, "events.json");
 const webhookNoncesPath = join(dataDir, "webhook-nonces.json");
 const publishDir = join(dataDir, "publish-jobs");
+const platformReceiptsDir = join(dataDir, "platform-receipts");
 const creativeJobsPath = join(dataDir, "creative-jobs.json");
 const creativeReviewsPath = join(dataDir, "creative-reviews.json");
 const analysisJobsPath = join(dataDir, "analysis-jobs.json");
@@ -78,7 +133,7 @@ const publisherReceiptsPath = join(dataDir, "publisher-receipts.json");
 const publisherSchedulePath = join(dataDir, "publisher-schedule.json");
 const publisherReceiptStore = matrix.createPublishReceiptStore({ path: publisherReceiptsPath });
 const knowledgeBase = expandHome(config.knowledgeBase);
-const publicKnowledgeBase = publicDisplayPath(knowledgeBase);
+const publicKnowledgeBase = "本机内容库";
 // ── 快点控制台 V1：伴生桥心跳（内存，TTL 默认 15s；测试可用 ZHITAI_KUAIDIAN_TTL_MS 缩短） ──
 const KUAIDIAN_HEARTBEAT_TTL_MS = Math.max(200, Number(process.env.ZHITAI_KUAIDIAN_TTL_MS) || 90_000);
 const kuaidianHeartbeat = {
@@ -91,6 +146,19 @@ const kuaidianHeartbeat = {
   pendingReportCount: 0,
   lastResult: null,
 };
+const KUAIDIAN_PAGE_KINDS = new Set(["filehelper", "unknown"]);
+const KUAIDIAN_RESULT_CODES = new Set([
+  "idle",
+  "ok",
+  "card_accepted",
+  "card_rejected",
+  "card_unreachable",
+  "card_timeout",
+  "reported_success",
+  "needs_attention",
+  "report_failed",
+  "unknown",
+]);
 // 重供命令队列（仅 itemId + 内部 deliveryId；绝不含下载 URL/签名），持久化 dataDir/kuaidian-commands.json
 const kuaidianCommandsPath = join(dataDir, "kuaidian-commands.json");
 // 可测试性注入：ZHITAI_ENRICH_SCRIPT=<path> 时用脚本默认导出替代真实元宝补元数据（测试用，生产不设置）
@@ -120,16 +188,34 @@ let webhookNonceMutation = Promise.resolve();
 let moduleUpdateCache = { at: 0, modules: [] };
 let moduleUpdateMutation = Promise.resolve();
 let libraryMigrationMutation = Promise.resolve();
+let startupLibraryMigration = Promise.resolve(null);
 let creativeQueue = null;
 let analysisQueue = null;
 let analysisExecution = Promise.resolve();
 let remoteController = null;
 let notificationCenter = null;
+let publisherLoginRecovery = null;
+let clawbotKeepaliveSupervisor = null;
+// 仅存在于当前进程、当前单飞保活尝试中；HMAC 指纹绝不落盘或进入 HTTP。
+let clawbotKeepaliveBinding = null;
 let publisherSchedulerInit = null;
 let downloadWatchdogTimer = null;
 let credentialReminderTimer = null;
 let runtimeConditionsTimer = null;
+let channelsPageRecovery = null;
+let channelsPageEnsurePromise = null;
+let channelsCardProbeSnapshot = null;
+let shuttingDown = false;
+const intentionalServiceStops = new Set();
+const serviceRestartAttempts = new Map();
+const serviceRestartTimers = new Map();
+const CHANNELS_CARD_CONNECTION_ERRORS = new Set([
+  "channels_card_engine_offline",
+  "channels_card_engine_starting",
+  "channels_card_wechat_page_not_connected",
+]);
 let creativeReviewMutation = Promise.resolve();
+let pendingCreativeReviewReassessment = null;
 let runtimeConditionsMutation = Promise.resolve();
 let runtimeConditionsCache = { at: 0, snapshot: null };
 let runtimeConditionsRefreshInFlight = null;
@@ -137,11 +223,195 @@ let runtimeConditionsLastRefreshAt = 0;
 let runtimeConditionsLastRefreshSnapshot = null;
 const RUNTIME_CONDITIONS_REFRESH_COOLDOWN_MS = 15_000;
 
+function serializeLibraryDbWork(operation) {
+  const current = libraryMigrationMutation.catch(() => {}).then(operation);
+  libraryMigrationMutation = current.then(() => undefined, () => undefined);
+  return current;
+}
+
+function queueLibraryMigration() {
+  return serializeLibraryDbWork(() => migrateLibraryToKb({
+    kbRoot: knowledgeBase,
+    dataDir,
+    privDir: kbPrivDir,
+  }));
+}
+
+async function resolveCreativeFailureBlockersIfRecovered() {
+  if (!notificationCenter || !creativeQueue) return false;
+  const jobs = await creativeQueue.list();
+  if (jobs.some((job) => ["failed", "needs_attention"].includes(job.status))) return false;
+  await notificationCenter.resolveBlockersByKind(
+    ["creative_failed", "creative_transient_exhausted"],
+    "creative_queue_recovered",
+  );
+  return true;
+}
+
+async function resolveCreativeTransientBlocker(jobId, reason = "creative_job_recovered") {
+  if (!notificationCenter || !jobId) return false;
+  await notificationCenter.resolveBlockersByKeys(
+    [`creative_transient_exhausted:${jobId}`],
+    reason,
+  );
+  return true;
+}
+
 async function readCreativeReviews() {
   try {
     const rows = JSON.parse(await readFile(creativeReviewsPath, "utf8"));
     return Array.isArray(rows) ? rows : [];
   } catch { return []; }
+}
+
+function assertGenerationApprovedForPublish(reviews, { assetId, generation }) {
+  const cleanAssetId = String(assetId || "").trim();
+  const taskId = String(generation?.engine_task_id || "").trim();
+  if (!cleanAssetId || !taskId) {
+    throw httpError(409, "publish_creative_review_binding_missing");
+  }
+  const sameTask = (Array.isArray(reviews) ? reviews : [])
+    .filter((row) => String(row?.jobId || "").trim() === taskId);
+  const exact = sameTask.filter((row) => String(row?.assetId || "").trim() === cleanAssetId);
+  if (!exact.length) {
+    throw httpError(409, sameTask.length
+      ? "publish_creative_review_asset_mismatch"
+      : "publish_creative_review_missing");
+  }
+  if (exact.length !== 1) throw httpError(409, "publish_creative_review_ambiguous");
+
+  const review = exact[0];
+  const status = String(review?.status || "missing").trim();
+  if (status !== "approved_for_publish") {
+    throw httpError(409, `publish_creative_review_not_approved：${status}`);
+  }
+  if (review?.supersededByReviewId || review?.revisionTaskId) {
+    throw httpError(409, "publish_creative_review_not_current");
+  }
+  if (review?.reviewer !== AUTONOMOUS_REVIEWER
+    || review?.reviewPolicyVersion !== AUTONOMOUS_REVIEW_POLICY_VERSION) {
+    throw httpError(409, "publish_creative_review_policy_stale");
+  }
+  if (!String(review?.id || "").trim()
+    || !STRICT_ZHITAI_GENERATION_ENGINES.includes(generation?.engine)
+    || !String(review?.generationId || "").trim()
+    || String(review.generationId) !== String(generation?.id || "")) {
+    throw httpError(409, "publish_creative_review_generation_mismatch");
+  }
+
+  const machine = review?.reviewEvidence?.machine;
+  const generatedClips = machine?.generatedClips;
+  const clips = Array.isArray(generatedClips?.clips) ? generatedClips.clips : [];
+  const expectedShotCount = Number(generatedClips?.expectedShotCount);
+  const actualShotCount = Number(generatedClips?.actualShotCount);
+  const clipHashes = clips.map((clip) => String(clip?.sha256 || "").toLowerCase());
+  const clipEvidenceValid = generatedClips?.passed === true
+    && Number.isInteger(expectedShotCount)
+    && expectedShotCount > 0
+    && expectedShotCount === actualShotCount
+    && clips.length === expectedShotCount
+    && clips.every((clip, index) => /^clip-\d+\.mp4$/i.test(String(clip?.name || ""))
+      && Number(clip?.sizeBytes) > 0
+      && /^[a-f0-9]{64}$/i.test(clipHashes[index]))
+    && new Set(clipHashes).size === clips.length;
+  const generationSha256 = String(generation?.sha256 || "").toLowerCase();
+  const generationEngine = String(generation?.engine || "");
+  const storyboards = Array.isArray(machine?.storyboards) ? machine.storyboards : [];
+  const storyboardHashes = storyboards.map((item) => String(item?.sha256 || "").toLowerCase());
+  const storyboardEvidenceValid = /^[a-f0-9]{64}$/i.test(String(machine?.storyboardFingerprint || ""))
+    && storyboards.length > 0
+    && storyboards.every((item, index) => /^storyboard-\d+\.png$/i.test(String(item?.name || ""))
+      && Number(item?.sizeBytes) > 0
+      && /^[a-f0-9]{64}$/i.test(storyboardHashes[index]));
+  const localSegments = Array.isArray(machine?.localMotion?.segments) ? machine.localMotion.segments : [];
+  const localMotionEvidenceValid = generationEngine !== ZHITAI_LOCAL_MOTION_ENGINE || (
+    machine?.evidenceMode === "local_storyboard_motion"
+    && /^[a-f0-9]{64}$/i.test(String(machine?.motionManifestSha256 || ""))
+    && Number(machine?.localMotion?.width) === 1080
+    && Number(machine?.localMotion?.height) === 1920
+    && Number(machine?.localMotion?.fps) === 30
+    && Number(machine?.localMotion?.totalFrames) === 750
+    && Number(machine?.localMotion?.durationMs) === 25_000
+    && localSegments.length === 3
+    && localSegments.every((segment, index) => Number(segment?.index) === index + 1
+      && String(segment?.clipName || "") === String(clips[index]?.name || "")
+      && String(segment?.clipSha256 || "").toLowerCase() === clipHashes[index]
+      && String(segment?.sourceStoryboard || "") === String(storyboards[index]?.name || "")
+      && String(segment?.sourceStoryboardSha256 || "").toLowerCase() === storyboardHashes[index]
+      && Number(segment?.clipSizeBytes) === Number(clips[index]?.sizeBytes)
+      && Number(segment?.width) === 1080
+      && Number(segment?.height) === 1920
+      && Number(segment?.fps) === 30
+      && Number(segment?.frameCount) === 250
+      && Number(segment?.durationMs) > 0)
+    && Math.abs(localSegments.reduce((sum, segment) => sum + Number(segment.durationMs), 0) - 25_000) <= 2
+    && machine?.localMotion?.audio?.codec === "aac"
+    && machine?.localMotion?.audio?.narrationComplete === true
+    && machine?.localMotion?.audio?.timingVerified === true
+    && Number(machine?.localMotion?.audio?.meanVolumeDb) >= -34
+    && Number(machine?.localMotion?.audio?.maxVolumeDb) >= -18
+    && /^[a-f0-9]{64}$/i.test(String(machine?.localMotion?.audio?.narrationSha256 || ""))
+  );
+  const engineEvidenceModeValid = generationEngine === ZHITAI_LOCAL_MOTION_ENGINE
+    ? machine?.evidenceMode === "local_storyboard_motion"
+    : machine?.evidenceMode === "seedance_web_generation" && !machine?.motionManifestSha256;
+  const evidenceValid = machine?.strictPreflightPassed === true
+    && machine?.strictGenerated === true
+    && machine?.publicPreflight === true
+    && String(machine?.assetId || "") === cleanAssetId
+    && machine?.generationEngine === generationEngine
+    && String(machine?.generationTaskId || "") === taskId
+    && /^[a-f0-9]{64}$/i.test(generationSha256)
+    && String(machine?.mediaSha256 || "").toLowerCase() === generationSha256
+    && Number(machine?.mediaSizeBytes) === Number(generation?.size_bytes)
+    && Number(generation?.size_bytes) > 0
+    && /^[a-f0-9]{64}$/i.test(String(machine?.audioQualitySha256 || ""))
+    && /^[a-f0-9]{64}$/i.test(String(machine?.workflowSha256 || ""))
+    && /^[a-f0-9]{64}$/i.test(String(machine?.generationProvenanceSha256 || ""))
+    && machine?.audioQuality?.reportPassed === true
+    && machine?.audioQuality?.integrity === true
+    && storyboardEvidenceValid
+    && clipEvidenceValid
+    && engineEvidenceModeValid
+    && localMotionEvidenceValid;
+  if (!evidenceValid) throw httpError(409, "publish_creative_review_evidence_invalid");
+
+  const reviewBinding = {
+    id: String(review.id || ""),
+    status,
+    reviewer: review.reviewer,
+    policyVersion: review.reviewPolicyVersion,
+    reviewedAt: String(review.reviewedAt || ""),
+    updatedAt: String(review.updatedAt || ""),
+    assetId: cleanAssetId,
+    generationId: String(review.generationId),
+    generationTaskId: taskId,
+    generationEngine,
+    evidenceMode: machine.evidenceMode,
+    generationProvenanceSha256: machine.generationProvenanceSha256,
+    storyboardFingerprint: machine.storyboardFingerprint,
+    motionManifestSha256: machine.motionManifestSha256 || null,
+    evidence: review.reviewEvidence,
+  };
+  return {
+    creativeReviewId: reviewBinding.id,
+    creativeReviewPolicyVersion: reviewBinding.policyVersion,
+    creativeReviewSha256: createHash("sha256")
+      .update(JSON.stringify(reviewBinding))
+      .digest("hex"),
+    creativeReviewGenerationEngine: generationEngine,
+    creativeReviewEvidenceMode: machine.evidenceMode,
+    creativeReviewGenerationProvenanceSha256: machine.generationProvenanceSha256,
+    creativeReviewStoryboardFingerprint: machine.storyboardFingerprint,
+    creativeReviewMotionManifestSha256: machine.motionManifestSha256 || null,
+  };
+}
+
+async function approvedCreativeReviewBinding(assetId, generation) {
+  // 等待本进程内已经排队的撤销/复审原子落盘，再做发布判定；否则一次刚发生的
+  // needs_revision 可能在发布预检读取旧快照时短暂失效。
+  await creativeReviewMutation.catch(() => {});
+  return assertGenerationApprovedForPublish(await readCreativeReviews(), { assetId, generation });
 }
 
 async function mutateCreativeReviews(mutator) {
@@ -155,11 +425,242 @@ async function mutateCreativeReviews(mutator) {
   return operation;
 }
 
-async function recordCreativeReview({ job, persistedOutput }) {
+function readCreativeReviewPlan(assetId) {
+  const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
+  try {
+    const saved = db.prepare("SELECT plan_json FROM remake_plan WHERE asset_id=?").get(String(assetId || ""));
+    if (!saved?.plan_json) return {};
+    const plan = JSON.parse(saved.plan_json);
+    return plan && typeof plan === "object" ? plan : {};
+  } catch {
+    return {};
+  } finally {
+    db.close();
+  }
+}
+
+async function sha256LocalFile(filePath) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const digest = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => digest.update(chunk));
+    stream.once("error", rejectPromise);
+    stream.once("end", () => resolvePromise(digest.digest("hex")));
+  });
+}
+
+async function verifyGeneratedClipSet({
+  jobId,
+  expectedShotCount,
+  generationRoot = join(runtimeRoot, "generation"),
+  hashFile = sha256LocalFile,
+} = {}) {
+  const count = Number(expectedShotCount);
+  if (!Number.isInteger(count) || count <= 0) {
+    return {
+      passed: false,
+      code: "generated_clip_expected_count_invalid",
+      message: "生成片段唯一性校验缺少有效的预期分镜数量",
+      expectedShotCount: null,
+      actualShotCount: 0,
+    };
+  }
+  const cleanJobId = String(jobId || "").trim();
+  if (!/^creative_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cleanJobId)) {
+    return {
+      passed: false,
+      code: "generated_clip_job_id_invalid",
+      message: "生成片段唯一性校验无法绑定到有效的生成任务",
+      expectedShotCount: count,
+      actualShotCount: 0,
+    };
+  }
+
+  const generationDir = join(generationRoot, cleanJobId);
+  let entries;
+  try {
+    entries = await readdir(generationDir, { withFileTypes: true });
+  } catch (error) {
+    return {
+      passed: false,
+      code: error?.code === "ENOENT" ? "generated_clip_missing" : "generated_clip_read_failed",
+      message: error?.code === "ENOENT"
+        ? `生成片段不完整：预期 ${count} 段，实际目录或片段不存在`
+        : "生成片段目录读取失败，无法完成唯一性校验",
+      expectedShotCount: count,
+      actualShotCount: 0,
+    };
+  }
+
+  const clipEntries = entries
+    .filter((entry) => entry?.isFile?.() && /^clip-.*\.mp4$/i.test(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const parsed = clipEntries.map((entry) => ({
+    entry,
+    match: /^clip-(\d+)\.mp4$/i.exec(entry.name),
+  }));
+  const invalidName = parsed.find((item) => !item.match);
+  if (invalidName) {
+    return {
+      passed: false,
+      code: "generated_clip_name_invalid",
+      message: "生成片段命名无效，必须使用 clip-01.mp4 这类连续序号",
+      expectedShotCount: count,
+      actualShotCount: clipEntries.length,
+    };
+  }
+  if (clipEntries.length !== count) {
+    return {
+      passed: false,
+      code: "generated_clip_count_mismatch",
+      message: `生成片段不完整：预期 ${count} 段，实际发现 ${clipEntries.length} 段`,
+      expectedShotCount: count,
+      actualShotCount: clipEntries.length,
+    };
+  }
+
+  const byIndex = new Map();
+  for (const item of parsed) {
+    const index = Number(item.match[1]);
+    if (!Number.isInteger(index) || index <= 0 || byIndex.has(index)) {
+      return {
+        passed: false,
+        code: "generated_clip_index_invalid",
+        message: `生成片段序号无效或重复：${item.entry.name}`,
+        expectedShotCount: count,
+        actualShotCount: clipEntries.length,
+      };
+    }
+    byIndex.set(index, item.entry);
+  }
+  const missingIndexes = Array.from({ length: count }, (_, index) => index + 1)
+    .filter((index) => !byIndex.has(index));
+  if (missingIndexes.length) {
+    return {
+      passed: false,
+      code: "generated_clip_index_missing",
+      message: `生成片段序号不连续：缺少第 ${missingIndexes.join("、")} 段`,
+      expectedShotCount: count,
+      actualShotCount: clipEntries.length,
+    };
+  }
+
+  const clips = [];
+  const hashes = new Map();
+  for (let index = 1; index <= count; index += 1) {
+    const entry = byIndex.get(index);
+    const filePath = join(generationDir, entry.name);
+    try {
+      const before = await stat(filePath);
+      if (!before.isFile() || before.size <= 0) {
+        return {
+          passed: false,
+          code: "generated_clip_empty",
+          message: `生成片段为空或不是普通文件：${entry.name}`,
+          expectedShotCount: count,
+          actualShotCount: clipEntries.length,
+        };
+      }
+      const sha256 = await hashFile(filePath);
+      const after = await stat(filePath);
+      if (!after.isFile() || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+        return {
+          passed: false,
+          code: "generated_clip_changed_during_review",
+          message: `生成片段在审核期间发生变化：${entry.name}`,
+          expectedShotCount: count,
+          actualShotCount: clipEntries.length,
+        };
+      }
+      const duplicate = hashes.get(sha256);
+      if (duplicate) {
+        return {
+          passed: false,
+          code: "generated_clip_duplicate",
+          message: `生成片段不唯一：${entry.name} 与 ${duplicate} 的 SHA-256 相同`,
+          expectedShotCount: count,
+          actualShotCount: clipEntries.length,
+        };
+      }
+      hashes.set(sha256, entry.name);
+      clips.push({ name: entry.name, sizeBytes: before.size, sha256 });
+    } catch {
+      return {
+        passed: false,
+        code: "generated_clip_read_failed",
+        message: `生成片段读取失败，无法完成 SHA-256 校验：${entry.name}`,
+        expectedShotCount: count,
+        actualShotCount: clipEntries.length,
+      };
+    }
+  }
+  return {
+    passed: true,
+    code: "generated_clips_unique",
+    message: `生成片段齐全且 SHA-256 全部不同（${count} 段）`,
+    expectedShotCount: count,
+    actualShotCount: clips.length,
+    clips,
+  };
+}
+
+function autonomousReviewFeedback(assessment, preflightError = null) {
+  const now = new Date().toISOString();
+  const items = [];
+  if (preflightError) {
+    const failureCode = /^[a-z0-9_]{1,100}$/i.test(String(preflightError?.code || ""))
+      ? String(preflightError.code)
+      : "strict_preflight_exception";
+    items.push({
+      source: "autonomous_review",
+      scope: "machine",
+      code: failureCode,
+      text: `严格发布预检未通过：${safeMessage(preflightError?.message || preflightError)}`.slice(0, 500),
+      createdAt: now,
+    });
+  }
+  for (const item of Array.isArray(assessment?.reasons) ? assessment.reasons : []) {
+    const code = String(item?.code || "autonomous_review_failed").slice(0, 100);
+    const scope = String(item?.scope || "content").slice(0, 40);
+    const text = String(item?.message || code).replace(/\s+/g, " ").trim().slice(0, 500);
+    if (!text || items.some((known) => known.code === code && known.scope === scope)) continue;
+    items.push({ source: "autonomous_review", scope, code, text, createdAt: now });
+  }
+  return items.slice(0, 12);
+}
+
+async function recordCreativeReview({ job, persistedOutput = null, title, assessment, machineFeedback = [] }) {
   const today = localDateKey();
   return mutateCreativeReviews((rows) => {
     const existing = rows.find((row) => row.jobId === job.id);
-    if (existing) return existing;
+    const now = new Date().toISOString();
+    if (existing) {
+      // 历史人工已批准的记录只保留审计结果，不被后台迁移反向改写；尚未定论或返工中的
+      // 记录则必须使用当前严格预检逐条重审，不能沿用旧“选择 N”直接放行。织台自主
+      // 审核记录在策略升级后也必须重审；否则旧策略误批准的重复旁白会永久留在候选池。
+      const outdatedAutonomousReview = existing.reviewer === AUTONOMOUS_REVIEWER
+        && existing.reviewPolicyVersion !== assessment.policyVersion;
+      const missingGeneratedClipEvidence = existing.reviewer === AUTONOMOUS_REVIEWER
+        && existing.reviewEvidence?.machine?.generatedClips?.passed !== true;
+      if (!["pending_review", "needs_revision"].includes(existing.status)
+        && !outdatedAutonomousReview
+        && !missingGeneratedClipEvidence) return existing;
+      const manualFeedback = (Array.isArray(existing.feedback) ? existing.feedback : [])
+        .filter((item) => item?.source !== "autonomous_review");
+      existing.title = String(title || existing.title || job.title || "未命名成片").slice(0, 180);
+      existing.status = assessment.status;
+      existing.reviewer = assessment.reviewer;
+      existing.reviewPolicyVersion = assessment.policyVersion;
+      existing.reviewEvidence = assessment.evidence;
+      existing.machineFeedback = machineFeedback;
+      existing.feedback = [...manualFeedback, ...machineFeedback].slice(-12);
+      existing.reviewedAt = now;
+      existing.updatedAt = now;
+      if (persistedOutput?.id) existing.generationId = persistedOutput.id;
+      if (persistedOutput?.filePath) existing.filePath = persistedOutput.filePath;
+      if (persistedOutput?.mediaUrl) existing.mediaUrl = persistedOutput.mediaUrl;
+      return existing;
+    }
     // `createdAt` 是 UTC ISO 字符串；北京时间凌晨 0–8 点直接按其日期前缀
     // 会落到“昨天”，导致同一天的 ClawBot 审核编号从 1 重新开始。
     // 记录入队时已经固化了本地 `date`，每日顺序必须只以它为准。
@@ -170,44 +671,207 @@ async function recordCreativeReview({ job, persistedOutput }) {
       sequence,
       jobId: job.id,
       assetId: job.assetId,
-      generationId: persistedOutput.id,
-      title: String(job.title || "未命名成片").slice(0, 180),
-      filePath: persistedOutput.filePath,
-      mediaUrl: persistedOutput.mediaUrl,
-      status: "pending_review",
-      feedback: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      generationId: persistedOutput?.id || null,
+      title: String(title || job.title || "未命名成片").slice(0, 180),
+      filePath: persistedOutput?.filePath || null,
+      mediaUrl: persistedOutput?.mediaUrl || null,
+      status: assessment.status,
+      reviewer: assessment.reviewer,
+      reviewPolicyVersion: assessment.policyVersion,
+      reviewEvidence: assessment.evidence,
+      machineFeedback,
+      feedback: machineFeedback,
+      reviewedAt: now,
+      createdAt: now,
+      updatedAt: now,
     };
     rows.unshift(item);
     return item;
   });
 }
 
+async function persistAutonomousRevisionRequest(assetId, feedback) {
+  const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
+  try {
+    return await withImmediateTransactionRetry(db, () => {
+      const cleanId = String(assetId || "");
+      const saved = db.prepare("SELECT plan_json FROM remake_plan WHERE asset_id=?").get(cleanId);
+      if (!saved?.plan_json) return false;
+      const plan = JSON.parse(saved.plan_json);
+      if (!plan || typeof plan !== "object") return false;
+      plan.userRevisionRequest = `织台自主审核返工：${feedback}`.slice(0, 800);
+      plan.autonomousReviewFeedback = {
+        text: feedback.slice(0, 800),
+        updatedAt: new Date().toISOString(),
+      };
+      const changed = db.prepare("UPDATE remake_plan SET plan_json=? WHERE asset_id=? AND plan_json=?")
+        .run(JSON.stringify(plan), cleanId, saved.plan_json);
+      if (Number(changed.changes || 0) !== 1) throw new Error("autonomous_revision_concurrent_update");
+      return true;
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function enqueueAutonomousRevision(review) {
+  const reviews = await readCreativeReviews();
+  const reviewCreatedAt = Date.parse(String(review?.createdAt || ""));
+  const newer = reviews.find((candidate) => candidate.id !== review.id
+    && candidate.assetId === review.assetId
+    && Date.parse(String(candidate?.createdAt || "")) > reviewCreatedAt);
+  if (newer) {
+    await mutateCreativeReviews((rows) => {
+      const row = rows.find((candidate) => candidate.id === review.id);
+      if (row) {
+        row.supersededByReviewId = newer.id;
+        row.updatedAt = new Date().toISOString();
+      }
+      return row || null;
+    });
+    return { queued: false, supersededByReviewId: newer.id };
+  }
+  const feedback = (Array.isArray(review?.machineFeedback) ? review.machineFeedback : [])
+    .map((item) => item?.text).filter(Boolean).join("；").slice(0, 800)
+    || "严格机器校验或内容语义自审未通过，请重新生成并再次校验";
+  const persisted = await persistAutonomousRevisionRequest(review.assetId, feedback);
+  if (!persisted) throw new Error("autonomous_revision_plan_not_found");
+  const created = await creativeQueue.create({ assetId: review.assetId, title: review.title, autoCreated: true });
+  await mutateCreativeReviews((rows) => {
+    const row = rows.find((candidate) => candidate.id === review.id);
+    if (row) {
+      row.revisionTaskId = created.job.id;
+      row.revisionDeduplicated = created.deduplicated === true;
+      row.updatedAt = new Date().toISOString();
+    }
+    return row || null;
+  });
+  return { queued: true, ...created };
+}
+
+async function autonomouslyReviewCreativeOutputUnlocked({ job, persistedOutput = null }) {
+  const plan = readCreativeReviewPlan(job.assetId);
+  const workflow = plan?.seedanceWorkflow || {};
+  const title = publishTitleForPlan(plan, job.title || "未命名内容");
+  let preparation = null;
+  let preflightError = null;
+  const expectedShotCount = Number(workflow?.shotCount)
+    || Number(job?.shotCount)
+    || (Array.isArray(workflow?.shots) ? workflow.shots.length : 0);
+  const generatedClips = await verifyGeneratedClipSet({
+    jobId: job.id,
+    expectedShotCount,
+  });
+  if (!generatedClips.passed) {
+    preflightError = new Error(generatedClips.message);
+    preflightError.code = generatedClips.code;
+  } else {
+    try {
+      preparation = await prepareMatrixPublish({
+        videoId: job.assetId,
+        useLatestRemake: true,
+        title,
+        draft: false,
+        allowQualityReview: false,
+      }, {
+        skipDestinations: true,
+        requireStrictGenerated: true,
+        // 唯一允许尚未批准成片进入技术预检的边界：当前自审任务本身。
+        // 任务 ID 必须与实际选中的 generation.engine_task_id 一致。
+        reviewCandidateJobId: job.id,
+      });
+    } catch (error) {
+      preflightError = error;
+    }
+  }
+  const assessment = assessAutonomousContentReview({
+    title,
+    workflow,
+    machineCheck: preparation ? {
+      passed: true,
+      strictGenerated: true,
+      generatedClips,
+      audioQuality: preparation.audioQuality,
+      preparation,
+    } : {
+      passed: false,
+      strictGenerated: true,
+      generatedClips,
+      failure: safeMessage(preflightError?.message || preflightError || "strict_preflight_failed"),
+    },
+    expectedAssetId: job.assetId,
+    expectedGenerationTaskId: job.id,
+  });
+  assessment.evidence.machine.generatedClips = generatedClips;
+  const machineFeedback = assessment.approved ? [] : autonomousReviewFeedback(assessment, preflightError);
+  const review = await recordCreativeReview({ job, persistedOutput, title, assessment, machineFeedback });
+  let revision = null;
+  if (review.status === "needs_revision") revision = await enqueueAutonomousRevision(review);
+  await recordEvent(
+    assessment.approved ? "info" : "warning",
+    "CREATIVE_AUTONOMOUS_REVIEW",
+    assessment.approved
+      ? `自主审核通过，可进入严格发布候选：${review.title}`
+      : `自主审核未通过，已记录返工：${machineFeedback.map((item) => item.text).join("；").slice(0, 500)}`,
+    job.id,
+  );
+  return { review, assessment, revision };
+}
+
+async function autonomouslyReviewCreativeOutput(input) {
+  // 启动旧库迁移、手动刷新迁移与复审共用一条异步串行链。
+  // GET /creative/reviews 因此不会在迁移写锁期间发起 revision/originality CAS。
+  await startupLibraryMigration;
+  return serializeLibraryDbWork(() => autonomouslyReviewCreativeOutputUnlocked(input));
+}
+
+async function reassessPendingCreativeReviews() {
+  if (pendingCreativeReviewReassessment) return pendingCreativeReviewReassessment;
+  pendingCreativeReviewReassessment = (async () => {
+    await startupLibraryMigration;
+    const pending = (await readCreativeReviews())
+      .filter((row) => row.status === "pending_review"
+        || (row.status === "needs_revision" && !row.revisionTaskId && !row.supersededByReviewId)
+        || (row.reviewer === AUTONOMOUS_REVIEWER
+          && row.reviewPolicyVersion !== AUTONOMOUS_REVIEW_POLICY_VERSION
+          && !row.revisionTaskId
+          && !row.supersededByReviewId)
+        || (row.status === "approved_for_publish"
+          && row.reviewer === AUTONOMOUS_REVIEWER
+          && row.reviewEvidence?.machine?.generatedClips?.passed !== true
+          && !row.supersededByReviewId))
+      .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
+    for (const row of pending) {
+      try {
+        await autonomouslyReviewCreativeOutput({
+          job: { id: row.jobId, assetId: row.assetId, title: row.title },
+        });
+      } catch (error) {
+        await recordEvent("error", "CREATIVE_AUTONOMOUS_REVIEW", `历史待审记录复审失败：${safeMessage(error?.message || error)}`, row.jobId);
+      }
+    }
+    return { reviewed: pending.length };
+  })().finally(() => { pendingCreativeReviewReassessment = null; });
+  return pendingCreativeReviewReassessment;
+}
+
 async function approveCreativeReview(sequence) {
-  const item = (await readCreativeReviews()).find((candidate) =>
+  let item = (await readCreativeReviews()).find((candidate) =>
     candidate.date === localDateKey() && Number(candidate.sequence) === Number(sequence));
   if (!item) return "今日没有第 " + sequence + " 条成片，请按收到的编号选择。";
-  const draftTask = await createPublishTask({
-    assetPath: item.filePath,
-    title: item.title,
-    targets: ["douyin", "wechat_channels", "xiaohongshu"],
-    mode: "platform_draft",
-    idempotencyKey: `creative-review:${item.id}`,
-  }, null);
-  await mutateCreativeReviews((rows) => {
-    const row = rows.find((candidate) => candidate.id === item.id);
-    if (!row) return null;
-    row.status = "approved_for_drafts";
-    row.draftTaskId = draftTask.id;
-    row.draftTargets = ["douyin", "wechat_channels", "xiaohongshu"];
-    row.updatedAt = new Date().toISOString();
-    return row;
-  });
-  await recordEvent("info", "CREATIVE_REVIEW", "已批准今日第 " + sequence + " 条成片创建多平台草稿：" + item.title, draftTask.id);
-  return "已选择今日第 " + sequence + " 条：" + item.title
-    + "\n已创建抖音、视频号、小红书的平台草稿任务（" + draftTask.id + "）。"
-    + "\n只会进入草稿，不会自动公开发布；登录未就绪时任务会保留并提醒你处理。";
+  if (item.status === "pending_review") {
+    await autonomouslyReviewCreativeOutput({ job: { id: item.jobId, assetId: item.assetId, title: item.title } });
+    item = (await readCreativeReviews()).find((candidate) => candidate.id === item.id) || item;
+  }
+  if (item.status === "needs_revision") {
+    const feedback = (Array.isArray(item.machineFeedback) ? item.machineFeedback : item.feedback || [])
+      .map((entry) => entry?.text).filter(Boolean).join("；").slice(0, 500);
+    return "今日第 " + sequence + " 条未通过织台严格自审，不能由旧选择命令放行。"
+      + (feedback ? "\n返工原因：" + feedback : "\n已进入自动返工队列。")
+      + "\n合格新版会由织台自行审核和运营，不需要你再次选择。";
+  }
+  return "今日第 " + sequence + " 条已经通过织台自审：" + item.title
+    + "\n不再需要人工选择；织台会通过严格生成成片链路按账号、数据和排期自主运营。";
 }
 
 async function reviseCreativeReview(sequence, feedback) {
@@ -233,8 +897,17 @@ async function reviseCreativeReview(sequence, feedback) {
     }
   } finally { db.close(); }
   const created = await creativeQueue.create({ assetId: target.assetId, title: target.title, autoCreated: false });
+  await mutateCreativeReviews((rows) => {
+    const row = rows.find((candidate) => candidate.id === target.id);
+    if (row) {
+      row.revisionTaskId = created.job.id;
+      row.revisionDeduplicated = created.deduplicated === true;
+      row.updatedAt = new Date().toISOString();
+    }
+    return row || null;
+  });
   await recordEvent("info", "CREATIVE_REVIEW", "第 " + sequence + " 条已按意见返工：" + feedback.slice(0, 120), created.job.id);
-  return "已保存第 " + sequence + " 条的改进意见：" + feedback + "\n已创建返工任务 " + created.job.id + "，新版完成后会再发给你审核。";
+  return "已保存第 " + sequence + " 条的改进意见：" + feedback + "\n已创建返工任务 " + created.job.id + "，新版完成后由织台重新自审并继续运营，无需你再确认。";
 }
 
 function canonicalAnalysisAsset(db, assetId) {
@@ -375,14 +1048,88 @@ const platformTargets = {
 await Promise.all([
   mkdir(dataDir, { recursive: true }),
   mkdir(publishDir, { recursive: true }),
+  mkdir(platformReceiptsDir, { recursive: true, mode: 0o700 }),
   mkdir(knowledgeBase, { recursive: true }),
 ]);
+await chmod(platformReceiptsDir, 0o700);
+
+const diagnostics = createDiagnosticStore({
+  dataDir,
+  policy: config.diagnostics,
+});
+await diagnostics.initialize();
+
+// 先启动且等待唯一的启动迁移，再恢复创作队列。迁移预处理阶段不持锁，
+// 提交阶段与后续手动刷新/自主复审又共用 serializeLibraryDbWork。
+startupLibraryMigration = queueLibraryMigration()
+  .then(async (result) => {
+    await recordEvent("info", "KB_MIGRATE", `旧库迁移完成：索引 ${result.indexed} / 跳过 ${result.skipped} / 补帖 ${result.posts} / 失败 ${result.failed}`);
+    return result;
+  })
+  .catch(async (error) => {
+    await recordEvent("error", "KB_MIGRATE", safeMessage(error?.message || error));
+    return null;
+  });
+await startupLibraryMigration;
+
+function publisherFailureBlockerKey(taskId) {
+  return `blocker:publish_failed:${String(taskId || "unknown").slice(0, 120)}`;
+}
+
+function publishPlatformLabel(value) {
+  const code = String(value || "").trim().toLowerCase();
+  return {
+    dy: "抖音",
+    sph: "视频号",
+    xhs: "小红书",
+    xiaohongshu: "小红书",
+    wechat_official: "微信公众号",
+    tt: "今日头条",
+    ks: "快手",
+    blbl: "哔哩哔哩",
+    bjh: "百家号",
+  }[code] || null;
+}
+
+async function handlePublisherSchedulerEvent(task) {
+  if (!task?.id) return;
+  const destinations = [...new Set((task.targets || [])
+    .map((target) => target?.definition?.destination || target?.definition?.platform)
+    .filter(Boolean))];
+  const label = destinations.map((value) => publishPlatformLabel(value) || String(value)).join("、") || "内容平台";
+  if (task.status === "public") {
+    await notificationCenter?.resolveBlockersByKeys([publisherFailureBlockerKey(task.id)], "publish_recovered");
+    await recordEvent("info", "PUBLISH", `${label}发布任务取得公开回执`, task.id);
+    return;
+  }
+  if (task.status === "retry_wait") {
+    await recordEvent("warning", "PUBLISH", `${label}发布前失败，已进入安全自动重试`, task.id);
+    return;
+  }
+  if (!["needs_attention", "needs_reconciliation", "submitted_unverified"].includes(task.status)) return;
+  const errors = (task.targets || [])
+    .map((target) => target?.error)
+    .filter(Boolean)
+    .map((value) => safeMessage(value))
+    .slice(0, 2);
+  const reason = errors.join("；") || safeMessage(task.error || task.status);
+  const action = task.status === "needs_attention"
+    ? "织台已停止重复提交并保留任务；会在确认没有公开回执后继续定向恢复。若平台要求扫码、验证码或风控确认，通知会持续提醒直到恢复。"
+    : "平台是否已接收尚不能安全判断，织台不会盲目重发；将持续回读并提醒。";
+  await notificationCenter?.send(
+    `织台 · ${label}发布未完成`,
+    `任务 ${task.id}：${reason}\n${action}`,
+    "publish_failed",
+    { blockerKey: publisherFailureBlockerKey(task.id) },
+  );
+}
 
 const publisherScheduler = new PublishScheduler({
   filePath: publisherSchedulePath,
   gracePeriodMs: Math.max(60_000, Number(config.adapters?.publisher?.scheduleGraceMs) || 20 * 60_000),
   preflight: preflightScheduledPublish,
   executeTarget: executeScheduledPublishTarget,
+  onEvent: handlePublisherSchedulerEvent,
 });
 
 async function ensurePublisherSchedulerReady() {
@@ -394,6 +1141,7 @@ async function ensurePublisherSchedulerReady() {
 
 creativeQueue = new CreativeQueue({
   filePath: creativeJobsPath,
+  autoDrain: !windowsPreview,
   analyze: analyzeCreativeAsset,
   persistRemediatedWorkflow: async (assetId, workflow, { signal } = {}) => {
     signal?.throwIfAborted?.();
@@ -402,18 +1150,25 @@ creativeQueue = new CreativeQueue({
     finally { db.close(); }
   },
   onEvent: async (kind, assetId, jobId, error) => {
-    if (kind === "ready") await recordEvent("info", "CREATIVE_READY", `生成任务已完成本机准备：${assetId}`, jobId);
+    if (kind === "ready") {
+      await recordEvent("info", "CREATIVE_READY", `生成任务已完成本机准备：${assetId}`, jobId);
+      await resolveCreativeFailureBlockersIfRecovered();
+    }
+    else if (kind === "retry") await recordEvent("warning", "CREATIVE_PREPARE", `数据库写锁竞争，已自动等待重试：${assetId}`, jobId);
     else await recordEvent("error", "CREATIVE_PREPARE", `生成任务准备失败：${safeMessage(error?.message || error)}`, jobId);
   },
 });
 await creativeQueue.init();
-const creativeRepair = await creativeQueue.reconcile(inspectCreativePreparation);
+const creativeRepair = windowsPreview
+  ? { repaired: 0, remapped: 0 }
+  : await creativeQueue.reconcile(inspectCreativePreparation);
 if (creativeRepair.repaired || creativeRepair.remapped) {
   await recordEvent("warning", "CREATIVE_RECOVER", `生成队列恢复：重置 ${creativeRepair.repaired} 条假就绪任务，重映射 ${creativeRepair.remapped} 条旧资产`);
 }
 
 analysisQueue = new AnalysisQueue({
   filePath: analysisJobsPath,
+  autoDrain: !windowsPreview,
   analyze: (assetId) => analyzeCreativeAsset(assetId),
   onEvent: async (kind, assetId, jobId, error) => {
     if (kind === "completed") {
@@ -429,7 +1184,7 @@ analysisQueue = new AnalysisQueue({
   },
 });
 await analysisQueue.init();
-{
+if (!windowsPreview) {
   const activeCreative = new Set((await creativeQueue.list())
     .filter((job) => !["completed", "cancelled"].includes(job.status))
     .map((job) => job.assetId));
@@ -559,7 +1314,7 @@ async function controllerQueueText() {
   return [
     "织台任务队列",
     `下载：进行中 ${count(tasks.filter((item) => item.type !== "publish"), ["queued", "running", "scheduled", "pending"])}，失败 ${count(tasks.filter((item) => item.type !== "publish"), ["failed", "needs_attention", "needs_setup"])}`,
-    `生成：进行中 ${count(creativeJobs, ["queued", "preparing"])}，待网页生成 ${count(creativeJobs, ["ready_for_images", "ready_for_seedance", "ready_for_assembly"])}，暂停 ${count(creativeJobs, ["paused"])}`,
+    `生成：进行中 ${count(creativeJobs, ["queued", "preparing", "retry_wait", "transient_wait"])}，待网页生成 ${count(creativeJobs, ["ready_for_images", "ready_for_seedance", "ready_for_assembly"])}，暂停 ${count(creativeJobs, ["paused"])}，需处理 ${count(creativeJobs, ["failed", "needs_attention"])}`,
     `发布：排期/队列 ${count(tasks.filter((item) => item.type === "publish"), ["queued", "running", "scheduled"])}，需处理 ${count(tasks.filter((item) => item.type === "publish"), ["failed", "needs_attention", "needs_setup"])}`,
   ].join("\n");
 }
@@ -567,7 +1322,7 @@ async function controllerQueueText() {
 async function controllerFailuresText() {
   const [tasks, creativeJobs] = await Promise.all([readTasks(), creativeQueue.list()]);
   const failedTasks = tasks.filter((item) => ["failed", "needs_attention", "needs_setup"].includes(String(item.status || ""))).slice(0, 5);
-  const failedCreative = creativeJobs.filter((item) => item.status === "failed").slice(0, 3);
+  const failedCreative = creativeJobs.filter((item) => ["failed", "needs_attention"].includes(item.status)).slice(0, 3);
   const lines = [
     ...failedTasks.map((item) => `• ${String(item.title || item.type || "任务").replace(/ · 卡片解析排队$/, "").slice(0, 46)}：${downloadFailureZh(item.errorCode || item.error || item.status)}`),
     ...failedCreative.map((item) => `• 生成 ${String(item.title).slice(0, 38)}：${String(item.error || "失败").slice(0, 70)}`),
@@ -594,6 +1349,193 @@ async function controllerStatusText() {
 const clawbotNotifier = new ClawBotNotifier({ dataDir });
 notificationCenter = new NotificationCenter({ dataDir, buildDigest: buildControllerDigest, clawbot: clawbotNotifier });
 await notificationCenter.init();
+// 早期 Open Interpreter 保活接线曾把技术告警误建成通用业务 blocker。
+// 只按精确 key + 标题迁移这一条，避免恢复后仍按 2h/8h/每日重复提醒；
+// 其它登录、发布和创作 blocker 完全不受影响。
+try {
+  for (const legacy of (await notificationCenter.blockers()).filter((item) => (
+    item?.status === "open"
+    && item?.key === "blocker:notification_channel"
+    && item?.title === "织台 · ClawBot 自动保活需处理"
+  ))) {
+    await notificationCenter.acknowledgeBlockers({
+      blockerId: legacy.id,
+      reason: "keepalive_supervisor_migrated",
+    });
+  }
+} catch { /* 通知存储降级由 NotificationCenter 自身记录，不能阻塞本地节点启动。 */ }
+publisherLoginRecovery = createPublisherLoginRecovery({
+  statePath: join(dataDir, "private", "publisher-login-recovery.json"),
+  startLogin: ({ platform, phone }) => matrix.startCliLogin({ platform, phone, dataDir }),
+  getLogin: async (sessionId) => {
+    const asset = await matrix.getCliLoginAsset(sessionId);
+    if (!asset) return null;
+    return { status: asset.status, png: asset.qrBuffer || null };
+  },
+  deliverQr: async ({ platform, png }) => {
+    const label = platform === "sph" ? "视频号" : "抖音";
+    return notificationCenter.sendSensitiveMedia(
+      `织台 · ${label}登录二维码`,
+      `检测到${label}登录失效。请用对应平台手机端扫描此二维码；织台会自动回读登录结果。`,
+      png,
+      "publisher_login_qr",
+      { fallbackKey: `publisher_login_qr:waiting:${platform}` },
+    );
+  },
+  recovered: async ({ platform, sessionId }) => {
+    await matrix.cleanupCliLogin(sessionId).catch(() => {});
+    runtimeConditionsCache = { at: 0, snapshot: null };
+    await notificationCenter.send(
+      "织台 · 发布账号登录已恢复",
+      `${platform === "sph" ? "视频号" : "抖音"}登录已经自动回读为有效，后续发布会继续执行。`,
+      "publisher_login_recovered",
+      { dedupeKey: `publisher_login_recovered:${platform}:${localDateKey()}` },
+    );
+    setTimeout(() => void collectRuntimeConditions({ refresh: true, notify: true }).catch(() => {}), 0).unref?.();
+  },
+});
+
+async function reconcilePublisherLogins(accounts = null) {
+  if (publisherLoginRecoveryAutomationDisabled || !publisherLoginRecovery) {
+    return { candidates: 0, started: 0, active: 0 };
+  }
+  const rows = Array.isArray(accounts) ? accounts : await matrix.cliAccounts();
+  return publisherLoginRecovery.reconcileAccounts(rows);
+}
+
+async function waitForClawbotContextRefresh(startedAt, timeoutMs = 25_000) {
+  const threshold = Date.parse(String(startedAt || ""));
+  const binding = clawbotKeepaliveBinding;
+  if (!Number.isFinite(threshold) || !binding) return { contextUpdatedAt: null };
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      const freshness = await clawbotNotifier
+        .readKeepaliveTargetFreshness(binding.targetFingerprint)
+        .catch(() => null);
+      const contextUpdatedAt = freshness?.contextUpdatedAt || null;
+      if (freshness?.ok === true
+        && freshness.targetFingerprint === binding.targetFingerprint
+        && freshness.contextFingerprint !== binding.contextFingerprint
+        && contextUpdatedAt
+        && Date.parse(contextUpdatedAt) > threshold) {
+        await notificationCenter.noteClawbotInbound({ contextUpdatedAt }).catch(() => {});
+        return { contextUpdatedAt };
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_000));
+    }
+    return { contextUpdatedAt: null };
+  } finally {
+    // 即使验证超时也销毁 capability，后续尝试必须重新选择唯一目标。
+    if (clawbotKeepaliveBinding === binding) clawbotKeepaliveBinding = null;
+  }
+}
+
+const openInterpreterTargetChat = String(process.env.ZHITAI_OPEN_INTERPRETER_TARGET_CHAT || "").trim();
+const openInterpreterKeepaliveEnabled = process.platform === "darwin"
+  && openInterpreterTargetChat.length > 0
+  && openInterpreterTargetChat.length <= 80
+  && !/[\r\n\0]/u.test(openInterpreterTargetChat);
+
+const KEEPALIVE_FALLBACK_TEXT = Object.freeze({
+  driver_unavailable: "Open Interpreter 控制服务当前不可用。请保持 Interpreter 应用运行；织台不会改用其他电脑控制工具，并会自动重试。",
+  permission_denied: "Open Interpreter 缺少 macOS 辅助功能权限。请在系统设置中为 Interpreter/Cua Driver 开启辅助功能后重新启动 Interpreter。",
+  auth_required: "电脑微信当前需要重新登录或扫码确认。完成一次微信登录后，织台会自动只读校验并恢复 ClawBot 保活。",
+  target_not_ready: "Open Interpreter 尚未在电脑微信中唯一识别所配置的 ClawBot 私聊及输入框，保活消息未发送；登录并打开该私聊后会自动重试。",
+  target_ambiguous: "电脑微信出现多个目标联系人、窗口或输入框候选，织台已停止操作以避免误发；请只保留一个所配置的 ClawBot 私聊窗口。",
+  ax_incomplete: "电脑微信没有向 Open Interpreter 暴露足够的可访问性元素，织台未使用坐标盲点并会继续自动核验。",
+  state_changed: "电脑微信界面在保活校验期间发生变化，织台已停止本次发送以避免发错联系人，并会自动重试。",
+  send_uncertain: "固定保活消息的发送结果无法确认，织台未将本次操作记为成功，并会通过 ClawBot 状态回读继续核验。",
+  context_not_refreshed: "固定保活消息已提交，但 ClawBot 会话状态未在限定时间内刷新；织台会继续自动核验。",
+  notification_state_unavailable: "织台暂时无法读取 ClawBot 通知状态，已停止本次电脑微信操作并会自动重试；备用通知链路仍在工作。",
+  state_unavailable: "ClawBot 保活监督器的私有状态暂时不可读或不可写，织台已停止发送以避免重复，并已通过独立备用链路告警。",
+  attempt_limit: "ClawBot 自动保活连续失败已达本轮上限；Open Interpreter 或微信恢复后，织台会在下一恢复窗口继续。",
+  command_failed: "Open Interpreter 保活命令暂不可用，织台已停止本次操作并会自动重试。",
+  invalid_response: "Open Interpreter 未返回可验证的保活结果，织台未将本次操作记为成功。",
+  timeout: "Open Interpreter 自动保活执行超时，织台已停止本次操作并会自动重试。",
+});
+
+const KEEPALIVE_TERMINAL_FALLBACK_TEXT = Object.freeze({
+  draft_present: "所配置的 ClawBot 私聊输入框已有未发送文字。为避免覆盖或误发，自动保活已持久冻结，冷却到期或织台重启都不会重发。请处理输入框文字并发送一条消息；检测到明确会话刷新后自动解冻。",
+  draft_cleanup_unconfirmed: "织台无法确认保活文字是否仍留在所配置私聊的输入框，已持久冻结自动重试以避免重复发送。请检查输入框和最后一条消息，处理后发送一条消息刷新会话。",
+  send_uncertain: "固定保活消息的发送结果无法确认，已持久冻结自动重试，冷却到期或织台重启也不会重发。请检查所配置私聊的最后一条消息并发送一条新消息；明确会话刷新后自动解冻。",
+  context_not_refreshed: "固定保活消息已提交，但 ClawBot 会话未在限定时间刷新。织台已持久冻结自动重发；请在所配置私聊发送一条新消息，明确会话刷新后自动解冻。",
+  needs_user: "ClawBot 保活进入需要人工处理的安全终态，已持久冻结自动重试。请检查所配置的 ClawBot 私聊并发送一条新消息，明确会话刷新后自动解冻。",
+});
+
+clawbotKeepaliveSupervisor = createClawbotKeepaliveSupervisor({
+  statePath: join(dataDir, "private", "clawbot-keepalive-supervisor.json"),
+  getNotificationState: () => notificationCenter.publicState(),
+  runKeepalive: async () => {
+    clawbotKeepaliveBinding = null;
+    const selected = await clawbotNotifier.selectUniqueKeepaliveTarget().catch(() => null);
+    if (selected?.ok !== true) {
+      return {
+        ok: false,
+        code: selected?.error === "clawbot_target_ambiguous"
+          ? "target_ambiguous"
+          : "target_not_ready",
+      };
+    }
+    clawbotKeepaliveBinding = {
+      targetFingerprint: selected.targetFingerprint,
+      contextFingerprint: selected.contextFingerprint,
+    };
+    const result = await runOpenInterpreterKeepalive({ targetChat: openInterpreterTargetChat });
+    if (result.ok) {
+      void recordEvent("info", "CLAWBOT_KEEPALIVE", "Open Interpreter 已向唯一验证的 ClawBot 私聊提交固定保活消息，正在回读会话状态").catch(() => {});
+      return { ok: true, code: "keepalive_sent" };
+    }
+    if (result.code !== "send_uncertain") clawbotKeepaliveBinding = null;
+    return result;
+  },
+  verifyContextRefresh: (startedAt) => waitForClawbotContextRefresh(startedAt),
+  notifyFallback: async (code, metadata = {}) => {
+    const terminalReason = metadata?.terminal === true && metadata?.needsUser === true
+      ? metadata.reason
+      : null;
+    const message = KEEPALIVE_TERMINAL_FALLBACK_TEXT[terminalReason]
+      || KEEPALIVE_FALLBACK_TEXT[code]
+      || KEEPALIVE_FALLBACK_TEXT.command_failed;
+    // Audit persistence must never sit between a safety failure and its phone
+    // notification, nor turn an already-sent keepalive into a retry.
+    void recordEvent("warning", "CLAWBOT_KEEPALIVE", message).catch(() => {});
+    if (["notification_state_unavailable", "state_unavailable"].includes(code)) {
+      const emergency = await notificationCenter.sendEmergencyNtfy(
+        "织台 · ClawBot 自动保活需处理",
+        message,
+      );
+      if (emergency.ok === true) return emergency;
+    }
+    const delivery = await notificationCenter.send(
+      "织台 · ClawBot 自动保活需处理",
+      message,
+      "notification_channel",
+      {
+        dedupeKey: `clawbot_keepalive:${code}:${terminalReason || "transient"}`,
+        blockerKey: "blocker:clawbot-session-refresh",
+      },
+    );
+    if (delivery?.ok === true
+      || delivery?.queued === true
+      || delivery?.suppressed === true
+      || delivery?.previouslyAccepted === true) return delivery;
+    throw new Error("clawbot_keepalive_fallback_unavailable");
+  },
+  intervalMs: 5 * 60_000,
+  cooldownMs: 30 * 60_000,
+  proactiveAfterMs: 6 * 60 * 60_000,
+  attemptWindowMs: 6 * 60 * 60_000,
+  maxAttempts: 3,
+});
+await resolveCreativeFailureBlockersIfRecovered();
+// 升级前遗留的 pending_review 不能批量改状态或沿用旧选择接口放行；启动后逐条
+// 走与新成片完全相同的严格预检和自主语义审核。后台执行，不阻塞本地节点启动。
+if (!windowsPreview) {
+  setTimeout(() => void reassessPendingCreativeReviews().catch(async (error) => {
+    await recordEvent("error", "CREATIVE_AUTONOMOUS_REVIEW", `历史待审记录复审任务失败：${safeMessage(error?.message || error)}`);
+  }), 0).unref?.();
+}
 
 // 下载入口看门狗：不猜测“某条未被网页看见的转发”，只提醒可验证的两类异常：
 // 1) 网页/微信登录连续未就绪；2) 已接收的文件传输助手任务长时间未完成。
@@ -658,9 +1600,11 @@ async function checkDownloadNotifications() {
   }
 }
 
-downloadWatchdogTimer = setInterval(() => void checkDownloadNotifications().catch(() => {}), 15_000);
-downloadWatchdogTimer.unref?.();
-setTimeout(() => void checkDownloadNotifications().catch(() => {}), 2_000).unref?.();
+if (!windowsPreview) {
+  downloadWatchdogTimer = setInterval(() => void checkDownloadNotifications().catch(() => {}), 15_000);
+  downloadWatchdogTimer.unref?.();
+  setTimeout(() => void checkDownloadNotifications().catch(() => {}), 2_000).unref?.();
+}
 
 async function supplementalCredentialStates() {
   let weread = { ready: false, reason: "补充采集引擎未连接" };
@@ -727,6 +1671,119 @@ function kuaidianConditionState() {
   };
 }
 
+function configuredChannelsCardBaseUrl() {
+  const healthUrl = config.services?.wx_channels_card?.healthUrl;
+  return healthUrl ? assertLoopbackUrl(healthUrl).origin : undefined;
+}
+
+async function probeChannelsCardRuntime(timeoutMs = 1_500) {
+  if (!config.services?.wx_channels_card) {
+    return { online: false, available: false, checkedAt: null, reasonCode: "channels_card_not_configured" };
+  }
+  const checkedAt = new Date().toISOString();
+  let state;
+  try {
+    const baseUrl = configuredChannelsCardBaseUrl();
+    const result = await getChannelsCardEngineStatus({ timeoutMs, ...(baseUrl ? { baseUrl } : {}) });
+    state = {
+      online: result.online === true,
+      available: result.online === true && result.available === true,
+      checkedAt,
+      reasonCode: result.available === true ? null : "channels_card_wechat_page_not_connected",
+    };
+  } catch (error) {
+    state = {
+      online: false,
+      available: false,
+      checkedAt,
+      reasonCode: safeErrorCode(error),
+    };
+  }
+  const previous = channelsCardProbeSnapshot;
+  channelsCardProbeSnapshot = state;
+  if (!state.online && config.services.wx_channels_card.autoStart === true
+    && !managedProcesses.has("wx_channels_card")) {
+    // 兼容本地节点被强制终止后遗留、无法重新收养的旧引擎进程：
+    // 一旦业务探针确认端点离线，仍会走同一个有界单例重启队列。
+    scheduleServiceRestart("wx_channels_card");
+  }
+  if (previous && (previous.online !== state.online || previous.available !== state.available)) {
+    runtimeConditionsCache = { at: 0, snapshot: null };
+    if (!previous.available && state.available) {
+      void recordEvent("info", "CHANNELS_PAGE_RECOVERED", "视频号解析页已通过业务探针确认恢复")
+        .then(() => recoverRetryableCardTasks())
+        .then((count) => count && recordEvent("info", "INGEST_RECOVERY", `解析页恢复后已重排 ${count} 条近期卡片任务`))
+        .catch(() => {});
+    }
+  }
+  return state;
+}
+
+async function requestChannelsPageRecovery() {
+  // wx_channels_download 注入到视频号页的脚本会每 5 秒重连。
+  // 这里只在后台确保微信进程存在；成功与否仍以 data.available 回读为准。
+  if (process.env.ZHITAI_DISABLE_CHANNELS_PAGE_LAUNCH === "1") {
+    return { requested: false, reason: "launch_disabled" };
+  }
+  if (process.platform !== "darwin") return { requested: false, reason: "unsupported_platform" };
+  try {
+    const child = spawn("/usr/bin/open", ["-g", "-a", "WeChat"], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    return { requested: true };
+  } catch {
+    return { requested: false, reason: "wechat_open_failed" };
+  }
+}
+
+channelsPageRecovery = createChannelsPageRecoverySupervisor({
+  probe: () => probeChannelsCardRuntime(),
+  requestRecovery: async ({ reason }) => {
+    const requested = await requestChannelsPageRecovery();
+    await recordEvent(requested.requested ? "info" : "warning", "CHANNELS_PAGE_RECOVERY",
+      requested.requested
+        ? `已在后台确保微信运行，正在等待视频号页面自动重连（${String(reason || "runtime").slice(0, 40)}）`
+        : "无法在后台启动微信，视频号解析页仍未连接");
+    return requested;
+  },
+  monitorIntervalMs: 30_000,
+  pollIntervalMs: 1_000,
+  recoveryTimeoutMs: 20_000,
+  cooldownMs: 10 * 60_000,
+});
+
+async function ensureChannelsPageConnected({ force = false, reason = "runtime" } = {}) {
+  if (!config.services?.wx_channels_card) {
+    return { ok: false, outcome: "not_configured", state: { online: false, available: false } };
+  }
+  if (channelsPageEnsurePromise) return channelsPageEnsurePromise;
+  const operation = (async () => {
+    const engineDeadline = Date.now() + 8_000;
+    let result;
+    do {
+      result = await channelsPageRecovery.tick({ force, reason });
+      if (result?.ok || !["offline", "probe_failed"].includes(String(result?.outcome || ""))) break;
+      if (Date.now() >= engineDeadline) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+    } while (!shuttingDown);
+
+    if (result?.ok && result.outcome === "recovered") {
+      runtimeConditionsCache = { at: 0, snapshot: null };
+      await recordEvent("info", "CHANNELS_PAGE_RECOVERED", "桌面微信视频号页面已自动重连解析引擎");
+    } else if (["timeout", "offline", "probe_failed"].includes(String(result?.outcome || "")) && reason !== "monitor") {
+      await recordEvent("warning", "CHANNELS_PAGE_RECOVERY",
+        "解析引擎或视频号页面未在恢复窗口内就绪；今日运行条件将保持需处理");
+    }
+    return result;
+  })().finally(() => {
+    if (channelsPageEnsurePromise === operation) channelsPageEnsurePromise = null;
+  });
+  channelsPageEnsurePromise = operation;
+  return operation;
+}
+
 async function runtimeBacklogSnapshot() {
   const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
   let total = 0;
@@ -749,13 +1806,14 @@ async function runtimeBacklogSnapshot() {
       remaining,
     },
     creative: {
-      waiting: creativeJobs.filter((job) => ["queued", "preparing", "ready_for_images", "ready_for_seedance", "ready_for_assembly", "paused", "failed"].includes(job.status)).length,
+      waiting: creativeJobs.filter((job) => ["queued", "preparing", "retry_wait", "transient_wait", "ready_for_images", "ready_for_seedance", "ready_for_assembly", "paused", "failed", "needs_attention"].includes(job.status)).length,
       waitingForImages: creativeJobs.filter((job) => job.status === "ready_for_images").length,
       waitingForSeedance: creativeJobs.filter((job) => job.status === "ready_for_seedance").length,
       waitingForAssembly: creativeJobs.filter((job) => job.status === "ready_for_assembly").length,
-      preparing: creativeJobs.filter((job) => ["queued", "preparing"].includes(job.status)).length,
+      preparing: creativeJobs.filter((job) => ["queued", "preparing", "retry_wait", "transient_wait"].includes(job.status)).length,
       paused: creativeJobs.filter((job) => job.status === "paused").length,
-      failed: creativeJobs.filter((job) => job.status === "failed").length,
+      failed: creativeJobs.filter((job) => ["failed", "needs_attention"].includes(job.status)).length,
+      needsAttention: creativeJobs.filter((job) => job.status === "needs_attention").length,
       completed: creativeJobs.filter((job) => job.status === "completed").length,
     },
   };
@@ -781,6 +1839,27 @@ async function notifyRuntimeConditionChange(snapshot) {
   });
 }
 
+function summarizeXhsRuntimeAccounts(accounts, fallback = {}) {
+  const listed = Array.isArray(accounts) ? accounts : [];
+  const rows = listed.length ? listed : fallback?.accountId ? [{ ...fallback, isDefault: true }] : [];
+  const usable = rows.filter((row) => row?.loggedIn === true);
+  const selected = usable.find((row) => row?.isDefault) || usable[0] || null;
+  return {
+    online: rows.some((row) => row?.online === true) || fallback?.online === true,
+    loggedIn: usable.length > 0,
+    accountId: selected?.accountId || null,
+    usableAccountIds: usable.map((row) => String(row.accountId || "")).filter(Boolean),
+    accounts: rows.map((row) => ({
+      accountId: String(row?.accountId || ""),
+      label: String(row?.label || "").slice(0, 64),
+      isDefault: row?.isDefault === true,
+      online: row?.online === true,
+      loggedIn: row?.loggedIn === true,
+    })),
+    reason: selected ? null : fallback?.reason || rows.find((row) => row?.reason)?.reason || "需扫码登录小红书",
+  };
+}
+
 async function collectRuntimeConditions({ refresh = false, notify = false } = {}) {
   if (!refresh && runtimeConditionsCache.snapshot && Date.now() - runtimeConditionsCache.at < 60_000) {
     return runtimeConditionsCache.snapshot;
@@ -788,9 +1867,9 @@ async function collectRuntimeConditions({ refresh = false, notify = false } = {}
   let state = await readRuntimeConditionsState();
   if (refresh) {
     const checkedAt = new Date().toISOString();
-    const [accountResult, xhs, official] = await Promise.all([
+    const [accountResult, xhsAccounts, official] = await Promise.all([
       matrix.cliAccounts().then((accounts) => ({ ok: true, accounts })).catch((error) => ({ ok: false, error: safeMessage(error?.message || error) })),
-      xhsPublisher.status().catch((error) => ({ online: false, loggedIn: false, reason: safeMessage(error?.message || error) })),
+      xhsPublisher.listAccounts({ includeStatus: true }).catch(() => []),
       wechatOfficial.verifyStatus().catch(() => ({
         configured: wechatOfficial.status().configured,
         credentialReady: false,
@@ -800,15 +1879,37 @@ async function collectRuntimeConditions({ refresh = false, notify = false } = {}
         reason: "公众号状态暂时无法校验，请稍后重试",
       })),
     ]);
+    const xhsFallback = xhsAccounts.length
+      ? {}
+      : await xhsPublisher.status().catch((error) => ({ online: false, loggedIn: false, reason: safeMessage(error?.message || error) }));
+    if (accountResult.ok) {
+      await reconcilePublisherLogins(accountResult.accounts).catch((error) => recordEvent(
+        "warning",
+        "PUBLISH_LOGIN_RECOVERY",
+        `发布账号自动登录恢复暂未启动：${safeMessage(error?.message || error)}`,
+      ));
+    }
+    const xhs = summarizeXhsRuntimeAccounts(xhsAccounts, xhsFallback);
     const platform = {
       checkedAt,
       accounts: accountResult.ok ? accountResult.accounts.map((row) => ({
         platform: String(row?.platform || "").slice(0, 40),
         code: String(row?.code || "").slice(0, 20),
         loginStatus: String(row?.loginStatus || row?.status || "").slice(0, 40),
+        authState: String(row?.authState || "").slice(0, 24),
+        ready: row?.ready === true,
+        loggedIn: row?.loggedIn === true,
+        reason: safeMessage(row?.reason || row?.error || ""),
       })) : null,
       publisherError: accountResult.ok ? null : accountResult.error,
-      xiaohongshu: { online: xhs?.online === true, loggedIn: xhs?.loggedIn === true, reason: safeMessage(xhs?.reason || (xhs?.loggedIn ? "登录有效" : "需登录")) },
+      xiaohongshu: {
+        online: xhs.online,
+        loggedIn: xhs.loggedIn,
+        accountId: xhs.accountId,
+        usableAccountIds: xhs.usableAccountIds,
+        accounts: xhs.accounts,
+        reason: safeMessage(xhs.reason || (xhs.loggedIn ? "登录有效" : "需登录")),
+      },
       wechatOfficial: {
         configured: official?.configured === true,
         credentialReady: official?.credentialReady === true,
@@ -826,19 +1927,24 @@ async function collectRuntimeConditions({ refresh = false, notify = false } = {}
   const remoteStatus = remoteController && typeof remoteController.status === "function"
     ? remoteController.status().catch(() => ({ paired: false }))
     : Promise.resolve({ paired: false });
-  const [services, remote, backlog, notificationState] = await Promise.all([
+  const [services, remote, backlog, notificationState, channelsCard] = await Promise.all([
     getServiceStates(),
     remoteStatus,
     runtimeBacklogSnapshot(),
     notificationCenter.publicState().catch(() => ({ clawbot: { operational: false, deliveryState: "unverified" } })),
+    probeChannelsCardRuntime(),
   ]);
   const snapshot = buildRuntimeConditions({
     checkedAt,
     dateKey: localDateKey(),
     services,
     remote,
-    notifications: { clawbot: notificationState.clawbot || null },
+    notifications: {
+      clawbot: notificationState.clawbot || null,
+      ntfy: notificationState.settings?.ntfy || null,
+    },
     filehelper: kuaidianConditionState(),
+    channelsCard,
     creative: state.creative || null,
     publisherAccounts: state.platform?.accounts ?? null,
     publisherError: state.platform?.publisherError || null,
@@ -846,6 +1952,13 @@ async function collectRuntimeConditions({ refresh = false, notify = false } = {}
     wechatOfficial: state.platform?.wechatOfficial || wechatOfficial.status(),
     backlog,
   });
+  const xhsCondition = snapshot.conditions.find((row) => row.id === "xiaohongshu");
+  if (xhsCondition) {
+    xhsCondition.accountId = state.platform?.xiaohongshu?.accountId || null;
+    xhsCondition.usableAccountIds = Array.isArray(state.platform?.xiaohongshu?.usableAccountIds)
+      ? state.platform.xiaohongshu.usableAccountIds
+      : [];
+  }
   runtimeConditionsCache = { at: Date.now(), snapshot };
   await mutateRuntimeConditionsState((next) => { next.snapshot = snapshot; });
   runtimeConditionsCache = { at: Date.now(), snapshot };
@@ -869,9 +1982,11 @@ async function refreshRuntimeConditions() {
   return runtimeConditionsRefreshInFlight;
 }
 
-credentialReminderTimer = setInterval(() => void checkCredentialNotifications().catch(() => {}), 15 * 60_000);
-credentialReminderTimer.unref?.();
-setTimeout(() => void checkCredentialNotifications().catch(() => {}), 5_000).unref?.();
+if (!windowsPreview) {
+  credentialReminderTimer = setInterval(() => void checkCredentialNotifications().catch(() => {}), 15 * 60_000);
+  credentialReminderTimer.unref?.();
+  setTimeout(() => void checkCredentialNotifications().catch(() => {}), 5_000).unref?.();
+}
 
 remoteController = new RemoteController({
   dataDir,
@@ -885,7 +2000,7 @@ remoteController = new RemoteController({
   approveCreative: approveCreativeReview,
   reviseCreative: reviseCreativeReview,
   pauseCreative: async () => {
-    const jobs = (await creativeQueue.list()).filter((job) => ["queued", "preparing"].includes(job.status));
+    const jobs = (await creativeQueue.list()).filter((job) => ["queued", "preparing", "retry_wait", "transient_wait"].includes(job.status));
     for (const job of jobs) await creativeQueue.pause(job.id);
     return jobs.length ? `已暂停 ${jobs.length} 个生成准备任务。` : "当前没有可暂停的生成准备任务。";
   },
@@ -899,9 +2014,44 @@ await remoteController.init();
 
 // 桌面端会额外上报 GPT/豆包真实页面状态；本地节点每 6 小时低频深检
 // 发布账号与公众号权限，并由 ClawBot/ntfy 聚合提醒一次。
-runtimeConditionsTimer = setInterval(() => void refreshRuntimeConditions().catch(() => {}), 6 * 60 * 60_000);
-runtimeConditionsTimer.unref?.();
-setTimeout(() => void refreshRuntimeConditions().catch(() => {}), 60_000).unref?.();
+if (!windowsPreview) {
+  runtimeConditionsTimer = setInterval(() => void refreshRuntimeConditions().catch(() => {}), 6 * 60 * 60_000);
+  runtimeConditionsTimer.unref?.();
+  setTimeout(() => void refreshRuntimeConditions().catch(() => {}), 60_000).unref?.();
+}
+
+function windowsCapabilityForRoute(method, pathname) {
+  if (!windowsPreview) return null;
+  if (pathname === "/channels-proxy.pac" || pathname.startsWith("/api/v1/channels/")
+    || pathname.startsWith("/api/v1/kuaidian")) return "wechatAutomation";
+  if (pathname.startsWith("/api/v1/notifications") || pathname.startsWith("/api/v1/remote")) {
+    return "notificationAutomation";
+  }
+  if (pathname.startsWith("/api/v1/credentials")) return "credentialAutomation";
+  if (pathname.startsWith("/api/v1/updates")) return "moduleUpdates";
+  if (pathname.startsWith("/api/v1/services")) return "externalServiceControl";
+  if (pathname.startsWith("/api/v1/runtime-conditions")) return "externalServiceControl";
+  if (method !== "GET" && (pathname.startsWith("/api/v1/analysis/")
+    || pathname.startsWith("/api/v1/creative/jobs"))) return "creativeAutomation";
+  if (pathname.startsWith("/api/v1/publisher") || pathname.startsWith("/api/v1/publish")) {
+    return method === "GET" ? "backgroundPublishing" : "nativePublishing";
+  }
+  return null;
+}
+
+function sendUnsupportedOnWindows(response, request, capability) {
+  try {
+    assertPlatformCapability(capabilities, capability);
+  } catch (error) {
+    sendJson(response, Number(error?.statusCode || 501), {
+      error: WINDOWS_PREVIEW_ERROR,
+      capability: error?.capability || capability,
+      platform: windowsPreviewStatus(capabilities),
+    }, request);
+    return true;
+  }
+  return false;
+}
 
 const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
@@ -913,6 +2063,9 @@ const server = createServer(async (request, response) => {
   }
 
   try {
+    const blockedCapability = windowsCapabilityForRoute(request.method, requestUrl.pathname);
+    if (blockedCapability && sendUnsupportedOnWindows(response, request, blockedCapability)) return;
+
     if (request.method === "GET" && requestUrl.pathname === "/channels-proxy.pac") {
       const body = Buffer.from(CHANNELS_PROXY_PAC, "utf8");
       response.writeHead(200, {
@@ -926,7 +2079,10 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/health") {
-      const [tasks, services] = await Promise.all([readTasks(), getServiceStates()]);
+      const [tasks, services] = await Promise.all([
+        readTasks(),
+        windowsPreview ? Promise.resolve({}) : getServiceStates(),
+      ]);
       sendJson(response, 200, {
         ok: true,
         service: "zhitai-local-companion",
@@ -939,6 +2095,8 @@ const server = createServer(async (request, response) => {
         webhookSecretSource: config.webhookSecretSource,
         adapters: publicAdapterState(),
         services,
+        platform: windowsPreviewStatus(capabilities),
+        capabilities,
       }, request);
       return;
     }
@@ -973,7 +2131,9 @@ const server = createServer(async (request, response) => {
         inboxMode: config.webhookSecret ? "signature_required" : "origin_or_loopback",
         webhookSecretSource: config.webhookSecretSource,
         adapters: publicAdapterState(),
-        services: await getServiceStates(),
+        services: windowsPreview ? {} : await getServiceStates(),
+        platform: windowsPreviewStatus(capabilities),
+        capabilities,
       }, request);
       return;
     }
@@ -988,10 +2148,11 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, {
         jobs,
         counts: {
-          active: jobs.filter((job) => ["queued", "preparing"].includes(job.status)).length,
+          active: jobs.filter((job) => ["queued", "preparing", "retry_wait", "transient_wait"].includes(job.status)).length,
           waiting: jobs.filter((job) => ["ready_for_images", "ready_for_seedance", "ready_for_assembly", "paused"].includes(job.status)).length,
           completed: jobs.filter((job) => job.status === "completed").length,
-          failed: jobs.filter((job) => job.status === "failed").length,
+          failed: jobs.filter((job) => ["failed", "needs_attention"].includes(job.status)).length,
+          attention: jobs.filter((job) => job.status === "needs_attention").length,
         },
       }, request);
       return;
@@ -1016,6 +2177,8 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/v1/creative/reviews") {
+      // API 读回前等待同一轮逐条复审，避免桌面端继续把旧 pending_review 当作运营条件。
+      if (!windowsPreview) await reassessPendingCreativeReviews();
       const reviews = await readCreativeReviews();
       sendJson(response, 200, {
         ok: true,
@@ -1067,39 +2230,113 @@ const server = createServer(async (request, response) => {
         const current = (await creativeQueue.list()).find((item) => item.id === jobId);
         if (!current) throw httpError(404, "creative_job_not_found");
         const detail = safeMessage(String(json?.error || "网页生成暂时无法继续")).slice(0, 300);
-        await recordEvent("error", "CREATIVE_PREPARE", `网页生成需处理：${detail}`, jobId);
-        sendJson(response, 202, { ok: true, jobId, recorded: true }, request);
+        const transient = json?.transient === true;
+        let nextRetryAt = null;
+        if (transient) {
+          const now = Date.now();
+          const requestedAt = Date.parse(String(json?.nextRetryAt || ""));
+          const requestedDelay = Number(json?.retryAfterMs);
+          const fallbackDelay = Number.isFinite(requestedDelay) ? requestedDelay : 30_000;
+          // 暂态等待只用于网页 busy/按钮尚未恢复等短故障；防止一个错误时间
+          // 把任务隐形卡住数小时。超过 15 分钟的等待应改记 needs_attention。
+          const candidate = Number.isFinite(requestedAt) ? requestedAt : now + fallbackDelay;
+          const bounded = Math.min(now + 15 * 60_000, Math.max(now + 1_000, candidate));
+          nextRetryAt = new Date(bounded).toISOString();
+        }
+        const job = await creativeQueue.attention(jobId, { error: detail, transient, nextRetryAt });
+        const transientExhausted = transient
+          && job.status === "needs_attention"
+          && Number(job.transientRetryCount) >= 3;
+        await recordEvent(
+          transientExhausted || !transient ? "error" : "warning",
+          transient ? "CREATIVE_TRANSIENT" : "CREATIVE_PREPARE",
+          transientExhausted
+            ? `网页生成连续短重试未恢复，已停止自动重试并保留原断点：${detail}`
+            : transient ? `网页生成短暂等待，已安排原断点重试：${detail}` : `网页生成需处理：${detail}`,
+          jobId,
+        );
+        if (transientExhausted) {
+          // 先把唯一 job blocker 持久化，再向桌面执行器返回 needs_attention。
+          // 这样并发的 resume/cancel/advance 会稳定排在 blocker 创建之后，
+          // 不会发生“已恢复后，零延时回调才补建旧提醒”的幽灵通知。
+          await notificationCenter.send(
+            "织台 · GPT 原断点需要处理",
+            `任务“${String(job.title || "未命名任务").slice(0, 80)}”连续 3 次等待 GPT 页面恢复仍失败，织台已停止重复尝试并保留原断点；其他任务会继续。请打开织台生成队列，点击“重试原断点”。`,
+            "creative_transient_exhausted",
+            { blockerKey: `creative_transient_exhausted:${jobId}` },
+          ).catch(() => null);
+          // attention 已先把 needs_attention 暴露给其它请求；若用户恰好在
+          // blocker 持久化前完成了恢复/取消，补一次权威状态回读并收口。
+          const afterNotification = (await creativeQueue.list()).find((item) => item.id === jobId);
+          if (!afterNotification
+            || !["failed", "needs_attention", "transient_wait"].includes(afterNotification.status)) {
+            await resolveCreativeTransientBlocker(jobId, "creative_attention_race_recovered");
+          }
+        }
+        sendJson(response, 202, {
+          ok: true,
+          jobId,
+          recorded: true,
+          transient,
+          nextRetryAt: job.nextRetryAt,
+          job,
+        }, request);
         return;
       }
       let persistedOutput = null;
+      let job;
       if (action === "advance" && String(json?.step || "") === "complete") {
-        const current = (await creativeQueue.list()).find((item) => item.id === jobId);
-        if (!current) throw httpError(404, "creative_job_not_found");
         const { persistZhitaiGeneration } = await import("./kb.mjs");
-        const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
-        try { persistedOutput = await persistZhitaiGeneration(db, current.assetId, { jobId, subject: current.title }); }
-        finally { db.close(); }
-        if (!persistedOutput?.ok) throw httpError(persistedOutput?.status || 400, `creative_output_persist_failed：${persistedOutput?.error || "unknown"}`);
+        try {
+          const completion = await creativeQueue.completeWithPersistence(jobId, async (current) => {
+            const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
+            try { persistedOutput = await persistZhitaiGeneration(db, current.assetId, { jobId, subject: current.title }); }
+            finally { db.close(); }
+            if (!persistedOutput?.ok) throw httpError(persistedOutput?.status || 400, `creative_output_persist_failed：${persistedOutput?.error || "unknown"}`);
+            return { ...persistedOutput, generationId: persistedOutput.id, mediaUrl: persistedOutput.mediaUrl };
+          });
+          job = completion.job;
+          persistedOutput = completion.output;
+        } catch (error) {
+          if (error?.message === "creative_job_not_found") throw httpError(404, error.message);
+          if (error?.message === "invalid_creative_transition") throw httpError(409, error.message);
+          throw error;
+        }
+      } else {
+        job = action === "pause" ? await creativeQueue.pause(jobId)
+          : action === "cancel" ? await creativeQueue.cancel(jobId)
+            : action === "advance" ? await creativeQueue.advance(jobId, String(json?.step || ""))
+              : await creativeQueue.resume(jobId);
       }
-      const job = action === "pause" ? await creativeQueue.pause(jobId)
-        : action === "cancel" ? await creativeQueue.cancel(jobId)
-          : action === "advance" ? await creativeQueue.advance(jobId, String(json?.step || ""), persistedOutput ? { generationId: persistedOutput.id, mediaUrl: persistedOutput.mediaUrl } : null)
-            : await creativeQueue.resume(jobId);
+      if (["resume", "retry", "cancel", "advance"].includes(action)
+        && job && !["failed", "needs_attention", "transient_wait"].includes(job.status)) {
+        await resolveCreativeTransientBlocker(
+          jobId,
+          ["resume", "retry"].includes(action) ? "creative_retry_requested" : "creative_job_recovered",
+        );
+      }
       if (persistedOutput && job?.status === "completed") {
-        const review = await recordCreativeReview({ job, persistedOutput });
-        const message = [
-          "今日第 " + review.sequence + " 条备用成片",
-          review.title,
-          "回复“选择 " + review.sequence + "”创建抖音、视频号、小红书草稿。",
-          "如需修改，回复“改进 " + review.sequence + " 你的具体意见”。",
-          "没有你的选择，织台不会创建草稿；任何情况下都不会自动公开发布。",
-        ].join("\n");
-        // 视频上传可能超过桌面生成器的 30 秒接口超时；先完成登记，再在后台发送。
-        setTimeout(() => void notificationCenter.sendMedia("织台 · 待审核成片 " + review.sequence, message, persistedOutput.filePath, "creative_review")
-          .then((sent) => {
-            if (!sent.ok) return notificationCenter.send("织台 · 成片已生成但视频发送失败", message + "\n请在织台 → 豆包创作中预览。", "creative_review_fallback");
-            return null;
-          }).catch(() => {}), 0).unref?.();
+        const autonomous = await autonomouslyReviewCreativeOutput({ job, persistedOutput });
+        const review = autonomous.review;
+        const message = autonomous.assessment.approved
+          ? [
+            "织台已完成自主审核，无需你选择或终审。",
+            "今日第 " + review.sequence + " 条合格备用成片：" + review.title,
+            "状态：approved_for_publish；只进入严格发布候选池，当前接口没有创建草稿或公开发布。",
+          ].join("\n")
+          : [
+            "织台自主审核未通过，已自动记录返工，不需要你审片。",
+            "今日第 " + review.sequence + " 条：" + review.title,
+            "原因：" + (review.machineFeedback || []).map((item) => item.text).filter(Boolean).join("；").slice(0, 800),
+            autonomous.revision?.queued ? "已进入返工队列，后续候选会继续推进。" : "已有更新候选，本条不会阻塞后续运营。",
+          ].join("\n");
+        // 这里只发送纯文字审计结论；不上传、不打开、不播放成片，也不再要求“选择 N”。
+        setTimeout(() => void notificationCenter.send(
+          autonomous.assessment.approved ? "织台 · 自主审核通过" : "织台 · 已自动返工",
+          message,
+          "creative_autonomous_review",
+          { trackBlocker: false },
+        ).catch(() => {}), 0).unref?.();
       }
       sendJson(response, 200, { ok: true, job }, request);
       return;
@@ -1140,9 +2377,7 @@ const server = createServer(async (request, response) => {
       // 否则会和分析/入库事务争用 SQLite 锁。
       if (requestUrl.searchParams.get("refresh") === "1") {
         try {
-          libraryMigrationMutation = libraryMigrationMutation.catch(() => {}).then(() =>
-            migrateLibraryToKb({ kbRoot: knowledgeBase, dataDir, privDir: kbPrivDir }));
-          await libraryMigrationMutation;
+          await queueLibraryMigration();
         } catch { /* 迁移失败不影响查询 */ }
       }
       const { queryVideos } = await import("./kb.mjs");
@@ -1158,12 +2393,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/library/open-folder") {
       requireConfirmedAction(request);
       await access(knowledgeBase, fsConstants.R_OK);
-      const child = spawn("/usr/bin/open", [knowledgeBase], {
-        shell: false,
-        detached: true,
-        stdio: "ignore",
-      });
-      child.unref();
+      if (!await openLocalPath(knowledgeBase)) throw httpError(503, "open_local_path_failed");
       sendJson(response, 200, { ok: true }, request);
       return;
     }
@@ -1195,13 +2425,45 @@ const server = createServer(async (request, response) => {
         isGroup: body.json?.isGroup === true,
       });
       const rejectedSender = result.authorizedSender !== true;
-      // 只有经过签名校验且命中已配对白名单的私聊，才算用户已回复。
+      // 任意通过入口签名、发送者白名单且来自私聊的真实命令，都证明 ClawBot
+      // 刚取得了新的微信入站上下文。立即解除旧会话冷却，不再等 6 小时轮询。
+      // 这里只恢复通知传输状态；是否关闭业务 blocker 仍由下方普通回复逻辑决定。
+      if (!rejectedSender && body.json?.isGroup !== true) {
+        await notificationCenter.noteClawbotInbound();
+        runtimeConditionsCache = { at: 0, snapshot: null };
+      }
+      // 只有经过入口校验且命中已配对白名单的普通私聊，才算用户已回复。
       // 这会停止“等你回复”的重复提醒并允许下一次 ClawBot 实投重新验证会话；
-      // 未授权发送者不能借此关闭任何运营阻塞。
-      if (result.authorizedSender === true) {
+      // 自动保活只刷新微信会话，不代表用户处理了业务问题，因此绝不关闭 blocker。
+      // 未授权发送者同样不能借此关闭任何运营阻塞。
+      if (shouldAcknowledgeRemoteUserReply(result)) {
         await notificationCenter.acknowledgeFromUserReply();
       }
       sendJson(response, rejectedSender ? 403 : 200, result, request);
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/v1/notifications/clawbot/outbound-result") {
+      const body = await readJsonBody(request, 8_000);
+      await guardInbox(request, body.raw);
+      if (body.json?.source !== "openclaw_weixin_outbound_result") {
+        throw httpError(400, "invalid_clawbot_outbound_source");
+      }
+      let report;
+      try { report = JSON.parse(String(body.json?.text || "")); }
+      catch { throw httpError(400, "invalid_clawbot_outbound_result"); }
+      if (!report || typeof report !== "object" || Array.isArray(report)
+        || typeof report.success !== "boolean"
+        || !(report.errorCode === null || report.errorCode === undefined || typeof report.errorCode === "string")
+        || Object.keys(report).some((key) => !["success", "errorCode"].includes(key))) {
+        throw httpError(400, "invalid_clawbot_outbound_result");
+      }
+      const deliveryState = await notificationCenter.noteClawbotOutboundResult({
+        success: report.success,
+        errorCode: report.errorCode ?? null,
+      });
+      runtimeConditionsCache = { at: 0, snapshot: null };
+      sendJson(response, 200, { ok: true, deliveryState: deliveryState.deliveryState }, request);
       return;
     }
 
@@ -1212,7 +2474,24 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/v1/notifications") {
-      sendJson(response, 200, { ok: true, ...(await notificationCenter.publicState()) }, request);
+      const [notifications, keepalive, loginRecovery] = await Promise.all([
+        notificationCenter.publicState(),
+        clawbotKeepaliveSupervisor.status(),
+        publisherLoginRecovery.status(),
+      ]);
+      sendJson(response, 200, {
+        ok: true,
+        ...notifications,
+        automation: {
+          clawbotKeepalive: keepalive,
+          publisherLoginRecovery: {
+            active: loginRecovery.active,
+            records: loginRecovery.records.map(({ platform, sessionStatus, attemptDay, attemptCount, updatedAt }) => ({
+              platform, sessionStatus, attemptDay, attemptCount, updatedAt,
+            })),
+          },
+        },
+      }, request);
       return;
     }
 
@@ -1352,28 +2631,41 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    // 诊断通道:桥接脚本把 webwxsync 等原始响应转发过来存盘,
-    // 用于排查"网页版到底收到了什么消息结构"(视频号卡片提取)。
+    // 隐私最小化诊断：任何输入都先投影到固定统计 schema；未知字段、正文、HTML、
+    // Cookie/Token、手机号、URL 和绝对路径不会进入磁盘、日志、API 或导出。
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/diag") {
       if (!guardJsonWrite(request, response)) return;
-      const { json } = await readJsonBody(request, 300_000);
-      const diagDir = join(dataDir, "diag");
-      await mkdir(diagDir, { recursive: true });
-      const fname = `sync-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.json`;
-      await writeFile(
-        join(diagDir, fname),
-        JSON.stringify({
-          at: new Date().toISOString(),
-          url: String(json?.url || "").slice(0, 500),
-          text: String(json?.text || "").slice(0, 60_000),
-        }, null, 2),
-      );
-      sendJson(response, 202, { ok: true }, request);
+      const { json } = await readJsonBody(request, 96_000);
+      const result = await diagnostics.record(json, {
+        kind: "sync_response",
+        source: "filehelper_bridge",
+        outcome: "observed",
+        transport: json?.transport,
+        contentType: "json",
+      });
+      sendJson(response, 202, { ok: true, ...result }, request);
+      return;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/v1/diagnostics") {
+      sendJson(response, 200, await diagnostics.status(), request);
+      return;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/v1/diagnostics/export") {
+      const bundle = await diagnostics.exportBundle();
+      response.writeHead(200, {
+        ...corsHeaders(request),
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Disposition": 'attachment; filename="zhitai-diagnostics.json"',
+      });
+      response.end(JSON.stringify(bundle));
       return;
     }
 
     // 快点工具下载引擎上报（主力通道）：
-    // {downloadUrl|localPath, sourceUrl?, deliveryId?, title?} —— 向后兼容 url
+    // {downloadUrl|localPath, sourceUrl?, deliveryId?} —— 向后兼容 url
     // downloadUrl=临时媒体直链（永不落库/出 API/日志；落库前 fingerprint）；
     // sourceUrl=稳定分享链接（sph/sf），只有真实稳定分享 URL 才调元宝补元数据；
     // deliveryId=本机投递 ID（原版快点 okd[].m = 微信 MsgId），仅作投递溯源/查重，
@@ -1383,8 +2675,9 @@ const server = createServer(async (request, response) => {
       const { json } = await readJsonBody(request, 100_000);
       const downloadUrl = String(json?.downloadUrl || json?.url || "").trim();
       const localPath = String(json?.localPath || "").trim() || (downloadUrl && !/^https?:\/\//i.test(downloadUrl) ? downloadUrl : "");
-      const title = String(json?.title || "视频号内容").trim().slice(0, 200);
-      const content = String(json?.content || "").trim().slice(0, 2000);
+      // 旧桥曾把同步响应中的 title/content 带过此边界。调用方提供的这两个
+      // 字段现在一律忽略，避免私聊正文、手机号或凭据进入日志、回执和任务 API。
+      const title = "视频号内容";
       const rawSourceUrl = String(json?.sourceUrl || "").trim().slice(0, 500) || null;
       // A4.3-B：原版快点 okd[].m 是微信 MsgId（投递 ID），不是平台 contentId。
       // deliveryId（限定长度/字符）只作本机投递溯源，绝不复制进 contentId/标题/sourceUrl；
@@ -1576,14 +2869,14 @@ const server = createServer(async (request, response) => {
           const ctx = { privDir: kbPrivDir, yuanbaoEnrich: enrich, displayInput: sourceUrl || displayInput, itemId };
           const startedAt = new Date().toISOString();
           try {
-            const receipt = await adapterKuaidian({ downloadUrl: isDl ? downloadUrl : null, localPath, sourceUrl, title: title || content });
+            const receipt = await adapterKuaidian({ downloadUrl: isDl ? downloadUrl : null, localPath, sourceUrl, title });
             // A4.3-B：显式提供的真实平台 contentId 优先于 adapter 推导值（覆盖）；deliveryId 绝不复制进 contentId
             if (contentId) receipt.contentId = contentId;
             const r = await kbIngestOne(workerDb, { receipt, input: inputForIngest, input_kind: "kuaidian", batchId, ctx });
             recountBatch(workerDb, batchId);
             if (sourceUrl) await updateAwaitingTask(sourceUrl, r, workerDb);
             if (r?.assetId && ["success", "duplicate", "linked"].includes(String(r.status))) {
-              scheduleCreativePreparation(r.assetId, receipt.title || title || content);
+              scheduleCreativePreparation(r.assetId, receipt.title || title);
             }
             recordEvent(r.status === "success" ? "info" : "error", "KUAIDIAN_INGEST",
               `快点通道[${receipt.mediaValidation}]${r.status === "partial" ? "（加密流/探测失败）" : ""}${enrich ? " 元数据已补" : " 无sourceUrl(元数据unavailable)"}：${(title || "").slice(0, 40)}`);
@@ -1622,13 +2915,16 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/kuaidian/heartbeat") {
       if (!guardJsonWrite(request, response)) return;
       const { json } = await readJsonBody(request, 8_000);
-      // 白名单安全字段：version/pageKind/wechatLoggedIn/originalKuaidianDetected/pendingReportCount/lastResult
-      kuaidianHeartbeat.version = String(json?.version ?? kuaidianHeartbeat.version ?? "").slice(0, 32) || null;
-      kuaidianHeartbeat.pageKind = String(json?.pageKind ?? "").slice(0, 32) || null;
-      kuaidianHeartbeat.wechatLoggedIn = Boolean(json?.wechatLoggedIn);
-      kuaidianHeartbeat.originalKuaidianDetected = Boolean(json?.originalKuaidianDetected);
-      kuaidianHeartbeat.pendingReportCount = Math.max(0, Number(json?.pendingReportCount) || 0);
-      kuaidianHeartbeat.lastResult = String(json?.lastResult ?? "").slice(0, 200) || null;
+      // 字段名和字段值都用白名单，防止任意字符串通过 heartbeat 进入状态 API。
+      const version = normalizeCompanionVersion(json?.version);
+      const pageKind = normalizeFixedValue(json?.pageKind, KUAIDIAN_PAGE_KINDS);
+      const lastResult = normalizeFixedValue(json?.lastResultCode ?? json?.lastResult, KUAIDIAN_RESULT_CODES);
+      kuaidianHeartbeat.version = version ?? kuaidianHeartbeat.version;
+      kuaidianHeartbeat.pageKind = pageKind;
+      kuaidianHeartbeat.wechatLoggedIn = json?.wechatLoggedIn === true;
+      kuaidianHeartbeat.originalKuaidianDetected = json?.originalKuaidianDetected === true;
+      kuaidianHeartbeat.pendingReportCount = boundedCount(json?.pendingReportCount, 10_000);
+      kuaidianHeartbeat.lastResult = lastResult;
       kuaidianHeartbeat.online = true;
       kuaidianHeartbeat.lastSeen = new Date().toISOString();
       sendJson(response, 202, { ok: true }, request);
@@ -2093,7 +3389,10 @@ const server = createServer(async (request, response) => {
         }),
       });
       if (verified.draftReady !== true) throw httpError(409, verified.reason || "公众号草稿接口未就绪");
-      if (verified.publishReady === false) throw httpError(409, "公众号明确账号正式发布权限不可用");
+      const permissionDecision = assertWechatOfficialExistingDraftSubmitAllowed(
+        verified,
+        json?.allowPermissionRecheck === true,
+      );
       const result = await wechatOfficial.submitDraft({
         accountId: json?.accountId,
         mediaId: json?.mediaId,
@@ -2102,7 +3401,9 @@ const server = createServer(async (request, response) => {
           signal: AbortSignal.timeout(60_000),
         }),
       });
-      await recordEvent("info", "PUBLISH", "微信公众号已有草稿正式发布提交成功");
+      await recordEvent("info", "PUBLISH", permissionDecision.permissionRecheck
+        ? "微信公众号权限恢复复核成功，已有草稿正式发布已提交"
+        : "微信公众号已有草稿正式发布提交成功");
       sendJson(response, 200, {
         ok: true,
         result: {
@@ -2144,6 +3445,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/publisher/login") {
+      if (!guardJsonWrite(request, response)) return;
       const { json } = await readJsonBody(request);
       try {
         const login = await matrix.startCliLogin({ platform: String(json?.platform || ""), phone: String(json?.phone || ""), dataDir });
@@ -2172,13 +3474,20 @@ const server = createServer(async (request, response) => {
           sendJson(response, 202, {
             ok: true,
             scheduled: true,
+            businessSuccess: false,
+            requiresReadback: true,
             task: publicPublisherSchedule(task),
             results: { total: task.targets.length, detail: { status: "scheduled" } },
           }, request);
           return;
         }
         const results = await executeMatrixPublish(withoutPublishTime(json));
-        sendJson(response, results.submitted === false ? 207 : 200, { ok: results.submitted !== false, results }, request);
+        sendJson(response, results.submitted === false ? 207 : 200, {
+          ok: results.submitted !== false,
+          businessSuccess: results.businessSuccess === true,
+          requiresReadback: results.requiresReadback !== false,
+          results,
+        }, request);
         return;
       }
       const task = await createPublishTask(json, request);
@@ -2210,41 +3519,72 @@ const server = createServer(async (request, response) => {
 server.listen(config.port, config.host, async () => {
   // Publish timers start only after this process has won the listening socket;
   // a second EADDRINUSE process must never race a due external submission.
-  publisherSchedulerInit = publisherScheduler.init();
+  if (!windowsPreview) publisherSchedulerInit = publisherScheduler.init();
   // 只有成功占用监听端口的实例才启动通知轮询，避免双启动并发投递同一 outbox。
-  notificationCenter.start();
+  if (!windowsPreview) notificationCenter.start();
+  if (!windowsPreview && openInterpreterKeepaliveEnabled) clawbotKeepaliveSupervisor.start();
+  // 账号失效恢复由监听成功的唯一实例持有；服务重启后从私有账本继续，
+  // 不依赖用户重新打开发布页。
+  if (!windowsPreview) {
+    setTimeout(() => void reconcilePublisherLogins().catch((error) => recordEvent(
+      "warning",
+      "PUBLISH_LOGIN_RECOVERY",
+      `发布账号自动登录恢复暂未启动：${safeMessage(error?.message || error)}`,
+    )), 2_000).unref?.();
+  }
   console.log(`织台本地节点已启动：http://${config.host}:${config.port}`);
   console.log(`知识库目录：${publicKnowledgeBase}`);
   await recordEvent("info", "READY", `本地节点已启动，知识库 ${publicKnowledgeBase}`);
-  try {
-    await publisherSchedulerInit;
+  if (windowsPreview) {
     await deactivateLegacyScheduledTasks();
-  } catch (error) {
-    await recordEvent("error", "PUBLISH_SCHEDULER", `持久发布调度器启动失败：${safeMessage(error?.message || error)}`);
+  } else {
+    try {
+      await publisherSchedulerInit;
+      await deactivateLegacyScheduledTasks();
+    } catch (error) {
+      await recordEvent("error", "PUBLISH_SCHEDULER", `持久发布调度器启动失败：${safeMessage(error?.message || error)}`);
+    }
   }
   await startWatcher();
-  // 给视频号解析引擎和文件传输助手页面留出恢复时间，然后自动
-  // 重跑近期可恢复的签名失败任务。这使修复部署后无需用户再次转发。
-  setTimeout(() => void recoverRetryableCardTasks()
-    .then((count) => count && recordEvent("info", "INGEST_RECOVERY", `已自动恢复 ${count} 条视频号卡片任务`))
-    .catch((error) => recordEvent("warning", "INGEST_RECOVERY", safeMessage(error?.message || error))), 8_000).unref?.();
-  for (const [serviceId, service] of Object.entries(config.services)) {
-    if (service?.autoStart !== true) continue;
-    void startService(serviceId).catch((error) =>
-      recordEvent("error", "SERVICE", `${serviceId} 自动启动失败：${safeErrorCode(error)}`));
+  if (!windowsPreview && config.services?.wx_channels_card) channelsPageRecovery.start();
+  const autoStartEntries = Object.entries(config.services)
+    .filter(([, service]) => !windowsPreview && service?.autoStart === true);
+  const autoStartResults = await Promise.allSettled(autoStartEntries
+    .map(([serviceId]) => runServiceAction(() => startService(serviceId))));
+  for (let index = 0; index < autoStartResults.length; index += 1) {
+    const result = autoStartResults[index];
+    if (result.status === "rejected") {
+      const serviceId = autoStartEntries[index]?.[0] || "unknown";
+      await recordEvent("error", "SERVICE", `${serviceId} 自动启动失败：${safeErrorCode(result.reason)}`);
+      scheduleServiceRestart(serviceId);
+    }
   }
-  // 旧内容库 → kb.sqlite 统一索引（幂等可回滚，不动原视频）
-  migrateLibraryToKb({ kbRoot: knowledgeBase, dataDir, privDir: kbPrivDir })
-    .then((r) => recordEvent("info", "KB_MIGRATE", `旧库迁移完成：索引 ${r.indexed} / 跳过 ${r.skipped} / 补帖 ${r.linked} / 失败 ${r.failed}`))
-    .catch((e) => recordEvent("error", "KB_MIGRATE", safeMessage(e.message)));
+  // 先以 data.available 确认解析页真实重连，再回收近期瞬态失败，
+  // 避免固定 8 秒定时器与引擎启动竞态。
+  const channelsReady = !windowsPreview && config.services?.wx_channels_card
+    ? await ensureChannelsPageConnected({ force: true, reason: "startup" })
+    : null;
+  if (channelsReady?.ok) {
+    await recoverRetryableCardTasks()
+      .then((count) => count && recordEvent("info", "INGEST_RECOVERY", `已自动恢复 ${count} 条视频号卡片任务`))
+      .catch((error) => recordEvent("warning", "INGEST_RECOVERY", safeMessage(error?.message || error)));
+  }
+  // 启动迁移已在创作队列恢复前完成；监听后不再启动第二条竞态迁移。
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, async () => {
+    shuttingDown = true;
+    for (const id of managedProcesses.keys()) intentionalServiceStops.add(id);
+    for (const timer of serviceRestartTimers.values()) clearTimeout(timer);
+    serviceRestartTimers.clear();
     publisherScheduler.stop();
     if (downloadWatchdogTimer) clearInterval(downloadWatchdogTimer);
     if (credentialReminderTimer) clearInterval(credentialReminderTimer);
     if (runtimeConditionsTimer) clearInterval(runtimeConditionsTimer);
+    await clawbotKeepaliveSupervisor?.stop();
+    await publisherLoginRecovery?.stop();
+    await channelsPageRecovery?.stop();
     await notificationCenter?.stop();
     for (const child of managedProcesses.values()) child.kill("SIGTERM");
     server.close(() => process.exit(0));
@@ -2312,6 +3652,7 @@ async function loadConfig() {
       enabled: parsed.mediaFallback?.enabled === true,
       providers: Array.isArray(parsed.mediaFallback?.providers) ? parsed.mediaFallback.providers : [],
     },
+    diagnostics: parsed.diagnostics && typeof parsed.diagnostics === "object" ? parsed.diagnostics : {},
   };
 }
 
@@ -2408,6 +3749,16 @@ function httpError(statusCode, message) {
   return error;
 }
 
+function assertWechatOfficialExistingDraftSubmitAllowed(verified, allowPermissionRecheck = false) {
+  // publishReady=false 是已经取得过 48001/48004 的明确拒绝，默认必须继续 fail-closed。
+  // 用户修复认证/权限后，可从已确认动作显式请求一次权限复核；调用方仍只能把
+  // 指定 mediaId 交给 submitDraft，不能借此重新上传素材或创建另一份草稿。
+  if (verified?.publishReady === false && allowPermissionRecheck !== true) {
+    throw httpError(409, "公众号明确账号正式发布权限不可用");
+  }
+  return { permissionRecheck: verified?.publishReady === false && allowPermissionRecheck === true };
+}
+
 function requireConfirmedAction(request) {
   // 服务启停属于高权限操作，必须来自已登记的前端（合规 Origin）。
   // 无 Origin 或 Origin 不在白名单的本地进程，即便携带 X-Zhitai-Action: confirm
@@ -2477,7 +3828,10 @@ function extractSupportedUrl(value) {
   try {
     const parsed = new URL(cleaned);
     if (!["https:", "http:"].includes(parsed.protocol)) return null;
-    return allowedHosts.has(parsed.hostname.toLowerCase()) ? parsed.toString() : null;
+    if (!allowedHosts.has(parsed.hostname.toLowerCase())
+      || containsSensitiveUrlMaterial(parsed.toString())
+      || !isStableShareUrl(parsed.toString())) return null;
+    return canonicalizeSourceUrl(parsed.toString());
   } catch {
     return null;
   }
@@ -2493,15 +3847,21 @@ function sanitizeUserNote(value) {
 
 function noteAfterUrl(text, url) {
   if (typeof text !== "string" || !url) return "";
-  return sanitizeUserNote(text.replace(url, ""));
+  // `url` 可能已 canonicalize 并丢弃 query/hash，不能用它从原文做字面替换；
+  // 否则签名 query 或伪装成普通 query 的私聊会被误当备注持久化。
+  const match = text.match(/https?:\/\/[^\s<>"']+/i);
+  if (!match || match.index === undefined) return sanitizeUserNote(text);
+  const withoutUrl = `${text.slice(0, match.index)} ${text.slice(match.index + match[0].length)}`;
+  return sanitizeUserNote(withoutUrl);
 }
 
 const DOWNLOAD_FAILURE_ZH = {
   channels_card_object_missing: "视频号页面暂时没有返回这条卡片对象，自动重试后仍未取得",
   channels_card_profile_jsapi_jsonparse_failed: "微信视频号页面没有正确返回这条卡片数据（JSAPI 解析异常）",
   channels_card_profile_: "微信视频号页面没有正确返回这条卡片数据",
-  channels_card_wechat_page_not_connected: "视频号解析页尚未连接，请在织台下载页恢复微信入口",
+  channels_card_wechat_page_not_connected: "视频号解析页未在自动恢复窗口内重连，请在桌面微信打开或刷新视频号页面",
   channels_card_engine_offline: "视频号卡片解析引擎暂时离线",
+  channels_card_engine_starting: "视频号卡片解析引擎正在启动，页面尚未完成重连",
   channels_card_media_missing: "卡片已识别，但没有取得可下载的视频媒体",
   channels_card_media_url_missing: "卡片已识别，但媒体地址缺失",
   yuanbao_cookie_missing: "元宝登录已过期或尚未登录",
@@ -2673,7 +4033,8 @@ async function createChannelsCardTask(body, source) {
   if (!/^[A-Za-z0-9_-]{1,240}$/.test(nonceId)) throw httpError(400, "invalid_channels_nonce_id");
   const deliveryValidation = validateDeliveryId(body?.deliveryId);
   if (deliveryValidation.has && !deliveryValidation.valid) throw httpError(400, "invalid_delivery_id");
-  const title = sanitizeTitle(String(body?.title || "视频号内容").slice(0, 200));
+  // 浏览器同步响应中的 desc/title 不跨越此边界；可信标题由后续媒体元数据补全。
+  const title = "视频号内容";
   const sourceUrl = `https://channels.weixin.qq.com/web/pages/feed?oid=${encodeURIComponent(objectId)}&nid=${encodeURIComponent(nonceId)}`;
   const now = new Date().toISOString();
 
@@ -2737,11 +4098,12 @@ async function createChannelsCardTask(body, source) {
 }
 
 /**
- * 版本升级后自动恢复近期因临时 CDN 签名错误失败的 legacy 卡片。
- * 仅回收可明确重试的 HTTP 错误、最多 2 次，不会循环重试其他历史失败。
+ * 自动恢复两类可证明的瞬态卡片失败：CDN 签名失效，以及解析
+ * 引擎重启窗口内的页面断连。连接类只回收近 30 分钟任务；每条最多 2 次。
  */
 async function recoverRetryableCardTasks() {
   const cutoff = Date.now() - 7 * 24 * 60 * 60_000;
+  const connectionCutoff = Date.now() - 30 * 60_000;
   const recovered = await mutateTasks((tasks) => {
     const selected = [];
     for (const task of tasks) {
@@ -2749,14 +4111,18 @@ async function recoverRetryableCardTasks() {
       const updated = Date.parse(String(task.updatedAt || task.createdAt || ""));
       const retryCount = Number(task.retryCount || 0);
       if (task.type !== "ingest" || task.status !== "failed" || !task.cardObjectId || !task.cardNonceId) continue;
-      if (!/^download_http_(?:400|401|403|404)$/.test(String(task.errorCode || ""))) continue;
-      if (!Number.isFinite(updated) || updated < cutoff || retryCount >= 2) continue;
+      const errorCode = String(task.errorCode || "");
+      const signedUrlFailure = /^download_http_(?:400|401|403|404)$/.test(errorCode);
+      const connectionFailure = CHANNELS_CARD_CONNECTION_ERRORS.has(errorCode);
+      if (!signedUrlFailure && !connectionFailure) continue;
+      const earliest = connectionFailure ? connectionCutoff : cutoff;
+      if (!Number.isFinite(updated) || updated < earliest || retryCount >= 2) continue;
       Object.assign(task, {
         status: "queued",
         progress: 0,
         errorCode: null,
         retryCount: retryCount + 1,
-        recoveryReason: "signed_url_refresh",
+        recoveryReason: connectionFailure ? "channels_page_reconnected" : "signed_url_refresh",
         updatedAt: new Date().toISOString(),
       });
       selected.push({ ...task });
@@ -2865,9 +4231,7 @@ async function runIngestTask(task) {
     // 页面要等用户手动“刷新知识库”才看得到，容易误以为没有自动下载。
     // 迁移串行执行，并与下载结果隔离：索引失败不能把已成功下载的任务改成失败。
     try {
-      libraryMigrationMutation = libraryMigrationMutation.catch(() => {}).then(() =>
-        migrateLibraryToKb({ kbRoot: knowledgeBase, dataDir, privDir: kbPrivDir }));
-      await libraryMigrationMutation;
+      await queueLibraryMigration();
       await recordEvent("info", "KB_INDEX", `已自动加入知识库：${metadata.title}`, task.id);
       const videoFile = (Array.isArray(metadata.files) ? metadata.files : []).find((file) => /\.(mp4|mov|m4v|webm|mkv)$/i.test(String(file?.path || "")));
       if (videoFile?.sha256) {
@@ -2999,10 +4363,24 @@ async function runChannelsYuanbao(task, packageDir) {
 
 /** 视频号卡片采集：objectId/nonceId → 本机微信视频号页面 → 媒体信息。 */
 async function runChannelsCard(task, packageDir) {
-  let media = await parseChannelsCard({
+  const baseUrl = configuredChannelsCardBaseUrl();
+  const parseCard = () => parseChannelsCard({
     objectId: task.cardObjectId,
     nonceId: task.cardNonceId,
-  });
+  }, baseUrl ? { baseUrl } : {});
+  let media;
+  try {
+    media = await parseCard();
+  } catch (error) {
+    const code = String(error?.message || error || "");
+    if (!CHANNELS_CARD_CONNECTION_ERRORS.has(code)) throw error;
+    await updateTask(task.id, { progress: 8 });
+    await recordEvent("warning", "CHANNELS_PAGE_RECOVERY",
+      "卡片到达时解析页尚未就绪，正在等待自动重连，不立即判定下载失败", task.id);
+    const recovery = await ensureChannelsPageConnected({ force: true, reason: "card_task" });
+    if (!recovery?.ok) throw error;
+    media = await parseCard();
+  }
   let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -3018,10 +4396,7 @@ async function runChannelsCard(task, packageDir) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, attempt * 1_500));
       // 只有媒体下载已经返回瞬态 HTTP 错误时才重新解析，刷新过期的签名 URL。
       // 卡片对象或 profile 解析失败由 parseChannelsCard 自身的轮询负责，避免 3×3 重试放大。
-      media = await parseChannelsCard({
-        objectId: task.cardObjectId,
-        nonceId: task.cardNonceId,
-      });
+      media = await parseCard();
     }
   }
   throw lastError || new Error("channels_card_download_failed");
@@ -3200,6 +4575,25 @@ async function fileExists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
+async function recordPlatformReceipts(input, taskId = null) {
+  try {
+    const receipts = createPlatformReceipts(input);
+    const paths = await persistPlatformReceipts(platformReceiptsDir, receipts);
+    return { status: "stored", count: paths.length };
+  } catch (error) {
+    // 发布请求可能已到达平台。回执落盘失败只能生成本地审计事件，
+    // 不能把任务伪装成可安全自动重试的普通发布失败。
+    await recordEvent(
+      "error",
+      "PUBLISH_RECEIPT",
+      `平台回执持久化失败：${safeErrorCode(redactPlatformReceiptText(error?.message || error))}`,
+      taskId,
+    ).catch(() => {});
+    const count = Number.isSafeInteger(error?.writtenCount) && error.writtenCount > 0 ? error.writtenCount : 0;
+    return { status: count > 0 ? "partial" : "failed", count };
+  }
+}
+
 function assertPublishWorkflowReady(plan, title) {
   const workflow = plan?.seedanceWorkflow;
   if (!workflow) throw httpError(409, "publish_generation_readiness_missing");
@@ -3212,7 +4606,97 @@ function assertPublishWorkflowReady(plan, title) {
   return {
     readiness,
     originality: workflow.originality || null,
-    workflowSha256: createHash("sha256").update(JSON.stringify(workflow)).digest("hex"),
+    workflowSha256: strictWorkflowSha256(workflow),
+  };
+}
+
+async function inspectStrictGenerationEvidence({
+  generation,
+  assetId,
+  assetPath,
+  assetDir,
+  workflowSha256,
+  expectedStoryboardCount,
+}) {
+  const engine = String(generation?.engine || "");
+  if (!STRICT_ZHITAI_GENERATION_ENGINES.includes(engine)) {
+    throw httpError(409, "strict_generation_engine_unsupported");
+  }
+  if (engine === ZHITAI_LOCAL_MOTION_ENGINE) {
+    const evidence = await validateLocalMotionManifestBundle({
+      bundleDir: assetDir,
+      finalPath: assetPath,
+      expectedJobId: generation.engine_task_id,
+      expectedAssetId: assetId,
+      expectedWorkflowSha256: workflowSha256,
+      expectedFinalSizeBytes: generation.size_bytes,
+      expectedFinalSha256: generation.sha256,
+    });
+    if (!evidence.ok) {
+      throw httpError(409, `publish_local_motion_manifest_invalid：${evidence.reason || "invalid"}`);
+    }
+    if (Number(expectedStoryboardCount) > 0
+      && evidence.storyboards.length !== Number(expectedStoryboardCount)) {
+      throw httpError(409, "publish_local_motion_storyboard_count_mismatch");
+    }
+    return {
+      evidenceMode: evidence.evidenceMode,
+      generationProvenanceSha256: evidence.generationProvenanceSha256,
+      storyboardFingerprint: evidence.storyboardFingerprint,
+      motionManifestSha256: evidence.manifestSha256,
+      storyboards: evidence.storyboards,
+      localMotion: {
+        ...evidence.visual,
+        segments: evidence.segments,
+        audio: evidence.audio,
+      },
+    };
+  }
+
+  // 数据库仅改一个 engine 字符串不能把 LocalMotion 伪装成 Seedance。
+  if (await fileExists(join(assetDir, "local-motion-manifest.json"))) {
+    throw httpError(409, "publish_seedance_engine_manifest_conflict");
+  }
+  let manifestRaw;
+  let manifest;
+  try {
+    manifestRaw = await readFile(join(assetDir, "generation-manifest.json"), "utf8");
+    manifest = JSON.parse(manifestRaw);
+  } catch {
+    throw httpError(409, "publish_seedance_generation_manifest_missing");
+  }
+  if (Number(manifest?.schemaVersion) !== 3
+    || manifest?.engine !== ZHITAI_SEEDANCE_ENGINE
+    || manifest?.evidenceMode !== "seedance_web_generation"
+    || String(manifest?.jobId || "") !== String(generation.engine_task_id || "")
+    || String(manifest?.assetId || "") !== String(assetId || "")
+  ) {
+    throw httpError(409, "publish_seedance_generation_manifest_mismatch");
+  }
+  let entries;
+  try { entries = await readdir(assetDir, { withFileTypes: true }); }
+  catch { throw httpError(409, "publish_storyboards_missing"); }
+  const storyboardEntries = entries
+    .filter((entry) => entry?.isFile?.() && /^storyboard-\d+\.png$/iu.test(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const count = Number(expectedStoryboardCount);
+  if (!Number.isInteger(count) || count <= 0 || storyboardEntries.length !== count) {
+    throw httpError(409, "publish_storyboard_count_mismatch");
+  }
+  const storyboards = await Promise.all(storyboardEntries.map(async (entry, offset) => {
+    if (entry.name !== `storyboard-${String(offset + 1).padStart(2, "0")}.png`) {
+      throw httpError(409, "publish_storyboard_order_invalid");
+    }
+    const info = await stat(join(assetDir, entry.name));
+    if (!info.isFile() || info.size <= 0) throw httpError(409, "publish_storyboard_invalid");
+    return { name: entry.name, sizeBytes: info.size, sha256: await sha256File(join(assetDir, entry.name)) };
+  }));
+  return {
+    evidenceMode: "seedance_web_generation",
+    generationProvenanceSha256: createHash("sha256").update(manifestRaw).digest("hex"),
+    storyboardFingerprint: createHash("sha256").update(JSON.stringify(storyboards)).digest("hex"),
+    motionManifestSha256: null,
+    storyboards,
   };
 }
 
@@ -3222,9 +4706,14 @@ async function prepareMatrixPublish(json, {
   requireStrictGenerated = false,
   requireExpectedBinding = false,
   expectedBinding = null,
+  reviewCandidateJobId = null,
 } = {}) {
   if (requireStrictGenerated && json.useLatestRemake !== true) {
     throw httpError(409, "persistent_schedule_requires_strict_generated_media");
+  }
+  const candidateJobId = String(reviewCandidateJobId || "").trim();
+  if (candidateJobId && (!skipDestinations || !requireStrictGenerated)) {
+    throw httpError(409, "creative_review_candidate_scope_invalid");
   }
   const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
   let row = null;
@@ -3246,15 +4735,28 @@ async function prepareMatrixPublish(json, {
     throw httpError(400, "video_not_found_or_no_asset：" + (json.videoId || ""));
   }
   let assetPath = row.file_path;
+  let creativeReviewBinding = null;
+  let assetDir = null;
   if (json.useLatestRemake === true) {
     if (!generation?.file_name || !row.package_path) throw httpError(409, "generated_video_not_ready：请先完成一键生成");
-    if (requireStrictGenerated && generation.engine !== "ZhitaiSeedance") {
-      throw httpError(409, "persistent_schedule_requires_zhitai_seedance_generation");
+    if (requireStrictGenerated && !STRICT_ZHITAI_GENERATION_ENGINES.includes(generation.engine)) {
+      throw httpError(409, "persistent_schedule_requires_strict_zhitai_generation");
     }
     if (requireStrictGenerated && !String(generation.engine_task_id || "").trim()) {
       throw httpError(409, "persistent_schedule_generation_task_binding_missing");
     }
+    if (candidateJobId) {
+      if (String(generation.engine_task_id || "") !== candidateJobId) {
+        throw httpError(409, "creative_review_candidate_generation_mismatch");
+      }
+    } else {
+      creativeReviewBinding = await approvedCreativeReviewBinding(json.videoId, generation);
+    }
     assetPath = join(row.package_path, "remake-output", basename(generation.file_name));
+    assetDir = join(
+      dirname(assetPath),
+      `${basename(generation.file_name, extname(generation.file_name))}-assets`,
+    );
   }
   if (typeof assetPath !== "string" || !assetPath || !(await fileExists(assetPath))) {
     throw httpError(400, json.useLatestRemake === true ? "generated_video_file_missing" : "video_not_found_or_no_asset：" + (json.videoId || ""));
@@ -3277,11 +4779,9 @@ async function prepareMatrixPublish(json, {
     throw httpError(409, "publish_audio_track_not_aac");
   }
   let audioQualitySha256 = null;
-  if (json.useLatestRemake === true && generation?.engine === "ZhitaiSeedance") {
-    const assetDir = join(
-      dirname(assetPath),
-      `${basename(generation.file_name, extname(generation.file_name))}-assets`,
-    );
+  let audioQualityEvidence = null;
+  let strictGenerationEvidence = null;
+  if (json.useLatestRemake === true && STRICT_ZHITAI_GENERATION_ENGINES.includes(generation?.engine)) {
     let audioQuality;
     try {
       const audioQualityRaw = await readFile(join(assetDir, "audio-quality.json"), "utf8");
@@ -3301,6 +4801,25 @@ async function prepareMatrixPublish(json, {
         ? "publish_generated_integrity_failed"
         : "publish_audio_quality_failed");
     }
+    audioQualityEvidence = {
+      ok: true,
+      status: "passed",
+      integrity: true,
+      meanVolumeDb: audioGate.meanVolumeDb,
+      maxVolumeDb: audioGate.maxVolumeDb,
+      // 旁白必须来自与成片 SHA/任务 ID 绑定的质检报告，不能读取
+      // 可能已被后续返工改写的 remake_plan，否则会用“新文案”误审旧成片。
+      narration: String(audioQuality.narration || "").replace(/\s+/gu, " ").trim(),
+    };
+    strictGenerationEvidence = await inspectStrictGenerationEvidence({
+      generation,
+      assetId: String(json.videoId || ""),
+      assetPath,
+      assetDir,
+      workflowSha256: workflowGate.workflowSha256,
+      expectedStoryboardCount: Number(plan?.seedanceWorkflow?.shotCount)
+        || (Array.isArray(plan?.seedanceWorkflow?.shots) ? plan.seedanceWorkflow.shots.length : 0),
+    });
   }
   if (requireStrictGenerated && !audioQualitySha256) {
     throw httpError(409, "persistent_schedule_audio_quality_binding_missing");
@@ -3318,11 +4837,18 @@ async function prepareMatrixPublish(json, {
     const phone = typeof dest.phone === "string" && dest.phone.trim() ? dest.phone.trim() : null;
     const partition = typeof dest.partition === "string" && dest.partition.trim() ? dest.partition.trim() : null;
     if (!phone && !partition) throw httpError(400, "account_required_for_platform：" + platform);
+    const requestedCreativeStatement = typeof dest.creativeStatement === "string" && dest.creativeStatement
+      ? dest.creativeStatement
+      : null;
+    if (strictGenerationEvidence && requestedCreativeStatement && requestedCreativeStatement !== "ai_generated") {
+      throw httpError(409, "publish_ai_declaration_mismatch");
+    }
+    const creativeStatement = strictGenerationEvidence ? "ai_generated" : requestedCreativeStatement;
     platforms.push({
       platform,
       ...(phone ? { phone } : {}),
       ...(partition ? { partition } : {}),
-      ...(typeof dest.creativeStatement === "string" && dest.creativeStatement ? { creativeStatement: dest.creativeStatement } : {}),
+      ...(creativeStatement ? { creativeStatement } : {}),
     });
   }
 
@@ -3338,6 +4864,15 @@ async function prepareMatrixPublish(json, {
   const scheduleBinding = {
     generationEngine: String(generation?.engine || ""),
     generationTaskId: String(generation?.engine_task_id || ""),
+    ...(strictGenerationEvidence ? {
+      evidenceMode: strictGenerationEvidence.evidenceMode,
+      generationProvenanceSha256: strictGenerationEvidence.generationProvenanceSha256,
+      storyboardFingerprint: strictGenerationEvidence.storyboardFingerprint,
+      motionManifestSha256: strictGenerationEvidence.motionManifestSha256,
+      storyboards: strictGenerationEvidence.storyboards,
+      ...(strictGenerationEvidence.localMotion ? { localMotion: strictGenerationEvidence.localMotion } : {}),
+    } : {}),
+    ...(creativeReviewBinding || {}),
     mediaSha256: String(publishMedia.sha256 || "").toLowerCase(),
     mediaSizeBytes: Number(publishMedia.size_bytes || 0),
     audioQualitySha256: String(audioQualitySha256 || ""),
@@ -3356,6 +4891,7 @@ async function prepareMatrixPublish(json, {
     },
     generation,
     publishQuality,
+    audioQuality: audioQualityEvidence,
     scheduleBinding,
   };
 }
@@ -3364,6 +4900,25 @@ async function prepareMatrixPublish(json, {
 async function executeMatrixPublish(json, preparationOptions = {}) {
   const immediate = withoutPublishTime(json);
   const prepared = await prepareMatrixPublish(immediate, preparationOptions);
+  const operationId = `pub_${randomUUID()}`;
+  const intentPersistence = await recordPlatformReceipts({
+    operationId,
+    videoId: String(immediate.videoId || ""),
+    source: "matrixmedia_cli",
+    mode: prepared.payload.draft ? "draft" : "publish",
+    scheduledAt: null,
+    platforms: prepared.payload.platforms,
+    results: prepared.payload.platforms.map(({ platform }) => ({
+      platform,
+      success: null,
+      status: "unknown",
+      message: "publish_intent_recorded",
+    })),
+  });
+  if (intentPersistence.status !== "stored") {
+    await recordEvent("warning", "PUBLISH", `发布意图回执未完整落盘（${operationId}），未调用发布器`).catch(() => {});
+    throw httpError(503, `publish_intent_not_persisted：${operationId}`);
+  }
   try {
     const body = await matrix.publishWithReceipts({
       payload: prepared.payload,
@@ -3372,17 +4927,67 @@ async function executeMatrixPublish(json, preparationOptions = {}) {
       jobId: String(immediate.jobId || prepared.generation?.engine_task_id || immediate.videoId || ""),
       retryFailed: immediate.retryFailed === true,
     });
+    await reconcilePublisherLogins().catch((error) => recordEvent(
+      "warning",
+      "PUBLISH_LOGIN_RECOVERY",
+      `发布后账号恢复检查失败：${safeMessage(error?.message || error)}`,
+    ));
     const results = Array.isArray(body?.results) ? body.results.map((r) => ({ ...r })) : [];
+    const receiptPersistence = await recordPlatformReceipts({
+      operationId,
+      videoId: String(immediate.videoId || ""),
+      source: "matrixmedia_cli",
+      mode: prepared.payload.draft ? "draft" : "publish",
+      scheduledAt: null,
+      platforms: prepared.payload.platforms,
+      results: results.map((result) => ({
+        platform: result?.platform,
+        success: typeof result?.success === "boolean" ? result.success : null,
+        status: result?.status || result?.state || "unknown",
+        message: "publisher_response_received",
+      })),
+    });
+    // 适配器的即时响应只是候选回执；即便其中出现 published/public，仍需
+    // 独立的平台历史或公开页回读后，才能把业务状态提升为 public。
+    const businessSuccess = false;
+    const uncertain = results.some((row) => ["unknown", "needs_reconciliation"].includes(String(row?.state || row?.status || "")));
+    const hasFailure = results.some((row) => row?.success === false || row?.state === "failed");
+    const wrongOutcome = !prepared.payload.draft
+      && results.some((row) => ["draft", "platform_draft"].includes(String(row?.state || row?.status || "")));
+    const lifecycleStatus = uncertain
+      ? "needs_reconciliation"
+      : hasFailure || wrongOutcome ? "needs_attention" : "submitted_unverified";
     await recordEvent("info", "PUBLISH", `MatrixMedia 立即发布提交：${prepared.payload.platforms.length} 平台（${immediate.videoId}${immediate.useLatestRemake === true ? "，生成成片" : "，原素材"}）`);
     return {
       submitted: body?.success !== false,
+      businessSuccess,
+      requiresReadback: true,
       results,
       total: typeof body?.total === "number" ? body.total : prepared.payload.platforms.length,
-      detail: { status: body?.success === false ? "partial_failed" : "submitted", message: body?.message, quality: prepared.publishQuality },
+      detail: {
+        status: lifecycleStatus,
+        message: body?.message,
+        quality: prepared.publishQuality,
+        receiptPersistence,
+      },
     };
-  } catch (e) {
-    await recordEvent("warning", "PUBLISH", `MatrixMedia 发布失败：${safeMessage(e.message)}`);
-    throw httpError(502, "matrixmedia_publish_failed：" + safeMessage(e.message));
+  } catch {
+    await recordPlatformReceipts({
+      operationId,
+      videoId: String(immediate.videoId || ""),
+      source: "matrixmedia_cli",
+      mode: prepared.payload.draft ? "draft" : "publish",
+      scheduledAt: null,
+      platforms: prepared.payload.platforms,
+      results: prepared.payload.platforms.map(({ platform }) => ({
+        platform,
+        success: null,
+        status: "unknown",
+        message: "publisher_outcome_not_observed",
+      })),
+    });
+    await recordEvent("warning", "PUBLISH", `MatrixMedia 返回前连接中断，平台结果未知，禁止自动重试（${operationId}）`);
+    throw httpError(502, `matrixmedia_publish_outcome_unknown：${operationId}`);
   }
 }
 
@@ -3469,9 +5074,9 @@ function matrixAccountMatchesPlatform(row, platform) {
 }
 
 function matrixAccountUsable(row) {
-  const state = `${row?.loginStatus || ""} ${row?.status || ""} ${row?.error || ""}`.toLowerCase();
-  return Boolean(row?.phone || row?.partition)
-    && !/未登录|offline|expired|invalid|failed|失败|过期|退出/.test(state);
+  // 旧逻辑只排除明确失败，导致“有 Cookie 元数据但平台已拒绝”的账号仍被当成
+  // 可发布。现在统一使用适配层的严格真值：只有 verified 才能进入发布链路。
+  return matrix.isMatrixAccountUsable(row);
 }
 
 function resolveMatrixAccountFromRows(target, rows) {
@@ -3496,7 +5101,15 @@ function resolveMatrixAccountFromRows(target, rows) {
 }
 
 async function resolveScheduledMatrixAccount(target) {
-  return resolveMatrixAccountFromRows(target, await matrix.cliAccounts());
+  try {
+    return resolveMatrixAccountFromRows(target, await matrix.cliAccounts());
+  } catch (error) {
+    // 账号解析发生在任何平台发布调用之前。把这个阶段显式标记给调度器，
+    // 允许它在 expiresAt 内安全退避重试；发布 CLI 一旦启动则绝不打此标记，
+    // 以免平台已接收但本地超时时重复发布。
+    if (error && typeof error === "object") error.beforeExternalCall = true;
+    throw error;
+  }
 }
 
 function matrixScheduleTarget(destination, expectedMode) {
@@ -3590,12 +5203,25 @@ async function prepareImageTextPublish(body, {
   }
   const title = String(body?.title || bundle.title).trim();
   const content = String(body?.content || bundle.content).trim();
+  // 当前图文包只来自已完成的织台 Seedance 或 LocalMotion 原创生成任务，因此小红书
+  // 必须自动声明为 AI 合成内容；不把这项合规责任交回给用户手工选择。
+  const creativeStatement = STRICT_ZHITAI_GENERATION_ENGINES.includes(bundle.assetBinding.generationEngine)
+    ? "ai_generated"
+    : null;
+  if (destinations.includes("xiaohongshu") && creativeStatement !== "ai_generated") {
+    throw httpError(409, "image_text_ai_declaration_evidence_missing");
+  }
+  if (body?.creativeStatement && body.creativeStatement !== creativeStatement) {
+    throw httpError(409, "image_text_ai_declaration_mismatch");
+  }
   const scheduleBinding = {
     ...bundle.assetBinding,
+    creativeStatement,
     publishTextSha256: createHash("sha256").update(JSON.stringify({
       title,
       content,
       sourceUrl: bundle.sourceUrl,
+      creativeStatement,
     })).digest("hex"),
   };
   if (requireExpectedBinding || expectedBinding) {
@@ -3609,6 +5235,7 @@ async function prepareImageTextPublish(body, {
     title,
     content,
     tags: Array.isArray(body?.tags) ? body.tags.map(String).slice(0, 4) : [],
+    creativeStatement,
     scheduleBinding,
   };
 }
@@ -3628,13 +5255,21 @@ async function executeImageTextTarget(body, destination, preparationOptions = {}
       content: prepared.content,
       images: prepared.bundle.images,
       tags: prepared.tags,
-      isOriginal: true,
+      // “来源为原创生成”是织台内部权利结论，不等同于平台版权原创声明。
+      // AI 生成图文只强制勾选 AI 合成内容，避免再触发额外原创权利承诺弹窗。
+      isOriginal: false,
+      creativeStatement: prepared.creativeStatement,
     });
+    if (prepared.creativeStatement === "ai_generated" && result.aiDeclarationVerified !== true) {
+      throw new Error("小红书 AI 合成内容声明未通过平台控件回读");
+    }
     return {
       destination,
       accountId: result.accountId,
       success: result?.success !== false,
-      status: result?.data?.status || (result?.success === false ? "failed" : "submitted"),
+      status: result.status || (result?.success === false ? "failed" : "submitted"),
+      aiDeclarationVerified: result.aiDeclarationVerified === true,
+      platformMessage: result?.data?.status || result?.message || null,
     };
   }
   const verified = await wechatOfficial.verifyStatus({
@@ -3832,37 +5467,43 @@ async function resolveImageTextBundle(videoId) {
   let plan = {};
   try {
     asset = db.prepare("SELECT id, title, package_path, source_url FROM video_asset WHERE id=?").get(String(videoId || ""));
-    generation = db.prepare("SELECT id, engine, engine_task_id, file_name, size_bytes, sha256 FROM remake_generation WHERE asset_id=? AND engine='ZhitaiSeedance' AND status='completed' ORDER BY completed_at DESC LIMIT 1").get(String(videoId || ""));
+    generation = db.prepare("SELECT id, engine, engine_task_id, file_name, size_bytes, sha256 FROM remake_generation WHERE asset_id=? AND status='completed' ORDER BY completed_at DESC, created_at DESC LIMIT 1").get(String(videoId || ""));
     const saved = db.prepare("SELECT plan_json FROM remake_plan WHERE asset_id=?").get(String(videoId || ""));
     if (saved?.plan_json) plan = JSON.parse(saved.plan_json);
   } finally { db.close(); }
   if (!asset?.package_path) throw httpError(404, "image_text_asset_not_found");
   if (!generation?.engine_task_id) throw httpError(409, "image_text_storyboards_not_ready：请先完成 GPT 生图和豆包成片");
+  // 图文与视频必须共享同一个已严格自审通过的生成任务。最新成片一旦
+  // 被撤销为 needs_revision，这里直接失败关闭，绝不回退使用较早的已完成成片。
+  if (!STRICT_ZHITAI_GENERATION_ENGINES.includes(generation.engine)) {
+    throw httpError(409, "image_text_strict_generation_required");
+  }
   const match = String(generation.engine_task_id).match(/^creative_([0-9a-f-]+)$/i);
   if (!match) throw httpError(409, "image_text_storyboards_not_ready");
   const artifactDir = join(asset.package_path, "remake-output", "zhitai-" + match[1] + "-assets");
-  let images = [];
-  try {
-    images = (await readdir(artifactDir))
-      .filter((name) => /^storyboard-\d+\.png$/i.test(name))
-      .sort()
-      .map((name) => join(artifactDir, name));
-  } catch { /* missing bundle handled below */ }
-  if (!images.length) throw httpError(409, "image_text_storyboards_not_ready：生成包里没有 GPT 分镜图");
   const publishTitle = publishTitleForPlan(plan, asset.title || "未命名内容");
   const workflowGate = assertPublishWorkflowReady(plan, publishTitle);
-  const storyboards = await Promise.all(images.map(async (imagePath) => {
-    const info = await stat(imagePath);
-    if (!info.isFile() || info.size <= 0) throw httpError(409, "image_text_storyboard_invalid");
-    return {
-      name: basename(imagePath),
-      sizeBytes: info.size,
-      sha256: await sha256File(imagePath),
-    };
-  }));
-  const storyboardFingerprint = createHash("sha256")
-    .update(JSON.stringify(storyboards))
-    .digest("hex");
+  const assetPath = join(asset.package_path, "remake-output", basename(generation.file_name));
+  const generationEvidence = await inspectStrictGenerationEvidence({
+    generation,
+    assetId: asset.id,
+    assetPath,
+    assetDir: artifactDir,
+    workflowSha256: workflowGate.workflowSha256,
+    expectedStoryboardCount: Number(plan?.seedanceWorkflow?.shotCount)
+      || (Array.isArray(plan?.seedanceWorkflow?.shots) ? plan.seedanceWorkflow.shots.length : 0),
+  });
+  const creativeReviewBinding = await approvedCreativeReviewBinding(asset.id, generation);
+  if (creativeReviewBinding.creativeReviewGenerationEngine !== generation.engine
+    || creativeReviewBinding.creativeReviewEvidenceMode !== generationEvidence.evidenceMode
+    || creativeReviewBinding.creativeReviewGenerationProvenanceSha256 !== generationEvidence.generationProvenanceSha256
+    || creativeReviewBinding.creativeReviewStoryboardFingerprint !== generationEvidence.storyboardFingerprint
+    || creativeReviewBinding.creativeReviewMotionManifestSha256 !== generationEvidence.motionManifestSha256) {
+    throw httpError(409, "image_text_creative_review_storyboard_binding_mismatch");
+  }
+  const storyboards = generationEvidence.storyboards;
+  const storyboardFingerprint = generationEvidence.storyboardFingerprint;
+  const images = storyboards.map((item) => join(artifactDir, item.name));
   return {
     assetId: asset.id,
     title: publishTitle,
@@ -3872,6 +5513,11 @@ async function resolveImageTextBundle(videoId) {
     assetBinding: {
       generationEngine: String(generation.engine || ""),
       generationTaskId: String(generation.engine_task_id || ""),
+      evidenceMode: generationEvidence.evidenceMode,
+      generationProvenanceSha256: generationEvidence.generationProvenanceSha256,
+      motionManifestSha256: generationEvidence.motionManifestSha256,
+      ...(generationEvidence.localMotion ? { localMotion: generationEvidence.localMotion } : {}),
+      ...creativeReviewBinding,
       storyboards,
       storyboardFingerprint,
       workflowSha256: workflowGate.workflowSha256,
@@ -3990,6 +5636,7 @@ const WATCHER_MAX_RETRIES = Math.max(1, Number(watcherConfig.maxRetries) || 8);
 const WATCHER_INTERVAL = Math.max(5000, Number(watcherConfig.intervalMs) || 20000);
 const watcherStatePath = join(dataDir, "watcher-state.json");
 let watcherState = { processed: [], files: {} }; // files: { "channel:path": { stableKey, seenAt, attempts, nextRetryAt, status } }
+let watcherScanInFlight = null;
 
 async function loadWatcherState() {
   try {
@@ -4095,38 +5742,86 @@ async function scanWatcherLibs() {
   await saveWatcherState();
 }
 
+function scanWatcherLibsSingleFlight() {
+  // macOS 的 File Provider / TCC 目录偶尔会让一次 readdir 长时间停在内核层。
+  // setInterval 若继续叠加扫描，会逐个占满 libuv 线程池并让健康、排期接口一起失去响应。
+  // 同一时刻只保留一次扫描；即使某个目录永久卡住，也只占一个 worker。
+  if (watcherScanInFlight) return watcherScanInFlight;
+  watcherScanInFlight = scanWatcherLibs()
+    .catch(() => {})
+    .finally(() => { watcherScanInFlight = null; });
+  return watcherScanInFlight;
+}
+
 async function startWatcher() {
   await loadWatcherState();
-  setInterval(() => scanWatcherLibs().catch(() => {}), WATCHER_INTERVAL);
-  scanWatcherLibs().catch(() => {});
-  console.log(`目录 watcher 已启动：${watcherRoots.map((r) => `${r.dir}→${r.channel}`).join(" / ")}`);
+  setInterval(() => { void scanWatcherLibsSingleFlight(); }, WATCHER_INTERVAL);
+  void scanWatcherLibsSingleFlight();
+  console.log(`目录 watcher 已启动：${watcherRoots.length} 个本机目录（路径已省略）`);
 }
 
 async function deactivateLegacyScheduledTasks() {
   const changed = await mutateTasks((tasks) => {
     let count = 0;
     for (const task of tasks) {
-      if (task.type !== "publish" || task.status !== "scheduled") continue;
-      task.status = "needs_attention";
-      task.errorCode = "legacy_scheduler_inactive";
+      if (task.type !== "publish") continue;
+      const previousStatus = task.status;
+      if (["running", "submitting"].includes(previousStatus)) {
+        task.status = "needs_reconciliation";
+        task.progress = Math.min(90, Number(task.progress) || 0);
+        task.errorCode = "submission_interrupted_outcome_unknown";
+      } else if (previousStatus === "submitted") {
+        task.status = "submitted_unverified";
+        task.progress = Math.min(90, Number(task.progress) || 90);
+      } else if (previousStatus === "scheduled") {
+        task.status = "needs_attention";
+        task.errorCode = "legacy_scheduler_inactive";
+      } else {
+        continue;
+      }
+      assertLifecycleTransition("publish_task", previousStatus, task.status);
       task.updatedAt = new Date().toISOString();
       count += 1;
     }
     return count;
   });
   if (changed) {
-    await recordEvent("warning", "PUBLISH", `${changed} 条旧排期缺少精确账号与完整预检，已停止自动执行`);
+    await recordEvent("warning", "PUBLISH", `${changed} 条旧发布任务已按生命周期证据安全收敛，未自动重发`);
   }
 }
 
 async function runPublishTask(task) {
   const adapter = config.adapters.publisher;
+  let publisherStarted = false;
+  let publisherReturned = false;
+  let preflightErrorCode = null;
+  const requestedPlatforms = (Array.isArray(task.targets) ? task.targets : [])
+    .map((target) => platformTargets[target])
+    .filter(Boolean);
   try {
     await updateTask(task.id, { status: "running", progress: 10 });
     const currentAssetPath = await realpath(task.assetPath);
     const currentAssetInfo = await stat(currentAssetPath);
     if (currentAssetPath !== task.assetPath || currentAssetInfo.size !== task.assetSizeBytes || await sha256File(currentAssetPath) !== task.assetSha256) {
       throw new Error("asset_changed_since_approval");
+    }
+    const intentPersistence = await recordPlatformReceipts({
+      operationId: task.id,
+      taskId: task.id,
+      source: "publisher_task",
+      mode: task.mode === "publish" ? "publish" : "platform_draft",
+      scheduledAt: task.scheduledAt,
+      platforms: requestedPlatforms,
+      results: requestedPlatforms.map((platform) => ({
+        platform,
+        success: null,
+        status: "unknown",
+        message: "publish_intent_recorded",
+      })),
+    }, task.id);
+    if (intentPersistence.status !== "stored") {
+      preflightErrorCode = "publish_intent_not_persisted";
+      throw new Error(preflightErrorCode);
     }
     const type = adapter.type || (adapter.command ? "command" : "");
     let result;
@@ -4142,10 +5837,8 @@ async function runPublishTask(task) {
       for (const target of task.targets) {
         const matchingAccounts = accounts.filter((row) => {
           const value = String(row?.platform || "").toLowerCase();
-          const state = `${row?.loginStatus || ""} ${row?.error || ""}`.toLowerCase();
           return aliases[target]?.some((alias) => value.includes(alias))
-            && Boolean(row?.phone || row?.partition)
-            && !/未登录|offline|expired|invalid|failed|失败|过期/.test(state);
+            && matrix.isMatrixAccountUsable(row);
         });
         if (matchingAccounts.length !== 1) {
           missingTargets.push(matchingAccounts.length > 1 ? `${target}_ambiguous_account` : target);
@@ -4158,23 +5851,42 @@ async function runPublishTask(task) {
           ...(account.partition ? { partition: account.partition } : {}),
         });
       }
-      result = platforms.length
-        ? await matrix.publishWithReceipts({
-          payload: {
-            platforms,
-            file: task.assetPath,
-            title: task.title,
-            draft: task.mode !== "publish",
-          },
-          receiptStore: publisherReceiptStore,
-          content: {
-            id: String(task.assetId || task.id || ""),
-            title: task.title,
-            mediaSha256: task.assetSha256,
-          },
-          jobId: task.id,
-        })
+      publisherStarted = platforms.length > 0;
+      result = publisherStarted
+        ? await (async () => {
+          await updateTask(task.id, { status: "submitting", progress: 50 });
+          return matrix.publishWithReceipts({
+            payload: {
+              platforms,
+              file: task.assetPath,
+              title: task.title,
+              draft: task.mode !== "publish",
+            },
+            receiptStore: publisherReceiptStore,
+            content: {
+              id: String(task.assetId || task.id || ""),
+              title: task.title,
+              mediaSha256: task.assetSha256,
+            },
+            jobId: task.id,
+          });
+        })()
         : { success: false, total: 0, results: [] };
+      publisherReturned = publisherStarted;
+      await recordPlatformReceipts({
+        operationId: task.id,
+        taskId: task.id,
+        source: "publisher_task",
+        mode: task.mode === "publish" ? "publish" : "platform_draft",
+        scheduledAt: task.scheduledAt,
+        platforms: requestedPlatforms,
+        results: (Array.isArray(result?.results) ? result.results : []).map((row) => ({
+          platform: row?.platform,
+          success: typeof row?.success === "boolean" ? row.success : null,
+          status: row?.status || row?.state || "unknown",
+          message: "publisher_response_received",
+        })),
+      }, task.id);
       const failedTargets = (Array.isArray(result?.results) ? result.results : [])
         .filter((row) => row?.success !== true)
         .map((row) => String(row?.platform || "unknown"));
@@ -4192,25 +5904,84 @@ async function runPublishTask(task) {
     } else if (type === "command") {
       const jobFile = join(publishDir, `${task.id}.json`);
       const args = (adapter.args || []).map((value) => String(value).replace(/\{jobFile\}/g, jobFile));
+      await updateTask(task.id, { status: "submitting", progress: 50 });
+      publisherStarted = true;
       await spawnAndWait(adapter.command, args, {
         cwd: adapter.cwd ? expandHome(adapter.cwd) : agentRoot,
         env: safeChildEnv({ ZHITAI_KNOWLEDGE_BASE: knowledgeBase }, adapter.env),
         timeoutMs: Number(adapter.timeoutMs || config.polling.timeoutMs),
       });
+      publisherReturned = true;
       result = { accepted: true };
     } else {
       throw new Error("unsupported_publisher_type");
     }
-    const status = task.mode === "publish" ? "submitted" : "platform_draft";
-    await updateTask(task.id, { status, progress: 100, result: sanitizeResult(result) });
-    await recordEvent("info", "PUBLISH", `发布器已接收任务，状态 ${status}`, task.id);
+    const receiptStatus = task.mode === "publish" ? "submitted" : "platform_draft";
+    if (type === "command") {
+      await recordPlatformReceipts({
+        operationId: task.id,
+        taskId: task.id,
+        source: "publisher_task",
+        mode: task.mode === "publish" ? "publish" : "platform_draft",
+        scheduledAt: task.scheduledAt,
+        platforms: requestedPlatforms,
+        results: requestedPlatforms.map((platform) => ({
+          platform,
+          success: true,
+          status: receiptStatus,
+          message: "publisher_response_received",
+        })),
+      }, task.id);
+    }
+    const status = "submitted_unverified";
+    await updateTask(task.id, {
+      status,
+      progress: 90,
+      intendedOutcome: task.mode === "publish" ? "public" : "platform_draft",
+      businessSuccess: false,
+      requiresReadback: true,
+      result: sanitizeResult(result),
+    });
+    await recordEvent("info", "PUBLISH", "发布器已接收任务，等待平台回读（不等于业务成功）", task.id);
   } catch (error) {
-    const code = safeErrorCode(error);
-    const status = code === "adapter_exit_4" || /account|login|cookie|session/i.test(code)
+    const rawCode = safeErrorCode(error);
+    const code = publisherReturned
+      ? "local_finalize_after_publisher_returned"
+      : publisherStarted
+        ? "publisher_outcome_not_observed"
+        : (preflightErrorCode || rawCode);
+    const status = publisherReturned || rawCode === "adapter_exit_4" || /account|login|cookie|session/i.test(rawCode)
       ? "needs_attention"
-      : "failed";
-    await updateTask(task.id, { status, progress: 0, errorCode: code });
-    await recordEvent(status === "needs_attention" ? "warning" : "error", "PUBLISH", `发布失败：${code}`, task.id);
+      : publishFailureDisposition({ externalCallStarted: publisherStarted, errorCode: code });
+    if (publisherStarted && !publisherReturned) {
+      await recordPlatformReceipts({
+        operationId: task.id,
+        taskId: task.id,
+        source: "publisher_task",
+        mode: task.mode === "publish" ? "publish" : "platform_draft",
+        scheduledAt: task.scheduledAt,
+        platforms: requestedPlatforms,
+        results: requestedPlatforms.map((platform) => ({
+          platform,
+          success: null,
+          status: "unknown",
+          message: "publisher_outcome_not_observed",
+        })),
+      }, task.id);
+    }
+    await updateTask(task.id, {
+      status,
+      progress: status === "failed" ? 0 : 90,
+      errorCode: code,
+      businessSuccess: false,
+      requiresReadback: status !== "failed",
+    });
+    const message = status === "needs_reconciliation"
+      ? `外部提交结果不确定，禁止自动重发：${code}`
+      : publisherReturned
+        ? `发布器已返回但本地收尾失败，需人工核对：${code}`
+        : `发布未完成：${code}`;
+    await recordEvent(status === "failed" ? "error" : "warning", "PUBLISH", message, task.id);
   }
 }
 
@@ -4222,14 +5993,27 @@ async function getServiceStates() {
     const install = await inspectServiceInstall(service, configured);
     const installed = ["ready", "source_ready"].includes(install.state);
     let healthy = false;
+    let healthReachable = false;
+    let healthBody = null;
     if (service.healthUrl) {
       try {
         const target = assertLoopbackUrl(service.healthUrl);
         const response = await fetch(target, { signal: AbortSignal.timeout(1_200) });
-        healthy = response.ok || (response.status >= 300 && response.status < 400);
+        healthReachable = response.ok || (response.status >= 300 && response.status < 400);
+        healthy = healthReachable;
+        const needsJson = id === "wx_channels_card"
+          || (Array.isArray(service.healthJsonKeys) && service.healthJsonKeys.length > 0);
+        if (healthReachable && needsJson) {
+          healthBody = await response.json();
+        }
         if (healthy && Array.isArray(service.healthJsonKeys) && service.healthJsonKeys.length) {
-          const body = await response.json();
-          healthy = Boolean(body && typeof body === "object" && service.healthJsonKeys.every((key) => key in body));
+          healthy = Boolean(healthBody && typeof healthBody === "object"
+            && service.healthJsonKeys.every((key) => key in healthBody));
+        }
+        if (id === "wx_channels_card") {
+          healthy = healthReachable
+            && Number(healthBody?.code) === 0
+            && healthBody?.data?.available === true;
         }
       } catch {
         healthy = false;
@@ -4294,9 +6078,25 @@ async function getServiceStates() {
         }
       }
     }
-    const running = Boolean(managed && managed.exitCode === null && !managed.killed) || healthy || probedRunning;
+    if (id === "wx_channels_card" && !business) {
+      business = {
+        authentication: null,
+        state: healthy ? "ready" : healthReachable ? "page_disconnected" : "engine_offline",
+        ready: healthy,
+        reason: healthy
+          ? "视频号解析页已连接"
+          : healthReachable
+            ? "解析引擎在线，但桌面微信视频号页面未连接"
+            : "视频号卡片解析引擎离线",
+        lastMonitorAt: new Date().toISOString(),
+        lastInboundAt: null,
+        lastErrorAt: healthy ? null : new Date().toISOString(),
+        bridgeReady: healthy,
+      };
+    }
+    const running = Boolean(managed && managed.exitCode === null && !managed.killed) || healthReachable || probedRunning;
     if (business) healthy = business.ready;
-    const readyOnDemand = onDemand && installed;
+    const readyOnDemand = onDemand && installed && !business;
     const status = healthy || readyOnDemand
       ? "healthy"
       : running && business?.state === "needs_login"
@@ -4327,7 +6127,7 @@ async function getServiceStates() {
       running,
       healthy: healthy || readyOnDemand,
       onDemand,
-      process: { running, managed: Boolean(managed), probed: probedRunning },
+      process: { running, managed: Boolean(managed), probed: probedRunning, endpointReachable: healthReachable },
       authentication: business?.authentication || null,
       business: business ? {
         state: business.state,
@@ -4415,8 +6215,10 @@ async function inspectServiceInstall(service, configured) {
 }
 
 async function readGitDirtyPaths(repositoryRoot) {
+  const gitExecutable = await resolveExecutable("git");
+  if (!gitExecutable) return null;
   return new Promise((resolvePromise) => {
-    const child = spawn("/usr/bin/git", ["-C", repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], {
+    const child = spawn(gitExecutable, ["-C", repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], {
       env: safeChildEnv(),
       shell: false,
       stdio: ["ignore", "pipe", "ignore"],
@@ -4480,34 +6282,46 @@ async function readGitRevision(repositoryRoot) {
 }
 
 async function resolveExecutable(command) {
-  if (command.includes("/") || isAbsolute(command)) {
-    return executablePath(expandHome(command));
-  }
-  for (const directory of String(process.env.PATH || "").split(":")) {
-    if (!directory) continue;
-    const candidate = join(directory, command);
-    const executable = await executablePath(candidate);
-    if (executable) return executable;
-  }
-  return null;
+  return resolveExecutablePath(expandHome(command));
 }
 
-async function executablePath(path) {
-  try {
-    const info = await stat(path);
-    if (!info.isFile()) return null;
-    await access(path, fsConstants.X_OK);
-    return path;
-  } catch {
-    return null;
-  }
+function clearServiceRestartTimer(id) {
+  const timer = serviceRestartTimers.get(id);
+  if (timer) clearTimeout(timer);
+  serviceRestartTimers.delete(id);
+}
+
+function scheduleServiceRestart(id) {
+  const service = config.services[id];
+  if (id !== "wx_channels_card" || service?.autoStart !== true || shuttingDown
+    || intentionalServiceStops.has(id) || serviceRestartTimers.has(id)) return;
+  const attempt = Math.max(1, Number(serviceRestartAttempts.get(id) || 0) + 1);
+  serviceRestartAttempts.set(id, attempt);
+  const delayMs = Math.min(30_000, 1_000 * (2 ** Math.min(5, attempt - 1)));
+  const timer = setTimeout(() => {
+    serviceRestartTimers.delete(id);
+    void runServiceAction(() => startService(id)).catch(async (error) => {
+      await recordEvent("error", "SERVICE", `${id} 自动重启失败：${safeErrorCode(error)}`);
+      scheduleServiceRestart(id);
+    });
+  }, delayMs);
+  timer.unref?.();
+  serviceRestartTimers.set(id, timer);
 }
 
 async function startService(id) {
+  assertPlatformCapability(capabilities, "externalServiceControl");
   const service = config.services[id];
   if (!service) throw httpError(404, "service_not_found");
+  intentionalServiceStops.delete(id);
+  clearServiceRestartTimer(id);
   const currentState = (await getServiceStates())[id];
-  if (currentState.running) return { service: currentState, alreadyRunning: true };
+  if (currentState.running) {
+    if (id === "wx_channels_card") {
+      await ensureChannelsPageConnected({ force: true, reason: "service_already_running" });
+    }
+    return { service: (await getServiceStates())[id], alreadyRunning: true };
+  }
   if (!currentState.installed || ["drifted", "invalid", "missing"].includes(currentState.install?.state)) {
     throw httpError(409, "service_install_not_ready");
   }
@@ -4528,15 +6342,24 @@ async function startService(id) {
   });
   managedProcesses.set(id, child);
   child.once("error", async () => {
-    managedProcesses.delete(id);
+    const current = managedProcesses.get(id) === child;
+    if (current) managedProcesses.delete(id);
+    if (current && !shuttingDown && !intentionalServiceStops.has(id)) scheduleServiceRestart(id);
     await recordEvent("error", "SERVICE", `${id} 启动失败`);
   });
   child.once("exit", async (code) => {
-    managedProcesses.delete(id);
-    await recordEvent(code === 0 ? "info" : "error", "SERVICE", `${id} 已退出（${code ?? "signal"}）`);
+    const current = managedProcesses.get(id) === child;
+    if (current) managedProcesses.delete(id);
+    const intentional = intentionalServiceStops.delete(id) || shuttingDown;
+    if (current && !intentional) scheduleServiceRestart(id);
+    await recordEvent(code === 0 || intentional ? "info" : "error", "SERVICE", `${id} 已退出（${code ?? "signal"}）`);
   });
   await recordEvent("info", "SERVICE", `已启动 ${id}`);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
+  if (id === "wx_channels_card") {
+    const recovery = await ensureChannelsPageConnected({ force: true, reason: "service_started" });
+    if (recovery?.ok) serviceRestartAttempts.set(id, 0);
+  }
   return { service: (await getServiceStates())[id] };
 }
 
@@ -4556,9 +6379,12 @@ async function runServiceAction(action) {
 }
 
 async function stopService(id) {
+  assertPlatformCapability(capabilities, "externalServiceControl");
   if (!config.services[id]) throw httpError(404, "service_not_found");
   const child = managedProcesses.get(id);
   if (!child) throw httpError(409, "service_not_managed_by_zhitai");
+  intentionalServiceStops.add(id);
+  clearServiceRestartTimer(id);
   const exited = new Promise((resolvePromise) => child.once("exit", resolvePromise));
   child.kill("SIGTERM");
   const timeoutMs = Math.max(1_000, Number(config.services[id].stopTimeoutMs || 5_000));
@@ -4580,6 +6406,7 @@ async function stopService(id) {
 }
 
 async function setupService(id) {
+  assertPlatformCapability(capabilities, "externalServiceControl");
   const service = config.services[id];
   if (!service) throw httpError(404, "service_not_found");
   const currentState = (await getServiceStates())[id];
@@ -4602,17 +6429,7 @@ function expandArgument(value) {
 }
 
 function safeChildEnv(...overrides) {
-  const allowed = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV"];
-  const env = Object.fromEntries(allowed.filter((key) => typeof process.env[key] === "string").map((key) => [key, process.env[key]]));
-  for (const values of overrides) {
-    if (!values || typeof values !== "object") continue;
-    for (const [key, value] of Object.entries(values)) {
-      if (/^[A-Z][A-Z0-9_]{0,63}$/.test(key) && ["string", "number", "boolean"].includes(typeof value)) {
-        env[key] = String(value);
-      }
-    }
-  }
-  return env;
+  return childEnvironment(Object.assign({}, ...overrides.filter((value) => value && typeof value === "object")));
 }
 
 async function filesChangedSince(root, timestamp) {
@@ -4951,10 +6768,13 @@ async function appendTask(task) {
   });
 }
 
-async function updateTask(taskId, patch) {
+async function updateTask(taskId, patch, transitionContext = {}) {
   return mutateTasks((tasks) => {
     const index = tasks.findIndex((task) => task.id === taskId);
     if (index < 0) return null;
+    if (tasks[index].type === "publish" && patch.status && patch.status !== tasks[index].status) {
+      assertLifecycleTransition("publish_task", tasks[index].status, patch.status, transitionContext);
+    }
     tasks[index] = { ...tasks[index], ...patch, updatedAt: new Date().toISOString() };
     return tasks[index];
   });
@@ -4984,7 +6804,7 @@ async function recordEvent(level, type, message, taskId = null) {
     await writeJsonAtomic(eventsPath, events.slice(0, 1_000));
   });
   await eventMutation;
-  if (notificationCenter) {
+  if (notificationCenter && capabilities.notificationAutomation) {
     void notificationCenter.notifyEvent(event.type, event.message).catch(() => {});
   }
 }
@@ -5058,13 +6878,17 @@ async function spawnAndCaptureJson(command, args, options) {
 }
 
 function pathIsInside(path, root) {
-  const absolutePath = resolve(path);
-  const absoluteRoot = resolve(root);
-  return absolutePath === absoluteRoot || absolutePath.startsWith(`${absoluteRoot}/`);
+  return isPathInside(path, root);
 }
 
 function sanitizeFilename(value) {
-  return stripControlCharacters(String(value || "asset")).replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "asset";
+  const cleaned = stripControlCharacters(String(value || "asset"))
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[. ]+$/g, "")
+    .slice(0, 120) || "asset";
+  return /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(cleaned)
+    ? `_${cleaned}`
+    : cleaned;
 }
 
 function sanitizeTitle(value) {
@@ -5250,15 +7074,43 @@ function safeErrorCode(error) {
     .slice(0, 120);
 }
 
+function normalizeCompanionVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value.trim());
+  return match ? `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}` : null;
+}
+
+function normalizeFixedValue(value, allowed) {
+  if (typeof value !== "string" || value.length > 32) return "unknown";
+  const normalized = value.toLowerCase();
+  return allowed.has(normalized) ? normalized : "unknown";
+}
+
+function boundedCount(value, maximum) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(maximum, Math.max(0, Math.trunc(value)))
+    : 0;
+}
+
 function safeMessage(value) {
-  return String(value || "")
-    .replace(/(cookie|token|authorization|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
-    .replace(/https?:\/\/[^\s]+/g, "[url]")
+  const withoutCredentials = String(value || "")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/(cookie|token|authorization|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]");
+  return sanitizeFailureText(withoutCredentials)
+    .replace(/<[^>]{0,2048}>/g, "[html]")
+    .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, "[phone]")
     .slice(0, 500);
 }
 
 function sanitizeResult(result) {
   if (!result || typeof result !== "object") return { accepted: true };
-  const allowed = ["success", "accepted", "message", "taskId", "job_id", "status"];
-  return Object.fromEntries(allowed.filter((key) => key in result).map((key) => [key, result[key]]));
+  const sanitized = {};
+  if (typeof result.success === "boolean") sanitized.success = result.success;
+  if (typeof result.accepted === "boolean") sanitized.accepted = result.accepted;
+  const status = String(result.status || "").toLowerCase();
+  if (["accepted", "draft", "failed", "needs_attention", "platform_draft", "submitted", "success", "unknown"].includes(status)) {
+    sanitized.status = status;
+  }
+  // 任意上游消息和任务标识可能包含账号、路径或凭据；第一方平台回执只保留固定码。
+  return Object.keys(sanitized).length ? sanitized : { accepted: true };
 }

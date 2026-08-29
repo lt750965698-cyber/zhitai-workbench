@@ -3,11 +3,14 @@
  * 账号、历史、登录会话仍沿用 MatrixMedia 官方数据格式和自动化引擎。
  */
 import { spawn } from "node:child_process";
-import { chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { canonicalPublicResultUrl } from "./content-lifecycle.mjs";
+import { sanitizeFailureText } from "./kb.mjs";
 
 export const MATRIX_BINARY = process.env.ZHITAI_MATRIX_BINARY
   || join(homedir(), ".local", "share", "zhitai-runtime", "engines", "matrixmedia.app", "Contents", "MacOS", "matrixmedia");
@@ -15,11 +18,24 @@ const CLI_TIMEOUT_MS = 120_000;
 const PTY_WRAPPER = "/usr/bin/script";
 const loginSessions = new Map();
 const receiptMutationQueues = new Map();
-const MATRIX_PARTITIONS = join(homedir(), "Library", "Application Support", "matrix-video", "Partitions");
+const MAX_LOGIN_QR_BYTES = 2 * 1024 * 1024;
+const LOGIN_TERMINATE_GRACE_MS = 400;
+export const MATRIX_PARTITIONS_DIR = resolve(process.env.ZHITAI_MATRIX_PARTITIONS_DIR
+  || join(homedir(), "Library", "Application Support", "matrix-video", "Partitions"));
+const MATRIX_RUNTIME_DATA_DIR = resolve(process.env.ZHITAI_DATA_DIR
+  || join(dirname(fileURLToPath(import.meta.url)), "data"));
+export const MATRIX_AUTH_STATE_PATH = resolve(process.env.ZHITAI_MATRIX_AUTH_STATE_PATH
+  || join(MATRIX_RUNTIME_DATA_DIR, "matrixmedia-auth-state.json"));
 const SESSION_PLATFORMS = [
   { suffix: "抖音", code: "dy", platform: "抖音", cookie: "passport_assist_user" },
   { suffix: "视频号", code: "sph", platform: "视频号", cookie: "sessionid" },
 ];
+
+const MATRIX_AUTH_STATES = new Set(["verified", "unverified", "invalid"]);
+const MATRIX_PLATFORM_ALIASES = Object.freeze({
+  dy: ["dy", "douyin", "抖音"],
+  sph: ["sph", "channels", "wechat_channels", "视频号"],
+});
 
 export const PLATFORMS = [
   { code: "dy", name: "抖音", automated: true },
@@ -94,6 +110,7 @@ export function publishModeFor({ draft = false, scheduledAt = null, publishAt = 
 
 function canonicalAccountIdentifier(value) {
   if (value && typeof value === "object") {
+    if (value.accountFingerprint) return canonicalAccountIdentifier(value.accountFingerprint);
     if (value.partition) return canonicalAccountIdentifier(value.partition);
     if (value.phone) return canonicalAccountIdentifier(value.phone);
   }
@@ -110,6 +127,266 @@ export function publishAccountFingerprint(platform, value) {
   return `acct_${createHash("sha256").update(`${String(platform || "").trim()}\0${canonical}`).digest("hex").slice(0, 24)}`;
 }
 
+function matrixPlatformCode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  for (const [code, aliases] of Object.entries(MATRIX_PLATFORM_ALIASES)) {
+    if (aliases.some((alias) => normalized === alias || normalized.includes(alias))) return code;
+  }
+  return normalized;
+}
+
+function accountPhoneFromPartition(value) {
+  const raw = String(value || "").replace(/^persist:/, "");
+  for (const definition of SESSION_PLATFORMS) {
+    if (!raw.endsWith(definition.suffix)) continue;
+    const phone = raw.slice(0, -definition.suffix.length);
+    if (/^1\d{10}$/.test(phone)) return phone;
+  }
+  return null;
+}
+
+function matrixLoginTarget(platform, phone) {
+  const code = matrixPlatformCode(platform);
+  const definition = SESSION_PLATFORMS.find((entry) => entry.code === code);
+  const normalizedPhone = String(phone || "").trim();
+  return {
+    platform: code,
+    phone: normalizedPhone,
+    ...(definition ? { partition: `persist:${normalizedPhone}${definition.suffix}` } : {}),
+  };
+}
+
+/**
+ * 登录真值使用独立于发布回执的不可逆账号指纹。手机号只参与内存中的哈希，
+ * 状态文件永远不会保存手机号、partition 或 Cookie 名称/值。
+ */
+export function matrixAuthAccountFingerprint(platform, account) {
+  const code = matrixPlatformCode(platform || account?.platform);
+  if (!code) throw new Error("matrix_auth_platform_required");
+  let canonical = account;
+  if (account && typeof account === "object") {
+    const phone = String(account.phone || "").trim() || accountPhoneFromPartition(account.partition);
+    canonical = phone || account.partition || account.account || account.accountFingerprint || "";
+  }
+  const raw = String(canonical || "").trim();
+  if (/^auth_[a-f0-9]{32}$/.test(raw)) return raw;
+  if (!raw) throw new Error("matrix_auth_account_required");
+  return `auth_${createHash("sha256").update(`matrix-auth-v1\0${code}\0${raw}`).digest("hex").slice(0, 32)}`;
+}
+
+function cloneAuthValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function safeAuthReasonCode(value, fallback) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-z][a-z0-9_:-]{0,63}$/.test(normalized) ? normalized : fallback;
+}
+
+/**
+ * MatrixMedia 登录真值账本。只持久化平台代码、不可逆账号指纹、状态、固定原因码
+ * 和时间戳；任何平台输出、手机号、partition、Cookie 元数据都不会落盘。
+ */
+export function createMatrixAuthStateStore({
+  path = MATRIX_AUTH_STATE_PATH,
+  now = () => new Date().toISOString(),
+} = {}) {
+  if (!path || typeof path !== "string") throw new Error("matrix_auth_state_path_required");
+  let mutation = Promise.resolve();
+
+  const timestamp = () => {
+    const raw = typeof now === "function" ? now() : now;
+    const parsed = raw instanceof Date ? raw : new Date(raw);
+    if (Number.isNaN(parsed.getTime())) throw new Error("matrix_auth_state_clock_invalid");
+    return parsed.toISOString();
+  };
+
+  const readState = async () => {
+    let raw;
+    try { raw = await readFile(path, "utf8"); }
+    catch (error) {
+      if (error?.code === "ENOENT") return { version: 1, accounts: [] };
+      throw error;
+    }
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch { throw new Error("matrix_auth_state_invalid_json"); }
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.accounts)) {
+      throw new Error("matrix_auth_state_invalid_schema");
+    }
+    for (const record of parsed.accounts) {
+      if (!record || !/^auth_[a-f0-9]{32}$/.test(String(record.account || ""))
+        || !MATRIX_AUTH_STATES.has(record.authState)
+        || !String(record.platform || "").trim()) {
+        throw new Error("matrix_auth_state_invalid_record");
+      }
+    }
+    return parsed;
+  };
+
+  const writeState = async (state) => {
+    await mkdir(dirname(path), { recursive: true });
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+  };
+
+  const update = (platform, account, authState, reasonCode) => {
+    if (!MATRIX_AUTH_STATES.has(authState)) throw new Error("matrix_auth_state_invalid");
+    const code = matrixPlatformCode(platform || account?.platform);
+    const fingerprint = matrixAuthAccountFingerprint(code, account);
+    const safeReasonCode = safeAuthReasonCode(reasonCode, authState === "verified" ? "verified_operation" : "auth_failed");
+    const operation = mutation.catch(() => {}).then(async () => {
+      const state = await readState();
+      const at = timestamp();
+      let record = state.accounts.find((entry) => entry.platform === code && entry.account === fingerprint);
+      if (!record) {
+        record = { platform: code, account: fingerprint, authState, reasonCode: safeReasonCode, updatedAt: at };
+        state.accounts.push(record);
+      } else {
+        record.authState = authState;
+        record.reasonCode = safeReasonCode;
+        record.updatedAt = at;
+      }
+      if (authState === "verified") {
+        record.verifiedAt = at;
+        delete record.invalidatedAt;
+      } else if (authState === "invalid") {
+        record.invalidatedAt = at;
+      }
+      await writeState(state);
+      return cloneAuthValue(record);
+    });
+    mutation = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
+
+  return {
+    path,
+    async list() {
+      await mutation.catch(() => {});
+      return cloneAuthValue((await readState()).accounts);
+    },
+    async get(platform, account) {
+      await mutation.catch(() => {});
+      const code = matrixPlatformCode(platform || account?.platform);
+      const fingerprint = matrixAuthAccountFingerprint(code, account);
+      const record = (await readState()).accounts.find((entry) => entry.platform === code && entry.account === fingerprint);
+      return record ? cloneAuthValue(record) : null;
+    },
+    markVerified(platform, account, reasonCode = "verified_operation") {
+      return update(platform, account, "verified", String(reasonCode || "verified_operation"));
+    },
+    invalidate(platform, account, reasonCode = "auth_failed") {
+      return update(platform, account, "invalid", String(reasonCode || "auth_failed"));
+    },
+  };
+}
+
+export const matrixAuthStateStore = createMatrixAuthStateStore();
+
+function normalizedAuthPresentation(authState, reason = null) {
+  if (authState === "verified") {
+    return {
+      authState,
+      loginStatus: "已登录",
+      loggedIn: true,
+      readyForPublish: true,
+      publishReady: true,
+      reason: reason || "登录态已通过实际登录或发布验证",
+    };
+  }
+  if (authState === "invalid") {
+    return {
+      authState,
+      loginStatus: "登录失效",
+      loggedIn: false,
+      readyForPublish: false,
+      publishReady: false,
+      reason: reason || "平台已明确返回登录失效，需要重新登录",
+    };
+  }
+  return {
+    authState: "unverified",
+    loginStatus: "待验证",
+    loggedIn: false,
+    readyForPublish: false,
+    publishReady: false,
+    reason: reason || "仅检测到账号或会话元数据，尚未通过实际登录或发布验证",
+  };
+}
+
+/** 只有明确 verified 才允许进入发布链路；缺字段、旧状态和 Cookie 推断都关闭。 */
+export function isMatrixAccountUsable(account) {
+  return account?.authState === "verified"
+    && account?.loggedIn === true
+    && account?.readyForPublish === true
+    && account?.publishReady === true
+    && Boolean(account?.phone || account?.partition);
+}
+
+export function applyMatrixAuthRecord(account, record = null) {
+  const current = account && typeof account === "object" ? account : {};
+  const recordState = MATRIX_AUTH_STATES.has(record?.authState) ? record.authState : null;
+  const currentState = MATRIX_AUTH_STATES.has(current.authState) ? current.authState : "unverified";
+  // 持久记录来自成功 CLI 登录/平台接受发布或真实认证失败，优先级高于 Matrix
+  // 账号树中的兼容状态文本；这样一次成功重新登录可以明确清除旧 invalid。
+  const authState = recordState || currentState;
+  const reason = recordState === "invalid"
+    ? "平台已明确返回登录失效，需要重新登录"
+    : recordState === "verified"
+      ? "登录态已通过实际登录或发布验证"
+      : current.reason;
+  return {
+    ...current,
+    ...(recordState ? { authSource: "persistent_auth_state" } : {}),
+    ...normalizedAuthPresentation(authState, reason),
+    authReasonCode: record?.reasonCode || current.authReasonCode || null,
+  };
+}
+
+function hasOfficialSphLoginUrl(text) {
+  const candidates = String(text || "").match(/https?:\/\/[^\s<>"']+/giu) || [];
+  return candidates.some((candidate) => {
+    try {
+      const url = new URL(candidate.replace(/[),;\]}，。；！]+$/u, ""));
+      return url.protocol === "https:"
+        && !url.username
+        && !url.password
+        && url.hostname.toLowerCase() === "channels.weixin.qq.com"
+        && (url.pathname === "/login" || url.pathname === "/login.html");
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * 只识别平台失败输出中的强登录证据。尤其是视频号实际会返回登录页重定向和
+ * `[auth] 视频号登录状态已失效`；普通上传错误或内容中偶然出现“登录”不会误伤。
+ */
+export function classifyMatrixAuthFailure({ platform, code, out = "", err = "", state = null } = {}) {
+  const platformCode = matrixPlatformCode(platform);
+  const failed = !(code === 0 || code === "0") || state === "failed";
+  if (!failed) return null;
+  const text = String(`${err}\n${out}`)
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .slice(0, 40_000);
+  if (platformCode === "sph") {
+    if (/\[auth\][^\n]*(?:视频号)?登录状态已失效/i.test(text)
+      || /登录态异常或未登录/i.test(text)
+      || (hasOfficialSphLoginUrl(text)
+        && /(?:重新登录|未登录|登录状态已失效|\[auth\])/i.test(text))) {
+      return { invalid: true, reasonCode: "sph_login_redirect" };
+    }
+  }
+  if (/^(?:not logged in|login expired|session expired|authentication required)\s*$/im.test(text)
+    || /^\[auth\][^\n]*(?:重新登录|未登录|登录失效|登录状态已失效)/im.test(text)) {
+    return { invalid: true, reasonCode: "platform_auth_failed" };
+  }
+  return null;
+}
+
 function normalizeScheduledAt(value) {
   if (value === null || value === undefined || value === "") return null;
   const parsed = Date.parse(String(value));
@@ -118,22 +395,17 @@ function normalizeScheduledAt(value) {
 }
 
 function cleanReceiptText(value, maxLength = 1_000) {
-  const clean = String(value ?? "")
+  const clean = sanitizeFailureText(String(value ?? "")
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-    .replace(/\b1\d{10}\b/g, "[account]")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/(?:\+?86[\s-]*)?1[3-9]\d(?:[\s-]*\d){8}/g, "[account]"))
     .trim();
   return clean ? clean.slice(0, maxLength) : null;
 }
 
 function validResultUrl(value) {
-  if (!value) return null;
-  try {
-    const url = new URL(String(value));
-    return ["http:", "https:"].includes(url.protocol) ? url.toString() : null;
-  } catch {
-    return null;
-  }
+  return canonicalPublicResultUrl(value);
 }
 
 function resultObjects(parsed) {
@@ -181,7 +453,7 @@ function structuredReceiptState(objects) {
 
 /**
  * MatrixMedia 的退出码 0 只能证明 CLI 成功完成，不能证明平台内容已经公开。
- * 只有结构化状态明确写出 published/public 才返回 public。
+ * structured public/draft/scheduled 只作为候选证据保留，不能直接成为业务终态。
  */
 export function classifyMatrixPublishResult({ code, out = "", err = "" } = {}, { mode = "public" } = {}) {
   const parsed = extractJson(out) || extractJson(err);
@@ -190,12 +462,10 @@ export function classifyMatrixPublishResult({ code, out = "", err = "" } = {}, {
   const succeeded = code === 0 || code === "0";
   const savedDraftFallback = code === 4 || code === "4";
   let state;
-  if (savedDraftFallback) state = "draft";
+  if (savedDraftFallback) state = mode === "draft" ? "submitted" : "draft";
   else if (!succeeded) state = "failed";
-  else if (explicitState === "public") state = "public";
   else if (explicitState === "failed") state = "failed";
-  else if (explicitState === "draft" || mode === "draft") state = "draft";
-  else if (explicitState === "scheduled" || mode === "scheduled") state = "scheduled";
+  else if (explicitState === "draft" && mode === "public") state = "draft";
   else state = "submitted";
 
   const taskId = cleanReceiptText(firstResultField(objects, ["taskId", "task_id", "scheduleId", "schedule_id", "platformTaskId", "id"]), 240);
@@ -203,20 +473,23 @@ export function classifyMatrixPublishResult({ code, out = "", err = "" } = {}, {
   const resultUrl = validResultUrl(firstResultField(objects, ["resultUrl", "result_url", "postUrl", "post_url", "noteUrl", "note_url", "shareUrl", "share_url", "url"]));
   const parsedMessage = firstResultField(objects, ["platformMessage", "platform_message", "message", "msg"]);
   const platformMessage = cleanReceiptText(parsedMessage ?? err ?? out);
-  const accepted = state === "draft"
-    ? mode === "draft" && (succeeded || savedDraftFallback)
-    : succeeded && !["failed", "unknown"].includes(state);
+  const accepted = savedDraftFallback
+    ? mode === "draft"
+    : succeeded && !["failed", "unknown", "draft"].includes(state);
   return {
     state,
     accepted,
+    source: "adapter_submission",
+    receivedAt: new Date().toISOString(),
     platformMessage,
+    ...(explicitState ? { adapterReportedState: explicitState } : {}),
     ...(taskId ? { taskId } : {}),
     ...(postId ? { postId } : {}),
     ...(resultUrl ? { resultUrl } : {}),
   };
 }
 
-export function publishReceiptDedupeKey({ platform, account, mediaSha256, mode, scheduledAt = null } = {}) {
+export function publishReceiptDedupeKey({ platform, account, accountFingerprint, mediaSha256, mode, scheduledAt = null } = {}) {
   const normalizedMode = String(mode || "").trim();
   if (!PUBLISH_RECEIPT_MODES.has(normalizedMode)) throw new Error("publisher_receipt_mode_invalid");
   const sha = String(mediaSha256 || "").trim().toLowerCase();
@@ -224,7 +497,7 @@ export function publishReceiptDedupeKey({ platform, account, mediaSha256, mode, 
   const normalizedPlatform = String(platform || "").trim();
   const identity = [
     normalizedPlatform,
-    publishAccountFingerprint(normalizedPlatform, account),
+    publishAccountFingerprint(normalizedPlatform, accountFingerprint || account),
     sha,
     normalizedMode,
     normalizeScheduledAt(scheduledAt),
@@ -434,7 +707,7 @@ export function runCli(args, timeoutMs = CLI_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(MATRIX_BINARY, ["cli", ...args], {
+      child = spawn(MATRIX_BINARY, buildMatrixCliArgs(args), {
         env: {
           PATH: process.env.PATH || "",
           HOME: process.env.HOME || "",
@@ -465,18 +738,54 @@ export function runCli(args, timeoutMs = CLI_TIMEOUT_MS) {
   });
 }
 
-export async function cliAccounts() {
-  const { code, out, err } = await runCli(["accounts", "--json"]);
-  if (code !== 0) throw new Error("matrixmedia_cli_accounts_failed：" + String(err || out).slice(-200));
-  const parsed = extractJson(out);
+/**
+ * MatrixMedia 在 Electron 主进程里通过 argv.indexOf("cli") 定位 CLI 子命令，
+ * 因此 Chromium 静音开关必须放在 cli 之前，不能混进 CLI 自己的参数区。
+ */
+export function buildMatrixCliArgs(args = []) {
+  const cliArgs = args[0] === "cli" ? args : ["cli", ...args];
+  return ["--mute-audio", ...cliArgs];
+}
+
+export function applyMatrixAuthRecords(accounts, records = []) {
+  const recordMap = new Map((Array.isArray(records) ? records : []).map((record) => [
+    `${matrixPlatformCode(record?.platform)}|${String(record?.account || "")}`,
+    record,
+  ]));
+  return (Array.isArray(accounts) ? accounts : []).map((account) => {
+    let record = null;
+    try {
+      const platform = matrixPlatformCode(account?.platform);
+      record = recordMap.get(`${platform}|${matrixAuthAccountFingerprint(platform, account)}`) || null;
+    } catch { /* 无账号标识的展示行保持 unverified */ }
+    return applyMatrixAuthRecord(account, record);
+  });
+}
+
+export async function cliAccounts({ authStateStore = matrixAuthStateStore, run = runCli } = {}) {
+  const { code, out, err } = await run(["accounts", "--json"]);
+  const sessionAccounts = await discoverSessionAccounts();
+  // MatrixMedia 的 GUI 账号树仍依赖它自己的数据目录。即使该目录瞬时不可读，
+  // Electron 分区里的 Cookie 元数据只能证明本地存在会话材料，不能证明平台
+  // 当前仍接受它；它只用于恢复账号候选，状态必须保持待验证。
+  if (code !== 0 && sessionAccounts.length === 0) {
+    throw new Error("matrixmedia_cli_accounts_failed：" + String(err || out).slice(-200));
+  }
+  const parsed = code === 0 ? extractJson(out) : [];
   // 官方 `cli login` 以目标 Cookie 落入 persist: 分区并 flush 为成功；
   // `cli accounts` 只遍历 GUI 账号树，纯 CLI 首次登录后可能仍返回 []。
-  // 因此补充只读扫描已登录分区的 Cookie 元数据（只查名称/有效期，不读取值），
-  // 让织台能显示并使用真实已登录账号，而不是误报“账号未写入”。
-  const rows = [...normalizeAccounts(Array.isArray(parsed) ? parsed : []), ...(await discoverSessionAccounts())];
+  // 因此补充只读扫描分区 Cookie 元数据（只查名称/有效期，不读取值），让织台
+  // 能显示账号候选；只有持久账本中的成功登录/成功发布证据才能把候选升级。
+  const records = await authStateStore.list();
+  const rows = applyMatrixAuthRecords([
+    ...normalizeAccounts(Array.isArray(parsed) ? parsed : []),
+    ...normalizeAccounts(sessionAccounts),
+  ], records);
   const seen = new Set();
   return rows.filter((row) => {
-    const key = `${row.platform}|${row.phone || row.partition || ""}`;
+    let key;
+    try { key = `${matrixPlatformCode(row.platform)}|${matrixAuthAccountFingerprint(row.platform, row)}`; }
+    catch { key = `${matrixPlatformCode(row.platform)}|${row.phone || row.partition || ""}`; }
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -498,7 +807,7 @@ export function sessionAccountFromPartitionName(encodedName) {
 
 async function discoverSessionAccounts() {
   let entries = [];
-  try { entries = await readdir(MATRIX_PARTITIONS, { withFileTypes: true }); } catch { return []; }
+  try { entries = await readdir(MATRIX_PARTITIONS_DIR, { withFileTypes: true }); } catch { return []; }
   const accounts = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -506,7 +815,7 @@ async function discoverSessionAccounts() {
     if (!definition) continue;
     let db = null;
     try {
-      db = new DatabaseSync(join(MATRIX_PARTITIONS, entry.name, "Cookies"), { readOnly: true });
+      db = new DatabaseSync(join(MATRIX_PARTITIONS_DIR, entry.name, "Cookies"), { readOnly: true });
       const valid = db.prepare(`SELECT 1 AS ok FROM cookies
         WHERE name=? AND (length(value)>0 OR length(encrypted_value)>0)
           AND (expires_utc=0 OR expires_utc>((strftime('%s','now')+11644473600)*1000000))
@@ -515,7 +824,13 @@ async function discoverSessionAccounts() {
         platform: definition.platform,
         phone: definition.phone,
         partition: definition.partition,
-        loginStatus: "已登录",
+        authSource: "partition_cookie_metadata",
+        authState: "unverified",
+        loginStatus: "待验证",
+        loggedIn: false,
+        readyForPublish: false,
+        publishReady: false,
+        reason: "仅检测到本地会话元数据，尚未通过实际登录或发布验证",
         error: null,
       });
     } catch { /* 分区正在切换或不是有效 Cookie DB */ }
@@ -542,7 +857,7 @@ export function normalizeChannelsShortTitle(value) {
   return characters.slice(0, 16).join("");
 }
 
-export async function cliPublish(payload) {
+export async function cliPublish(payload, { authStateStore = matrixAuthStateStore, run = runCli } = {}) {
   const results = [];
   const mode = publishModeFor({ draft: payload.draft === true, publishAt: payload.publishAt });
   for (const target of payload.platforms) {
@@ -559,8 +874,16 @@ export async function cliPublish(payload) {
     if (target.creativeStatement && target.creativeStatement !== "none") {
       args.push("--creative-statement", target.creativeStatement);
     }
-    const { code, out, err } = await runCli(args, 30 * 60_000);
+    const { code, out, err } = await run(args, 30 * 60_000);
     const receipt = classifyMatrixPublishResult({ code, out, err }, { mode });
+    const authFailure = classifyMatrixAuthFailure({ platform: target.platform, code, out, err, state: receipt.state });
+    // 真实平台认证失败会覆盖任何旧的 Cookie/账号树推断；后续账号回读保持
+    // fail-closed。反之，只有平台实际接受发布/草稿请求才建立 verified 真值。
+    if (authFailure?.invalid) {
+      await authStateStore.invalidate(target.platform, target, authFailure.reasonCode);
+    } else if (receipt.accepted) {
+      await authStateStore.markVerified(target.platform, target, "publish_accepted");
+    }
     const account = publishAccountFingerprint(target.platform, target);
     results.push({
       platform: target.platform,
@@ -570,12 +893,21 @@ export async function cliPublish(payload) {
       state: receipt.state,
       message: receipt.platformMessage,
       platformMessage: receipt.platformMessage,
+      source: receipt.source,
+      receivedAt: receipt.receivedAt,
+      ...(receipt.adapterReportedState ? { adapterReportedState: receipt.adapterReportedState } : {}),
       ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
       ...(receipt.postId ? { postId: receipt.postId } : {}),
       ...(receipt.resultUrl ? { resultUrl: receipt.resultUrl } : {}),
     });
   }
-  return { success: results.every((item) => item.success), total: results.length, results };
+  return {
+    success: results.every((item) => item.success),
+    businessSuccess: false,
+    requiresReadback: true,
+    total: results.length,
+    results,
+  };
 }
 
 function receiptResult(receipt, { deduplicated = false, success = null } = {}) {
@@ -712,15 +1044,45 @@ export function isLikelyQrPng(buffer) {
   return Math.abs(width - height) <= Math.max(width, height) * 0.2;
 }
 
-export async function startCliLogin({ platform, phone, dataDir }) {
+export function selectReusableLoginSession(sessions, { platform, phone } = {}) {
+  const normalizedPlatform = matrixPlatformCode(platform);
+  const normalizedPhone = String(phone || "").trim();
+  if (!sessions || typeof sessions[Symbol.iterator] !== "function") return null;
+  for (const session of sessions) {
+    if (matrixPlatformCode(session?.platform) === normalizedPlatform
+      && String(session?.phone || "").trim() === normalizedPhone
+      && ["waiting_qr", "waiting_scan"].includes(session?.status)) {
+      return session;
+    }
+  }
+  return null;
+}
+
+export async function startCliLogin({ platform, phone, dataDir, authStateStore = matrixAuthStateStore }) {
   if (!["dy", "sph"].includes(platform)) throw new Error("login_platform_not_supported");
   if (!phone || !String(phone).trim()) throw new Error("login_account_required");
   if (!/^1\d{10}$/.test(String(phone).trim())) throw new Error("请输入11位手机号；MatrixMedia 用手机号作为登录态分区，不能填“测试”等名称");
+  const active = selectReusableLoginSession(loginSessions.values(), { platform, phone });
+  if (active) {
+    return {
+      id: active.id,
+      platform: active.platform,
+      status: active.status,
+      message: active.message,
+      interactionMode: active.interactionMode,
+      reused: true,
+    };
+  }
   const id = randomUUID();
-  const qrDir = join(dataDir, "matrix-login");
-  await mkdir(qrDir, { recursive: true });
+  const qrDir = resolve(dataDir, "matrix-login");
+  await mkdir(qrDir, { recursive: true, mode: 0o700 });
+  await chmod(qrDir, 0o700);
   const qrPath = join(qrDir, `${id}.png`);
-  const args = buildCliLoginArgs({ platform, phone, qrPath });
+  // 登录二维码等同短期认证凭证。先用私有权限占位，让外部 CLI 只覆盖
+  // 这个 inode，避免生成过程短暂落成 0644。
+  await writeFile(qrPath, Buffer.alloc(0), { flag: "wx", mode: 0o600 });
+  await chmod(qrPath, 0o600);
+  const args = buildMatrixCliArgs(buildCliLoginArgs({ platform, phone, qrPath }));
   const interactionMode = platform === "sph" ? "window" : "inline_qr";
   const session = {
     id, platform, phone: String(phone).trim(), status: "waiting_qr", qrPath, interactionMode,
@@ -737,57 +1099,158 @@ export async function startCliLogin({ platform, phone, dataDir }) {
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let output = "";
-  const appendOutput = (data) => { output = (output + String(data)).slice(-20_000); };
-  child.stdout.on("data", (data) => {
-    appendOutput(data);
+  child.stdout.on("data", () => {
     session.status = "waiting_scan";
     session.message = platform === "sph"
       ? "请在已打开的视频号官方窗口点击“微信快捷登录”，再按页面提示确认"
       : "请扫码登录";
     session.updatedAt = Date.now();
   });
-  child.stderr.on("data", (data) => { appendOutput(data); session.updatedAt = Date.now(); });
-  child.once("error", (error) => { session.status = "failed"; session.message = `登录引擎启动失败：${error.message}`; session.updatedAt = Date.now(); });
+  child.stderr.on("data", () => { session.updatedAt = Date.now(); });
+  session.child = child;
+  child.once("error", () => {
+    session.status = "failed";
+    session.message = "登录引擎启动失败，请稍后自动重试";
+    session.updatedAt = Date.now();
+    void unlink(session.qrPath).catch(() => {});
+  });
   child.once("exit", async (code) => {
     if (code === 0) {
       // 官方契约：退出码 0 表示目标登录 Cookie 已检测到并 flush 到分区。
       // `cli accounts` 可能因 GUI 账号树尚未建行而返回空；cliAccounts 会从
       // 同一持久分区只读核验 Cookie 元数据，不能再把这种情况误报为失败。
       try {
+        await authStateStore.markVerified(platform, matrixLoginTarget(platform, session.phone), "cli_login_success");
+      } catch (error) {
+        session.status = "failed";
+        session.message = "平台登录已完成，但本机未能持久化登录验证状态；已停止发布，请重试登录";
+        session.updatedAt = Date.now();
+        session.child = null;
+        await unlink(session.qrPath).catch(() => {});
+        return;
+      }
+      try {
         await new Promise((resolve) => setTimeout(resolve, 800));
-        const accounts = normalizeAccounts(await cliAccounts());
+        const accounts = await cliAccounts({ authStateStore });
         const saved = accounts.some((account) => String(account.phone || "").split("-")[0] === session.phone);
         session.status = "success";
         session.message = saved ? "登录成功，账号已保存并可用于发布" : "登录成功，会话已保存；账号列表稍后自动刷新";
-      } catch (error) {
+      } catch {
         session.status = "success";
-        session.message = "登录成功，会话已由发布引擎保存";
+        session.message = "登录成功，会话已由发布引擎保存并验证";
       }
     } else {
       session.status = code === 3 ? "expired" : "failed";
-      session.message = code === 3 ? "二维码已过期，请重新生成" : `登录失败（${String(output).trim().slice(-160) || `退出码 ${code}`}）`;
+      session.message = code === 3 ? "二维码已过期，正在准备自动刷新" : "登录失败，已停止本次尝试并等待安全重试";
     }
+    session.child = null;
     session.updatedAt = Date.now();
+    await unlink(session.qrPath).catch(() => {});
   });
-  return { id, platform, phone: session.phone, status: session.status, message: session.message, interactionMode };
+  return { id, platform, status: session.status, message: session.message, interactionMode };
 }
 
-export async function getCliLogin(id) {
+function isPathInside(root, candidate) {
+  const rel = relative(root, candidate);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+/**
+ * 仅供本机恢复管理器使用。qrPath、qrBuffer 与 account 都不得进入 HTTP、
+ * 日志或持久账本。
+ */
+export async function getCliLoginAsset(id) {
   const session = loginSessions.get(String(id));
   if (!session) return null;
-  let qrData = null;
+  const qrRoot = resolve(dirname(session.qrPath));
+  let qrPath = null;
+  let qrBuffer = null;
   try {
-    const png = await readFile(session.qrPath);
-    if (session.platform !== "sph" || isLikelyQrPng(png)) {
-      qrData = `data:image/png;base64,${png.toString("base64")}`;
+    const info = await lstat(session.qrPath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size < 24 || info.size > MAX_LOGIN_QR_BYTES) {
+      throw new Error("qr_asset_invalid");
     }
-  } catch { /* QR 尚未生成 */ }
+    const resolvedPath = await realpath(session.qrPath);
+    if (!isPathInside(qrRoot, resolvedPath)) throw new Error("qr_asset_outside_root");
+    await chmod(resolvedPath, 0o600);
+    const png = await readFile(resolvedPath);
+    if (!isLikelyQrPng(png)) throw new Error("qr_asset_not_scannable");
+    qrPath = resolvedPath;
+    qrBuffer = png;
+  } catch { /* QR 尚未稳定生成，或仍是不可扫描的整页截图 */ }
   return {
-    id: session.id, platform: session.platform, phone: session.phone,
+    id: session.id,
+    platform: session.platform,
+    account: session.phone,
     status: session.status, message: session.message, interactionMode: session.interactionMode,
-    qrData, updatedAt: new Date(session.updatedAt).toISOString(),
+    qrPath,
+    qrBuffer,
+    qrReady: Boolean(qrPath && qrBuffer),
+    updatedAt: new Date(session.updatedAt).toISOString(),
   };
+}
+
+/** 面向 HTTP/UI 的无凭证投影：不返回手机号、二维码内容或本机路径。 */
+export async function getCliLogin(id) {
+  const asset = await getCliLoginAsset(id);
+  if (!asset) return null;
+  return {
+    id: asset.id,
+    platform: asset.platform,
+    status: asset.status,
+    message: asset.qrReady ? "登录二维码已生成，正通过安全手机通道发送" : asset.message,
+    interactionMode: asset.interactionMode,
+    qrAvailable: asset.qrReady,
+    updatedAt: asset.updatedAt,
+  };
+}
+
+function cliChildRunning(child) {
+  return Boolean(child && child.exitCode == null && child.signalCode == null);
+}
+
+function waitForCliChildExit(child, timeoutMs) {
+  if (!cliChildRunning(child)) return Promise.resolve(true);
+  return new Promise((resolveWait) => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child.removeListener?.("exit", finish);
+      resolveWait(!cliChildRunning(child));
+    };
+    child.once?.("exit", finish);
+    timer = setTimeout(finish, Math.max(1, Math.floor(timeoutMs)));
+  });
+}
+
+/** 先礼貌终止；短暂宽限后仍未退出则强杀，避免隐藏 Electron 残留播放。 */
+export async function terminateMatrixCliChild(child, {
+  graceMs = LOGIN_TERMINATE_GRACE_MS,
+  killGraceMs = LOGIN_TERMINATE_GRACE_MS,
+} = {}) {
+  if (!cliChildRunning(child)) return true;
+  try { child.kill("SIGTERM"); } catch { /* 继续检查真实退出状态 */ }
+  if (await waitForCliChildExit(child, graceMs)) return true;
+  try { child.kill("SIGKILL"); } catch { /* 由最终状态决定返回值 */ }
+  await waitForCliChildExit(child, killGraceMs);
+  return !cliChildRunning(child);
+}
+
+/** 终止并清理一条登录恢复会话；错误不包含本机路径。 */
+export async function cleanupCliLogin(id, { terminate = false } = {}) {
+  const key = String(id);
+  const session = loginSessions.get(key);
+  if (!session) return false;
+  if (terminate && session.child) {
+    await terminateMatrixCliChild(session.child);
+    session.child = null;
+  }
+  await unlink(session.qrPath).catch(() => {});
+  loginSessions.delete(key);
+  return true;
 }
 
 // ISO → 本地 YYYY-MM-DD HH:mm:ss（官方 publishAt 契约）
@@ -798,18 +1261,50 @@ export function formatPublishAt(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// cli accounts 原始数据 → 规范化账号行 {platform, phone, partition, loginStatus, error}
+// cli accounts 原始数据 → 显式登录真值。任何缺省/旧格式均为 unverified；只有
+// CLI 的明确正向字段或持久验证记录才能 readyForPublish=true。
 export function normalizeAccounts(raw) {
   if (!Array.isArray(raw)) return [];
   return raw.map((entry) => {
-    if (typeof entry === "string") return { platform: entry, phone: null, partition: null, loginStatus: null, error: null };
+    if (typeof entry === "string") {
+      return {
+        platform: entry,
+        phone: null,
+        partition: null,
+        error: null,
+        ...normalizedAuthPresentation("unverified"),
+        authReasonCode: null,
+      };
+    }
     const r = entry && typeof entry === "object" ? entry : {};
-    return {
+    const authSource = String(r.authSource || r.auth_source || "").trim() || null;
+    const statusText = `${r.loginStatus || ""} ${r.login_state || ""} ${r.status || ""} ${r.error || ""} ${r.reason || ""}`.toLowerCase();
+    const explicitState = MATRIX_AUTH_STATES.has(r.authState) ? r.authState : null;
+    const negative = (authSource !== "partition_cookie_metadata" && (
+      r.loggedIn === false
+      || r.isLoggedIn === false
+      || r.readyForPublish === false && (r.loggedIn !== undefined || r.authState !== undefined)
+    )) || /未登录|登录失效|offline|logged.?out|expired|invalid|auth(?:entication)? failed|重新登录|过期|退出/.test(statusText);
+    const positive = r.loggedIn === true
+      || r.isLoggedIn === true
+      || r.readyForPublish === true
+      || r.publishReady === true
+      || /(?:^|\s)(?:online|logged.?in|authenticated|valid|success)(?:\s|$)|已登录/.test(statusText);
+    const authState = negative
+      ? "invalid"
+      : authSource === "partition_cookie_metadata"
+        ? "unverified"
+        : explicitState || (positive ? "verified" : "unverified");
+    const reason = String(r.reason || r.error || r.note || "").trim() || null;
+    const normalized = {
       platform: String(r.platform || r.code || r.name || r.platformName || ""),
       phone: r.phone || r.mobile || null,
       partition: r.partition || r.session || null,
-      loginStatus: r.loginStatus || r.login_state || r.status || null,
       error: r.error || r.note || null,
+      ...(authSource ? { authSource } : {}),
+      ...normalizedAuthPresentation(authState, reason),
+      authReasonCode: r.authReasonCode || r.auth_reason_code || null,
     };
+    return normalized;
   });
 }

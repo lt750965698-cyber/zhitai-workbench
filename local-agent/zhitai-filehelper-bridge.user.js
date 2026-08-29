@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         织台·文件传输助手入库桥
 // @namespace    zhitai.local
-// @version      1.4.1
-// @description  监听网页版文件传输助手的新消息；视频号转发卡片直接提取 objectId/nonceId 自动下载入库，链接继续走原有通道。免密钥、零配置。
+// @version      1.5.1
+// @description  监听网页版文件传输助手的新消息；诊断仅发送结构化计数，不保存或导出消息正文、HTML、凭据和完整 URL。
 // @match        https://filehelper.weixin.qq.com/*
 // @match        https://szfilehelper.weixin.qq.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
@@ -15,6 +16,8 @@
 // @run-at       document-start
 // ==/UserScript==
 
+/* global GM_deleteValue */
+
 (function () {
   'use strict';
 
@@ -22,7 +25,9 @@
   const CARD_ENDPOINT = 'http://127.0.0.1:17890/api/v1/channels/card';
   const NOTE_ENDPOINT = 'http://127.0.0.1:17890/api/v1/channels/note';
   const SOURCE = 'filehelper_web';
-  const SEEN_KEY = 'zhitai_filehelper_seen';
+  // 使用新键只读取 v2 指纹；旧版完整 URL 去重键留待显式处置，启动时不读取或改写。
+  const SEEN_KEY = 'zhitai_filehelper_seen_v2';
+  const LEGACY_SEEN_KEY = 'zhitai_filehelper_seen';
   const KILL_KEY = 'zhitai_bridge_disabled';
   const SEEN_CAP = 1000;
 
@@ -53,33 +58,81 @@
     'v.douyin.com', 'www.douyin.com', 'douyin.com', 'm.douyin.com', 'iesdouyin.com',
     'xiaohongshu.com', 'www.xiaohongshu.com', 'xhslink.com',
   ]);
-  // 允许的子域后缀(不含 weixin.qq.com 主域)
-  const SUPPORTED_SUFFIXES = [
-    '.mp.weixin.qq.com', '.channels.weixin.qq.com', '.finder.video.qq.com',
-    '.v.douyin.com', '.www.douyin.com', '.m.douyin.com', '.iesdouyin.com',
-    '.xiaohongshu.com', '.www.xiaohongshu.com', '.xhslink.com',
-  ];
-
   function isSupported(u) {
-    let h = '', path = '';
+    let h = '', path = '', parsed = null;
     try {
-      const p = new URL(u);
-      h = p.hostname.toLowerCase();
-      path = p.pathname;
+      parsed = new URL(u);
+      h = parsed.hostname.toLowerCase();
+      path = parsed.pathname;
     } catch (e) { return false; }
     if (!h) return false;
+    if (hasSensitiveUrlMaterial(parsed)) return false;
     // v1.3.12:排除加密链——stodownload/wxapp.tc.qq.com/finder /251/ 是视频号加密流,
     // 元宝解析不了(提交必失败),由慢点去水印(TikHub)处理,这里直接跳过。
     if (h === 'wxapp.tc.qq.com') return false;
     if (h === 'finder.video.qq.com' && (path.includes('/251/') || path.includes('stodownload'))) return false;
-    if (SUPPORTED_EXACT.has(h)) {
-      // weixin.qq.com 主域只放行 /sph/ 视频号短链;readtemplate/cgi-bin 等
-      // 服务条款、协议页不是内容链接,必须排除(实测被误提交过)。
-      if (h === 'weixin.qq.com' && path.indexOf('/sph/') !== 0) return false;
-      return true;
+    if (!SUPPORTED_EXACT.has(h) || h === 'finder.video.qq.com' || h === 'iesdouyin.com') return false;
+    if (h === 'weixin.qq.com') return /^\/(?:sph|sf|s)\/[A-Za-z0-9_-]+\/?$/i.test(path);
+    if (h === 'channels.weixin.qq.com') return /^\/mobile\/sf\/[A-Za-z0-9_-]+\/?$/i.test(path);
+    if (h === 'mp.weixin.qq.com') return /^\/s\/[A-Za-z0-9_-]+\/?$/i.test(path);
+    if (h === 'v.douyin.com') return /^\/[A-Za-z0-9_-]+\/?$/i.test(path);
+    if (['douyin.com', 'www.douyin.com', 'm.douyin.com'].includes(h)) return /^\/video\/[A-Za-z0-9_-]+\/?$/i.test(path);
+    if (h === 'xhslink.com') return /^\/[A-Za-z0-9_-]+\/?$/i.test(path);
+    return /^\/(?:explore|discovery\/item)\/[A-Za-z0-9_-]+\/?$/i.test(path);
+  }
+
+  function canonicalSupportedUrl(value) {
+    try {
+      const parsed = new URL(value);
+      if (!isSupported(parsed.toString())) return null;
+      // 分享身份完全由 host + 严格路径确定；任意 query/hash 都可能夹带私聊或凭据。
+      parsed.username = '';
+      parsed.password = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString();
+    } catch (e) { return null; }
+  }
+
+  function hasSensitiveUrlMaterial(parsedUrl) {
+    if (parsedUrl.username || parsedUrl.password) return true;
+    let pathAndHash = `${parsedUrl.pathname || ''}${parsedUrl.hash || ''}`;
+    for (let i = 0; i < 2; i++) {
+      try {
+        const decoded = decodeURIComponent(pathAndHash);
+        if (decoded === pathAndHash) break;
+        pathAndHash = decoded;
+      } catch (e) { break; }
     }
-    for (let i = 0; i < SUPPORTED_SUFFIXES.length; i++) {
-      if (h.endsWith(SUPPORTED_SUFFIXES[i])) return true;
+    if (/(?:^|[\s?&;,/])(?:bearer(?:\s+|[A-Za-z0-9._~+/-])|(?:access[_-]?token|auth(?:orization)?|cookie|credential|password|pass[_-]?ticket|secret|session(?:_?id)?|signature|sig|token|uskey|x-uskey)\s*[=:])/i.test(pathAndHash) ||
+        /(?:\+?86[ -]?)?1[3-9]\d{9}/.test(pathAndHash) ||
+        /(?:^|\/)(?:Users|home|private|var|tmp|opt|srv)(?:\/|$)/i.test(pathAndHash) ||
+        /<(?:html|body|script|style|div|span|p|a|img|video|article|section)\b/i.test(pathAndHash)) return true;
+    const exact = new Set([
+      'access_token', 'authorization', 'auth', 'authkey', 'auth_key', 'decode_key',
+      'credential', 'credentials', 'decodekey', 'decrypt_key', 'decryptkey', 'encfilekey',
+      'expires', 'key', 'pass_ticket', 'password', 'secret', 'session', 'session_id',
+      'sessionid', 'signature', 'sig', 'token', 'uskey', 'x-uskey',
+      'ws_secret', 'wssecret', 'ws_time', 'wstime',
+    ]);
+    for (const [rawName, rawValue] of parsedUrl.searchParams.entries()) {
+      const name = String(rawName || '').toLowerCase();
+      const compact = name.replace(/[^a-z0-9]/g, '');
+      if (exact.has(name) || name.startsWith('x-amz-') || name.startsWith('x-cos-') || name.startsWith('x-oss-') ||
+          compact.endsWith('token') || compact.endsWith('secret') || compact.endsWith('signature') ||
+          compact.includes('decodekey') || compact.includes('decryptkey') || compact.includes('encfilekey')) return true;
+      let value = String(rawValue || '');
+      for (let i = 0; i < 2; i++) {
+        try {
+          const decoded = decodeURIComponent(value);
+          if (decoded === value) break;
+          value = decoded;
+        } catch (e) { break; }
+      }
+      if (/(?:^|[\s?&;,/])(?:bearer(?:\s+|[A-Za-z0-9._~+/-])|(?:access[_-]?token|auth(?:orization)?|cookie|credential|password|pass[_-]?ticket|secret|session(?:_?id)?|signature|sig|token|uskey|x-uskey|x-amz-signature|x-cos-signature|x-oss-security-token)\s*[=:])/i.test(value) ||
+          /(?:\+?86[ -]?)?1[3-9]\d{9}/.test(value) ||
+          /(?:file:\/\/\/|(?:^|[\s=:])\/(?:Users|home|private|var|tmp|opt|srv)\/|[A-Za-z]:\\(?:Users|Documents|Desktop)\\|~\/)/i.test(value) ||
+          /<(?:html|body|script|style|div|span|p|a|img|video|article|section)\b/i.test(value)) return true;
     }
     return false;
   }
@@ -102,20 +155,45 @@
     lastScanMs: 0,
     degraded: false,
     log: [],
-    otherLinks: [],
+    otherLinkCount: 0,
     lastTextLen: 0,
     sphHints: 0,
-    sphSample: '',
+    unparsedCardHints: 0,
     hookMsgs: 0,        // webwxsync 直取消息数
     hookLinks: 0,       // 接口通道提取并提交的链接数
     hookCards: 0,       // 接口通道提取并提交的视频号卡片数
     hookResp: 0,        // 命中的网络响应数(XHR+fetch)
-    hookRaw: [],        // 最近提取失败的消息摘要(诊断用,最多6条)
+    hookShapes: [],     // 最近提取失败消息的结构计数；绝不保留字段值
     loginHint: false,   // 页面是否出现登录二维码(诊断用)
   };
 
-  function pushLog(kind, text) {
-    state.log.unshift({ t: new Date().toLocaleTimeString('zh-CN', { hour12: false }), kind, text });
+  const SAFE_LOG_MESSAGES = Object.freeze({
+    CARD_ACCEPTED: '视频号卡片已交给织台自动下载',
+    CARD_REJECTED: '卡片入库请求被拒绝',
+    CARD_OFFLINE: '卡片提交失败（节点未启动）',
+    CARD_TIMEOUT: '卡片提交超时',
+    LINK_DETECTED: '已识别受支持链接',
+    LINK_ACCEPTED: '链接已入库',
+    LINK_REJECTED: '链接入库请求被拒绝',
+    LINK_OFFLINE: '请求失败（节点未启动或被拦截）',
+    HISTORY_PRIMED: '历史链接已完成本地去重',
+    DUPLICATES_SKIPPED: '重复链接已跳过',
+    SCAN_SLOW: '扫描偏慢，已自动降频',
+    DIAGNOSTIC_COPIED: '结构化诊断已复制；不含消息正文、HTML 或完整链接',
+    SEEN_RESET: '已重置去重记录，页面现有链接会被重新入库',
+    LEGACY_SEEN_CLEARED: '旧版完整 URL 去重项已清理',
+    MANUAL_SCAN: '已手动触发全量扫描',
+    NOTE_ACCEPTED: '已把备注附到上一条视频',
+    NOTE_REJECTED: '备注暂未关联到视频',
+    NOTE_OFFLINE: '备注未送达，视频下载不受影响',
+  });
+
+  function pushLog(kind, code, metric) {
+    const safeKind = ['ok', 'err', 'hit', 'info', 'warn'].includes(kind) ? kind : 'info';
+    const base = SAFE_LOG_MESSAGES[code] || '操作状态已更新';
+    const count = Number.isSafeInteger(metric) && metric >= 0 ? Math.min(metric, 999999) : null;
+    const text = count === null ? base : `${base}（${count}）`;
+    state.log.unshift({ t: new Date().toLocaleTimeString('zh-CN', { hour12: false }), kind: safeKind, text });
     if (state.log.length > 30) state.log.pop();
     render();
   }
@@ -124,14 +202,32 @@
   let seen = new Set();
   try {
     const arr = JSON.parse(GM_getValue(SEEN_KEY, '[]'));
-    if (Array.isArray(arr)) seen = new Set(arr);
+    if (Array.isArray(arr)) {
+      seen = new Set(arr.filter((value) => /^v2:[0-9a-f]{16}$/i.test(String(value))));
+    }
   } catch (e) { /* 忽略损坏记录 */ }
   let saveTimer = null;
   function remember(norm) {
-    seen.add(norm);
+    seen.add(dedupeKey(norm));
     if (seen.size > SEEN_CAP) seen = new Set([...seen].slice(-SEEN_CAP));
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => GM_setValue(SEEN_KEY, JSON.stringify([...seen])), 800);
+  }
+
+  function wasSeen(norm) {
+    return seen.has(dedupeKey(norm));
+  }
+
+  // 同步去重只需稳定指纹；GM storage 永不保存完整或带签名的 URL。
+  function dedupeKey(value) {
+    const input = String(value || '');
+    if (/^v2:[0-9a-f]{16}$/i.test(input)) return input.toLowerCase();
+    let hash = 0xcbf29ce484222325n;
+    for (let i = 0; i < input.length; i++) {
+      hash ^= BigInt(input.charCodeAt(i));
+      hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+    }
+    return `v2:${hash.toString(16).padStart(16, '0')}`;
   }
 
   /* ════════════════════════════════════════════════════════════════
@@ -139,10 +235,10 @@
      网页版传输助手收到消息后走 webwxsync 接口同步,响应 AddMsgList。
      视频号消息 Content 一般是转义 XML(内含 <url> <desc>),但微信可能改
      AppMsgType/结构——所以 v1.3.4 不再猜消息类型,一律先在 Content 里
-     全量扫 URL(含转义后的 XML <url>),扫不到就把原始消息存进诊断。
+     全量扫 URL(含转义后的 XML <url>)，扫不到时只记录字段存在性与长度桶。
      ════════════════════════════════════════════════════════════════ */
   let msgSeen = new Set();            // 按 MsgId 去重,避免同消息重复提交
-  let recentCard = null;              // 卡片后 2 分钟内的纯文字视为用户备注/操作要求
+  let recentCard = null;              // 只保留卡片身份；用户明确紧随的文字可作为业务备注
 
   function extractFromWxMsg(m) {
     // v1.3.5:扫描消息的多个字段(Content/Url/FileName/Title/Desc),不再只看 Content。
@@ -208,17 +304,9 @@
       const objectId = (doc.getElementsByTagName('objectId')[0]?.textContent || '').trim();
       const nonceId = (doc.getElementsByTagName('objectNonceId')[0]?.textContent || '').trim();
       if (!/^[0-9]{6,32}$/.test(objectId) || !/^[A-Za-z0-9_-]{1,240}$/.test(nonceId)) continue;
-      const descriptions = doc.getElementsByTagName('desc');
-      let title = '';
-      for (let i = descriptions.length - 1; i >= 0; i--) {
-        title = (descriptions[i].textContent || '').trim();
-        if (title) break;
-      }
-      if (!title) title = (doc.getElementsByTagName('title')[0]?.textContent || '').trim();
       return {
         objectId,
         nonceId,
-        title: title || '视频号内容',
         deliveryId: msg.MsgId == null ? null : String(msg.MsgId),
       };
     }
@@ -230,34 +318,45 @@
       method: 'POST',
       url: CARD_ENDPOINT,
       headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ ...card, source: SOURCE }),
+      data: JSON.stringify({
+        objectId: card.objectId,
+        nonceId: card.nonceId,
+        deliveryId: card.deliveryId,
+        source: SOURCE,
+      }),
       timeout: 15000,
       onload: (r) => {
         if (r.status === 202) {
-          // 只在本地节点确认收到后记已见。以前在发送前就记忆，
-          // 节点暂时离线时会让该卡片永久丢失。
+          // 只在本地节点确认收到后记已见，避免节点短暂离线造成永久丢失。
           remember(seenKey);
           state.submitted += 1;
           state.hookCards += 1;
-          pushLog('ok', '视频号卡片已交给织台自动下载');
+          pushLog('ok', 'CARD_ACCEPTED');
         } else {
           state.failed += 1;
-          pushLog('err', `卡片入库返回 ${r.status}:${String(r.responseText).slice(0, 60)}`);
+          pushLog('err', 'CARD_REJECTED', Number(r.status));
         }
       },
-      onerror: () => { state.failed += 1; pushLog('err', '卡片提交失败(节点未启动)'); },
-      ontimeout: () => { state.failed += 1; pushLog('err', '卡片提交超时'); },
+      onerror: () => { state.failed += 1; pushLog('err', 'CARD_OFFLINE'); },
+      ontimeout: () => { state.failed += 1; pushLog('err', 'CARD_TIMEOUT'); },
     });
   }
 
   function submitCardNote(card, note) {
     GM_xmlhttpRequest({
-      method: 'POST', url: NOTE_ENDPOINT,
+      method: 'POST',
+      url: NOTE_ENDPOINT,
       headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ deliveryId: card.deliveryId, objectId: card.objectId, note, source: SOURCE }),
+      data: JSON.stringify({
+        deliveryId: card.deliveryId,
+        objectId: card.objectId,
+        note,
+        source: SOURCE,
+      }),
       timeout: 10000,
-      onload: (r) => pushLog(r.status === 200 ? 'ok' : 'warn', r.status === 200 ? '已把你的备注附到上一条视频' : '备注暂未关联到视频'),
-      onerror: () => pushLog('warn', '备注未送达织台，视频下载不受影响'),
+      onload: (r) => pushLog(r.status === 200 ? 'ok' : 'warn', r.status === 200 ? 'NOTE_ACCEPTED' : 'NOTE_REJECTED'),
+      onerror: () => pushLog('warn', 'NOTE_OFFLINE'),
+      ontimeout: () => pushLog('warn', 'NOTE_OFFLINE'),
     });
   }
 
@@ -270,33 +369,41 @@
 
   function trySubmitCard(card) {
     if (!card) return false;
-    recentCard = { ...card, at: Date.now() };
+    recentCard = { objectId: card.objectId, deliveryId: card.deliveryId, at: Date.now() };
     const key = 'card:' + (card.deliveryId || card.objectId);
-    if (seen.has(key)) return true;
+    if (wasSeen(key)) return true;
     if (!primed) { remember(key); return true; }
     submitCard(card, key);
     return true;
   }
 
-  function rememberHookRaw(msg, link) {
-    // 提取失败的消息摘要,进诊断,便于按真实结构打补丁。
-    // 只记录"有内容字段但提取失败"的消息;MsgType=51 空 Content 的状态通知不记录。
+  function rememberHookShape(msg, link) {
+    // 只保留结构：字段名、长度桶和有限类型码；不缓存正文、HTML、URL 或标识符。
     if (link) return;
-    const parts = [];
+    const presentFields = [];
+    const lengthBuckets = {};
     for (const fn of ['Content', 'Url', 'FileName', 'Title', 'Desc', 'Digest']) {
       const v = msg[fn];
       if (v && typeof v === 'string' && v.trim()) {
-        parts.push(fn + '=' + v.replace(/\s+/g, ' ').slice(0, 160));
+        presentFields.push(fn);
+        const length = v.length;
+        lengthBuckets[fn] = length <= 64 ? '1-64' : length <= 256 ? '65-256' : '257+';
       }
     }
-    if (!parts.length) parts.push('字段全空(Content/Url/FileName/Title/Desc 均为空)');   // 51 状态通知也记录,便于看到消息来了
     const summary = {
       t: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-      MsgType: msg.MsgType, AppMsgType: msg.AppMsgType,
-      fields: parts.join(' || '),
+      msgType: safeTypeCode(msg.MsgType),
+      appMsgType: safeTypeCode(msg.AppMsgType),
+      presentFields,
+      lengthBuckets,
     };
-    state.hookRaw.unshift(summary);
-    if (state.hookRaw.length > 6) state.hookRaw.pop();
+    state.hookShapes.unshift(summary);
+    if (state.hookShapes.length > 6) state.hookShapes.pop();
+  }
+
+  function safeTypeCode(value) {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= 0 && number <= 9999 ? number : 'other';
   }
 
   /* ════════════════════════════════════════════════════════════════
@@ -309,20 +416,21 @@
   let hookInstalled = false;
 
   function trySubmitUrl(u) {
-    if (!u || !isSupported(u) || seen.has(u) || respUrlSeen.has(u)) return;
-    respUrlSeen.add(u);
+    const safeUrl = canonicalSupportedUrl(u);
+    const responseKey = dedupeKey(safeUrl);
+    if (!safeUrl || wasSeen(safeUrl) || respUrlSeen.has(responseKey)) return;
+    respUrlSeen.add(responseKey);
     if (respUrlSeen.size > 500) respUrlSeen = new Set([...respUrlSeen].slice(-400));
-    if (!primed) { remember(u); return; }   // 首扫阶段只记账,防历史同步灌库
-    remember(u);
+    if (!primed) { remember(safeUrl); return; }   // 首扫阶段只记账,防历史同步灌库
+    remember(safeUrl);
     state.hookLinks += 1;
-    pushLog('ok', '接口直取:' + u.slice(0, 44));
-    submit(u);
+    pushLog('ok', 'LINK_DETECTED');
+    submit(safeUrl);
   }
 
-  // 诊断上报:把 webwxsync 原始响应转发到本地节点存盘(v1.3.11),
-  // 用于拿真实消息结构——不再靠猜,一次转发就能定位。
+  // 诊断上报只传固定字段的统计摘要。原始 URL、响应正文和消息字段值不会离开页面。
   let diagBudget = 0;
-  function sendDiag(url, text) {
+  function sendDiag(text, transport) {
     try {
       if (Date.now() > diagBudget) {
         diagBudget = Date.now() + 10000;   // 10 秒最多发一条,防刷屏
@@ -330,7 +438,7 @@
           method: 'POST',
           url: ENDPOINT.replace('/inbox', '/diag'),
           headers: { 'Content-Type': 'application/json' },
-          data: JSON.stringify({ url, text: String(text).slice(0, 60000) }),
+          data: JSON.stringify(buildSyncDiagnostic(text, transport)),
           onload: () => {},
           onerror: () => {},
         });
@@ -338,7 +446,42 @@
     } catch (e) { /* ignore */ }
   }
 
-  function scanResponse(url, text) {
+  function buildSyncDiagnostic(text, transport) {
+    const raw = String(text || '');
+    const summary = {
+      schemaVersion: 2,
+      source: 'filehelper_bridge',
+      kind: 'sync_response',
+      outcome: 'observed',
+      transport: transport === 'xhr' || transport === 'fetch' ? transport : 'unknown',
+      contentType: 'json',
+      metrics: {
+        payloadBytes: utf8Bytes(raw),
+        itemCount: 0,
+        messageCount: 0,
+        linkCount: Math.min((raw.match(/https?:\/\//gi) || []).length, 10000),
+      },
+    };
+    try {
+      const data = JSON.parse(raw);
+      const list = Array.isArray(data?.AddMsgList) ? data.AddMsgList : [];
+      summary.metrics.messageCount = Math.min(list.length, 10000);
+      for (const msg of list.slice(0, 10000)) {
+        if (!msg || typeof msg !== 'object') continue;
+        if (['Content', 'Url', 'Digest'].some((field) => typeof msg[field] === 'string' && msg[field].includes('objectId'))) {
+          summary.metrics.itemCount += 1;
+        }
+      }
+    } catch (e) { /* JSON 失败也只上报字节数与固定枚举 */ }
+    return summary;
+  }
+
+  function utf8Bytes(value) {
+    try { return Math.min(new TextEncoder().encode(value).byteLength, 10 * 1024 * 1024); }
+    catch (e) { return Math.min(String(value).length * 3, 10 * 1024 * 1024); }
+  }
+
+  function scanResponse(url, text, transport) {
     if (!text || typeof text !== 'string' || text.length < 20) return;
     // 快筛:没有视频号痕迹的响应直接跳过,保持低开销
     if (url.indexOf('webwxsync') === -1 &&
@@ -347,10 +490,10 @@
         text.indexOf('channels.weixin') === -1) return;
     state.hookResp += 1;
 
-    // 诊断上报:webwxsync 响应原文存到节点(卡片消息结构之谜靠它解开)
-    if (url.indexOf('webwxsync') !== -1) sendDiag(url, text);
+    // webwxsync 只上报结构化计数，绝不发送原文或完整 URL。
+    if (url.indexOf('webwxsync') !== -1) sendDiag(text, transport);
 
-    // 通道A:webwxsync 的 AddMsgList 结构解析(保留 MsgId 去重与原始消息诊断)
+    // 通道A:webwxsync 的 AddMsgList 结构解析（MsgId 仅内存去重；诊断只留结构计数）
     if (url.indexOf('webwxsync') !== -1) {
       try {
         const data = JSON.parse(text);
@@ -368,8 +511,11 @@
             else if (link) trySubmitUrl(link);
             else {
               const note = plainNoteFromWxMsg(msg);
-              if (note && recentCard && Date.now() - recentCard.at <= 2 * 60 * 1000) submitCardNote(recentCard, note);
-              else rememberHookRaw(msg, null);
+              if (note && recentCard && Date.now() - recentCard.at <= 2 * 60 * 1000) {
+                submitCardNote(recentCard, note);
+              } else {
+                rememberHookShape(msg, null);
+              }
             }
           }
         }
@@ -413,7 +559,7 @@
       try {
         this.addEventListener('load', () => {
           try {
-            scanResponse(this.responseURL || '', this.responseText || '');
+            scanResponse(this.responseURL || '', this.responseText || '', 'xhr');
           } catch (e) { /* ignore */ }
         });
       } catch (e) { /* ignore */ }
@@ -428,7 +574,7 @@
         const p = origFetch.apply(this, args);
         p.then((resp) => {
           try {
-            resp.clone().text().then((t) => scanResponse(reqUrl, t)).catch(() => {});
+            resp.clone().text().then((t) => scanResponse(reqUrl, t, 'fetch')).catch(() => {});
           } catch (e) { /* ignore */ }
         }).catch(() => {});
         return p;
@@ -456,7 +602,7 @@
             const mm = v.match(/https?:\/\/[^\s"'<>]+/i);
             if (mm) { out.push(mm[0]); continue; }
             state.sphHints += 1;
-            if (!state.sphSample && el.outerHTML) state.sphSample = el.outerHTML.slice(0, 400);
+            state.unparsedCardHints += 1;
           }
         }
       }
@@ -487,23 +633,25 @@
 
   /* ── 提交(免密钥:来源绑定) ── */
   function submit(url) {
+    const safeUrl = canonicalSupportedUrl(url);
+    if (!safeUrl) return;
     GM_xmlhttpRequest({
       method: 'POST',
       url: ENDPOINT,
       headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ text: url, source: SOURCE }),
+      data: JSON.stringify({ text: safeUrl, source: SOURCE }),
       onload: (r) => {
         if (r.status === 202) {
           state.submitted += 1;
-          pushLog('ok', '已入库 ' + url.slice(0, 44));
+          pushLog('ok', 'LINK_ACCEPTED');
         } else {
           state.failed += 1;
-          pushLog('err', `入库返回 ${r.status}:${String(r.responseText).slice(0, 60)}`);
+          pushLog('err', 'LINK_REJECTED', Number(r.status));
         }
       },
       onerror: () => {
         state.failed += 1;
-        pushLog('err', '请求失败(节点未启动或被拦截)');
+        pushLog('err', 'LINK_OFFLINE');
       },
     });
   }
@@ -539,7 +687,7 @@
     fullScanQueued = false;
     pendingRoots.clear();
     state.sphHints = 0;
-    state.sphSample = '';
+    state.unparsedCardHints = 0;
     state.loginHint = false;
 
     state.scans += 1;
@@ -554,30 +702,28 @@
         state.loginHint = true;
         continue;
       }
-      if (seen.has(norm)) { dupSkipped += 1; continue; }
-      if (!isSupported(norm)) {
-        if (/^https?:/i.test(norm) && !state.otherLinks.includes(norm)) {
-          state.otherLinks.unshift(norm);
-          if (state.otherLinks.length > 12) state.otherLinks.pop();
-        }
+      const safeUrl = canonicalSupportedUrl(norm);
+      if (safeUrl && wasSeen(safeUrl)) { dupSkipped += 1; continue; }
+      if (!safeUrl) {
+        if (/^https?:/i.test(norm)) state.otherLinkCount = Math.min(state.otherLinkCount + 1, 999999);
         continue;
       }
-      remember(norm);
+      remember(safeUrl);
       if (!primed) continue;
-      pushLog('hit', '发现链接 ' + norm.slice(0, 44));
-      submit(norm);
+      pushLog('hit', 'LINK_DETECTED');
+      submit(safeUrl);
       submittedNow += 1;
     }
 
     if (!primed) {
       primed = true;
-      pushLog('info', `已标记 ${seen.size} 条历史链接,新消息开始生效`);
+      pushLog('info', 'HISTORY_PRIMED', seen.size);
     } else if (dupSkipped > 0 && submittedNow === 0) {
       // 节流:同类日志最多 30 秒一条,避免刷屏
       const now = Date.now();
       if (now - lastDupLogAt > 30000) {
         lastDupLogAt = now;
-        pushLog('info', `发现 ${dupSkipped} 条链接,均已在库(去重跳过)`);
+        pushLog('info', 'DUPLICATES_SKIPPED', dupSkipped);
       }
     }
 
@@ -585,7 +731,7 @@
     if (state.lastScanMs > SLOW_SCAN_MS) {
       if (!state.degraded && state.lastScanMs > SLOW_SCAN_MS) {
         state.degraded = true;
-        pushLog('warn', `扫描偏慢(${state.lastScanMs}ms),已自动降频`);
+        pushLog('warn', 'SCAN_SLOW', state.lastScanMs);
       }
     } else if (state.degraded && state.lastScanMs < 80) {
       state.degraded = false;
@@ -655,34 +801,29 @@
 
   function buildDiagnostic() {
     const lines = [];
-    lines.push('【织台桥诊断 v1.3.4】' + new Date().toLocaleString('zh-CN', { hour12: false }));
-    lines.push('页面: ' + location.href);
+    lines.push('【织台桥结构化诊断 v1.5.0】' + new Date().toLocaleString('zh-CN', { hour12: false }));
+    lines.push('页面类型: 文件传输助手（地址已省略）');
     lines.push('节点: ' + (state.nodeOk === true ? '已连通 17890' : state.nodeOk === false ? '连不上 17890' : '检测中') +
       ' | 成功入库 ' + state.submitted + ' | 失败 ' + state.failed);
     lines.push('扫描: ' + state.scans + ' 次 | 最近耗时 ' + state.lastScanMs + 'ms' + (state.degraded ? '(已降频)' : ''));
     lines.push('网络接口(XHR+fetch): 命中响应 ' + state.hookResp + ' 个 | 收到消息 ' + state.hookMsgs + ' 条 | 卡片 ' + state.hookCards + ' / 链接 ' + state.hookLinks);
-    if (state.hookRaw.length) {
-      lines.push('-- webwxsync 原始消息(提取失败,供诊断) --');
-      for (const r of state.hookRaw) {
-        lines.push(`  [${r.t}] MsgType=${r.MsgType} AppMsgType=${r.AppMsgType}`);
-        lines.push('  ' + r.fields);
+    if (state.hookShapes.length) {
+      lines.push('-- webwxsync 消息结构（不含字段值） --');
+      for (const shape of state.hookShapes) {
+        const fields = shape.presentFields.length ? shape.presentFields.join(',') : 'none';
+        const buckets = shape.presentFields.map((field) => `${field}:${shape.lengthBuckets[field]}`).join(',') || 'none';
+        lines.push(`  [${shape.t}] MsgType=${shape.msgType} AppMsgType=${shape.appMsgType} Fields=${fields} Lengths=${buckets}`);
       }
     }
     lines.push('页面文本量: ' + state.lastTextLen + ' 字符 | 疑似视频号卡片: ' + state.sphHints + ' 处');
     lines.push('已见链接(去重库): ' + seen.size + ' 条');
-    if (state.otherLinks.length) {
-      lines.push('-- 白名单外链接 --');
-      lines.push(...state.otherLinks.slice(0, 8).map((u) => '  ' + u));
-    }
+    lines.push('白名单外链接: ' + state.otherLinkCount + ' 条（地址已省略）');
     if (state.log.length) {
       lines.push('-- 最近动作(最多10条) --');
       lines.push(...state.log.slice(0, 10).map((l) => '  ' + l.t + ' ' + l.text));
     }
-    if (state.sphSample) {
-      lines.push('-- 卡片HTML片段 --');
-      lines.push(state.sphSample);
-    }
-    lines.push('-- 结尾 --(把以上全部粘贴发给 AI 即可)');
+    lines.push('未解析卡片结构提示: ' + state.unparsedCardHints + ' 处（HTML 已省略）');
+    lines.push('-- 结尾 --（仅包含结构化统计，可粘贴给支持人员）');
     return lines.join('\n');
   }
 
@@ -698,7 +839,7 @@
         ta.remove();
       }
     }
-    pushLog('info', '诊断已复制到剪贴板,直接粘贴发给助手即可');
+    pushLog('info', 'DIAGNOSTIC_COPIED');
   }
 
   function doRender() {
@@ -711,7 +852,7 @@
     panel.style.display = 'block';
 
     const rows = [];
-    rows.push('<div style="font-weight:500;margin-bottom:8px">织台 · 入库桥自检 v1.4.0</div>');
+    rows.push('<div style="font-weight:500;margin-bottom:8px">织台 · 入库桥自检 v1.5.0</div>');
     rows.push(line('脚本运行', `是(已扫描 ${state.scans} 次)`, true));
     rows.push(line('本地节点', state.nodeOk === null ? '检测中…' : (okNode ? '已连通 17890' : '连不上 17890'), state.nodeOk !== false));
     rows.push(line('鉴权方式', '来源绑定(免密钥)', true));
@@ -726,25 +867,18 @@
       rows.push('<div class="dim">登录后新消息才会同步到页面,再转发视频号测试。</div>');
     }
 
-    rows.push('<button class="copybtn">📋 一键复制诊断(发给助手)</button>');
+    rows.push('<button class="copybtn">📋 复制结构化诊断（不含正文/链接）</button>');
     rows.push('<button class="copybtn" id="resetbtn" style="background:#ba7517;margin-top:6px">🔄 重置已读记录(允许重新入库)</button>');
 
-    if (state.hookRaw.length) {
-      rows.push('<div class="h">webwxsync 原始消息(提取失败/在库,诊断用)</div>');
-      rows.push('<div class="dim" style="font-size:10px;word-break:break-all">' + state.hookRaw.map((r) =>
-        `<div style="margin-top:4px">[${r.t}] MsgType=${r.MsgType} AppMsgType=${r.AppMsgType}<br>${esc(r.fields)}</div>`,
+    if (state.hookShapes.length) {
+      rows.push('<div class="h">webwxsync 消息结构（字段值已省略）</div>');
+      rows.push('<div class="dim" style="font-size:10px;word-break:break-all">' + state.hookShapes.map((shape) =>
+        `<div style="margin-top:4px">[${shape.t}] MsgType=${shape.msgType} AppMsgType=${shape.appMsgType}<br>Fields=${esc(shape.presentFields.join(',') || 'none')}</div>`,
       ).join('') + '</div>');
     }
 
-    if (state.sphSample) {
-      rows.push('<div class="h">卡片 HTML 片段(诊断用)</div>');
-      rows.push('<div class="dim" style="font-size:10px;word-break:break-all">' + esc(state.sphSample) + '</div>');
-    }
-
-    if (state.otherLinks.length) {
-      rows.push('<div class="h">页面上其它链接(不在白名单)</div>');
-      rows.push('<div class="dim">' + state.otherLinks.map((u) => '· ' + esc(u.slice(0, 70))).join('<br>') + '</div>');
-    }
+    rows.push(line('白名单外链接', `${state.otherLinkCount} 条（地址已省略）`, true));
+    rows.push(line('未解析卡片结构', `${state.unparsedCardHints} 处（HTML 已省略）`, true));
 
     rows.push('<div class="h">最近动作</div>');
     rows.push(state.log.length
@@ -764,7 +898,7 @@
         seen = new Set();
         GM_setValue(SEEN_KEY, '[]');
         primed = true;
-        pushLog('info', '已重置去重记录,页面现有链接会被重新入库');
+        pushLog('info', 'SEEN_RESET');
         scheduleScan(null);
       });
     }
@@ -783,13 +917,19 @@
     seen = new Set();
     GM_setValue(SEEN_KEY, '[]');
     primed = true;
-    pushLog('info', '已重置去重记录,页面现有链接会被重新入库');
+    pushLog('info', 'SEEN_RESET');
     scheduleScan(null);
+  });
+  GM_registerMenuCommand('织台·隐私：清理旧版完整 URL 去重项…', () => {
+    const approved = window.confirm('仅删除旧版桥保存的完整 URL 去重项；当前 v2 指纹不受影响。继续吗？');
+    if (!approved) return;
+    try { GM_deleteValue(LEGACY_SEEN_KEY); } catch (e) { return; }
+    pushLog('info', 'LEGACY_SEEN_CLEARED');
   });
   GM_registerMenuCommand('织台·立即扫描并入库当前页面', () => {
     primed = true;
     fullScanQueued = true;
-    pushLog('info', '手动触发全量扫描');
+    pushLog('info', 'MANUAL_SCAN');
     scheduleScan(null);
   });
 

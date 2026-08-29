@@ -1,11 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 const DEFAULT_RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000, 6 * 60 * 60_000];
 const SESSION_RETRY_DELAYS_MS = [2 * 60 * 60_000, 8 * 60 * 60_000, 24 * 60 * 60_000];
 const DEFAULT_BLOCKER_REMINDER_DELAYS_MS = [2 * 60 * 60_000, 8 * 60 * 60_000, 24 * 60 * 60_000];
 const OUTBOX_DRAIN_LIMIT = 5;
+const MAX_SENSITIVE_PNG_BYTES = 2 * 1024 * 1024;
 const CRITICAL_STORAGE_SCOPES = new Set([
   "settings_read",
   "settings_write",
@@ -27,6 +28,7 @@ const BLOCKER_KINDS = new Set([
   "credential_yuanbao",
   "runtime_conditions",
   "creative_failed",
+  "creative_transient_exhausted",
   "publish_failed",
   "filehelper_offline",
   "download_failed",
@@ -71,6 +73,23 @@ function deliveryErrorCode(error) {
   if (/target_unavailable|sender_unavailable|session_unavailable/i.test(text)) return "session_unavailable";
   if (/HTTP\s+4\d\d/i.test(text)) return "client_error";
   return "delivery_failed";
+}
+
+const CLAWBOT_OUTBOUND_ERROR_CODES = new Set([
+  "session_refresh_required",
+  "session_unavailable",
+  "rate_limited",
+  "timeout",
+  "network_unavailable",
+  "client_error",
+  "delivery_failed",
+]);
+
+function normalizedClawbotOutboundErrorCode(value) {
+  const explicit = String(value || "").trim();
+  if (CLAWBOT_OUTBOUND_ERROR_CODES.has(explicit)) return explicit;
+  const derived = deliveryErrorCode(explicit);
+  return CLAWBOT_OUTBOUND_ERROR_CODES.has(derived) ? derived : "delivery_failed";
 }
 
 function blockerKey(kind) {
@@ -130,6 +149,16 @@ function localDateKey(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+function isScannablePng(value) {
+  const buffer = Buffer.isBuffer(value) ? value : value instanceof Uint8Array ? Buffer.from(value) : null;
+  if (!buffer || buffer.length < 24 || buffer.length > MAX_SENSITIVE_PNG_BYTES) return false;
+  if (!buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
+  const width = buffer.readUInt32BE(16);
+  const height = buffer.readUInt32BE(20);
+  return width >= 96 && height >= 96 && width <= 1024 && height <= 1024
+    && Math.abs(width - height) <= Math.max(width, height) * 0.2;
+}
+
 export class NotificationCenter {
   constructor({
     dataDir,
@@ -140,7 +169,9 @@ export class NotificationCenter {
     sessionRetryDelaysMs = SESSION_RETRY_DELAYS_MS,
     blockerReminderDelaysMs = DEFAULT_BLOCKER_REMINDER_DELAYS_MS,
     dedupeWindowMs = 5 * 60_000,
+    emergencyFetch = fetch,
   }) {
+    this.dataDir = dataDir;
     this.settingsPath = `${dataDir}/notification-settings.json`;
     this.deliveryPath = `${dataDir}/notification-deliveries.json`;
     this.ingressPath = `${dataDir}/notification-ingress.json`;
@@ -160,7 +191,9 @@ export class NotificationCenter {
       ? blockerReminderDelaysMs.map((value) => Math.max(1, Number(value) || 1))
       : DEFAULT_BLOCKER_REMINDER_DELAYS_MS;
     this.dedupeWindowMs = Math.max(0, Number(dedupeWindowMs) || 0);
+    this.emergencyFetch = typeof emergencyFetch === "function" ? emergencyFetch : fetch;
     this.timer = null;
+    this.clawbotContextDisposer = null;
     this.tickPromise = null;
     this.sendMutation = Promise.resolve();
     this.ingressMutation = Promise.resolve();
@@ -320,6 +353,19 @@ export class NotificationCenter {
   }
 
   start() {
+    if (!this.clawbotContextDisposer && typeof this.clawbot?.watchContextTokens === "function") {
+      try {
+        this.clawbotContextDisposer = this.clawbot.watchContextTokens((event = {}) => {
+          // A watcher event is only evidence of a real inbound refresh after the
+          // notifier can resolve a fresh context-token mtime. Do not treat a
+          // directory churn event with no matched target as a recovered session.
+          if (!event?.contextUpdatedAt) return;
+          void this.noteClawbotInbound({ contextUpdatedAt: event.contextUpdatedAt }).catch(() => {});
+        });
+      } catch {
+        this.clawbotContextDisposer = null;
+      }
+    }
     if (this.timer) return;
     const run = () => {
       void this.tick().then(() => {
@@ -334,6 +380,8 @@ export class NotificationCenter {
   }
 
   stop() {
+    this.clawbotContextDisposer?.();
+    this.clawbotContextDisposer = null;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     return this.flush();
@@ -368,12 +416,11 @@ export class NotificationCenter {
     const clawbot = this.clawbot ? await this.clawbot.status().catch(() => ({ ready: false, pairedCount: 0, reason: "ClawBot 状态不可读" })) : { ready: false, pairedCount: 0, reason: "未配置" };
     const lastClawbotDelivery = deliveries.find((item) => item?.channel === "clawbot" || item?.channel === "clawbot_media") || null;
     const paired = clawbot.paired === true || Number(clawbot.pairedCount) > 0;
-    const contextRefreshed = clawbot.contextUpdatedAt
-      && this.deliveryHealth.clawbot.lastFailureAt
-      && asDate(clawbot.contextUpdatedAt).getTime() > asDate(this.deliveryHealth.clawbot.lastFailureAt).getTime();
-    let deliveryState = contextRefreshed && this.deliveryHealth.clawbot.deliveryState === "session_refresh_required"
-      ? "unverified"
-      : this.deliveryHealth.clawbot.deliveryState;
+    // A shared context-token file mtime can change because another sender was
+    // active. Session recovery is accepted only through noteClawbotInbound(),
+    // whose callers bind the configured sender/session or validate the signed
+    // inbound route; status() timestamps are informational only.
+    let deliveryState = this.deliveryHealth.clawbot.deliveryState;
     if (clawbot.ready !== true) deliveryState = paired ? "transport_unavailable" : "unpaired";
     const clawbotOperational = clawbot.ready && deliveryState === "ready";
     const ntfyConfigured = this.settings.ntfy.enabled && Boolean(this.settings.ntfy.topic);
@@ -402,6 +449,7 @@ export class NotificationCenter {
       },
       clawbot: {
         ...clawbot,
+        contextUpdatedAt: this.deliveryHealth.clawbot.contextUpdatedAt || clawbot.contextUpdatedAt || null,
         paired,
         transportReady: clawbot.ready === true,
         ready: clawbotOperational,
@@ -493,7 +541,7 @@ export class NotificationCenter {
       await this.persistDeliveryHealth().catch((error) => this.recordStorageIssue("delivery_health_write", error));
     }
     const disabledKinds = [];
-    if (patch.events?.creative === false) disabledKinds.push("creative_failed");
+    if (patch.events?.creative === false) disabledKinds.push("creative_failed", "creative_transient_exhausted");
     if (patch.events?.publishFailure === false) disabledKinds.push("publish_failed");
     if (patch.events?.downloadFailure === false) disabledKinds.push("download_failed");
     if (patch.events?.filehelperOffline === false) disabledKinds.push("filehelper_offline");
@@ -512,6 +560,38 @@ export class NotificationCenter {
 
   async test() {
     return this.send("织台手机通知测试", "测试成功：以后每日学习、入库摘要和重要失败会从这里提醒。", "test");
+  }
+
+  /**
+   * Last-resort phone notification for failures in the ordinary notification
+   * state/WAL itself. It never tries ClawBot, never includes raw errors, and
+   * returns only a low-cardinality result. The supervisor supplies its own
+   * durable/in-memory dedupe before calling this path.
+   */
+  async sendEmergencyNtfy(title, message) {
+    if (!this.settings.ntfy.enabled || !this.settings.ntfy.topic) {
+      return { ok: false, code: "not_configured" };
+    }
+    const endpoint = `${this.settings.ntfy.server}/${encodeURIComponent(this.settings.ntfy.topic)}`;
+    const headers = {
+      "Content-Type": "text/plain; charset=utf-8",
+      Title: encodeURIComponent(String(title || "织台备用通知").slice(0, 180)),
+      Tags: "warning",
+    };
+    if (this.settings.ntfy.accessToken) headers.Authorization = `Bearer ${this.settings.ntfy.accessToken}`;
+    try {
+      const response = await this.emergencyFetch(endpoint, {
+        method: "POST",
+        headers,
+        body: String(message || "").slice(0, 1_000),
+        signal: AbortSignal.timeout(10_000),
+      });
+      return response?.ok === true
+        ? { ok: true, code: "accepted" }
+        : { ok: false, code: "delivery_failed" };
+    } catch {
+      return { ok: false, code: "delivery_failed" };
+    }
   }
 
   async notifyEvent(type, message) {
@@ -546,6 +626,10 @@ export class NotificationCenter {
 
   async runTick(now) {
     await this.drainIngress();
+    // ClawBot 的服务端 context token 只会在收到真实微信入站后刷新。即使当前
+    // 没有待发 outbox，也要在常驻 30 秒 tick 中主动回读一次；否则旧的
+    // session_refresh_required 冷却会一直保留到下一条业务通知或六小时任务。
+    if (this.clawbot) await this.clawbotAttemptAvailability(now);
     const retried = await this.drainOutbox(now);
     let settingsChanged = false;
     for (const result of retried) {
@@ -673,6 +757,15 @@ export class NotificationCenter {
   }
 
   async enqueueAndAttempt(title, message, kind, options) {
+    const cleanKind = String(kind || "");
+    // `send()` 先写持久 ingress，再串行处理。通知设置可能恰好在两步之间
+    // 被关闭，因此必须在真正建 blocker / outbox 的入口再次判断，避免
+    // setTimeout 触发的旧回调在关闭通知后重新创建并发送一条提醒。
+    if (["creative_failed", "creative_transient_exhausted", "creative"].includes(cleanKind)
+      && !this.settings.events.creative) {
+      await options?.onDurable?.();
+      return { ok: true, accepted: false, suppressed: true, disabled: true, kind: cleanKind };
+    }
     const recoveryKinds = RECOVERY_KIND_MAP.get(String(kind || ""));
     if (recoveryKinds?.length) await this.closeBlockersNow({ kinds: recoveryKinds, status: "resolved", reason: String(kind) });
     if (BLOCKER_KINDS.has(String(kind || "")) && options?.trackBlocker !== false) {
@@ -834,7 +927,7 @@ export class NotificationCenter {
     let changed = false;
     for (const blocker of blockers) {
       if (blocker?.status !== "open" || !blocker?.nextReminderAt) continue;
-      if (blocker.kind === "creative_failed" && !this.settings.events.creative) continue;
+      if (["creative_failed", "creative_transient_exhausted"].includes(blocker.kind) && !this.settings.events.creative) continue;
       if (blocker.kind === "publish_failed" && !this.settings.events.publishFailure) continue;
       if (blocker.kind === "download_failed" && !this.settings.events.downloadFailure) continue;
       if (blocker.kind === "filehelper_offline" && !this.settings.events.filehelperOffline) continue;
@@ -908,8 +1001,89 @@ export class NotificationCenter {
     return operation;
   }
 
+  async noteClawbotInbound({ contextUpdatedAt = null } = {}) {
+    const operation = this.sendMutation.then(async () => {
+      const eventAt = asDate(contextUpdatedAt || this.now()).toISOString();
+      const needsSessionReset = this.deliveryHealth.clawbot.deliveryState === "session_refresh_required"
+        || Boolean(this.deliveryHealth.clawbot.cooldownUntil);
+      this.deliveryHealth.clawbot = {
+        ...this.deliveryHealth.clawbot,
+        ...(needsSessionReset ? {
+          deliveryState: "unverified",
+          sessionFailureStage: 0,
+          cooldownUntil: null,
+          lastError: null,
+        } : {}),
+        contextUpdatedAt: eventAt,
+      };
+      await this.persistDeliveryHealth();
+      await this.closeBlockersNow({
+        blockerKeys: ["blocker:clawbot-session-refresh"],
+        status: "resolved",
+        reason: "clawbot_context_refreshed",
+      });
+      // Inbound traffic proves only that OpenClaw refreshed its context token.
+      // It is not proof that a proactive outbound delivery succeeded and it is
+      // not a user acknowledgement of unrelated publishing/business blockers.
+      return { ok: true, deliveryState: this.deliveryHealth.clawbot.deliveryState, contextUpdatedAt: eventAt };
+    });
+    this.sendMutation = operation.catch(() => {});
+    return operation;
+  }
+
+  async noteClawbotOutboundResult({ success = false, errorCode = null } = {}) {
+    const operation = this.sendMutation.then(async () => {
+      const now = asDate(this.now());
+      if (success === true) {
+        this.deliveryHealth.clawbot = {
+          ...this.deliveryHealth.clawbot,
+          deliveryState: "ready",
+          sessionFailureStage: 0,
+          lastSuccessAt: now.toISOString(),
+          lastError: null,
+          cooldownUntil: null,
+        };
+        await this.persistDeliveryHealth();
+        // This is the transport-specific blocker only. Publishing, login and
+        // other business blockers remain open until their own recovery signal.
+        await this.closeBlockersNow({
+          blockerKeys: ["blocker:clawbot-session-refresh"],
+          status: "resolved",
+          reason: "clawbot_outbound_verified",
+        });
+        return { ok: true, deliveryState: "ready" };
+      }
+
+      const normalizedErrorCode = normalizedClawbotOutboundErrorCode(errorCode);
+      const sessionFailureStage = Math.max(0, Number(this.deliveryHealth.clawbot.sessionFailureStage) || 0);
+      const sessionDelay = this.sessionRetryDelaysMs[Math.min(sessionFailureStage, this.sessionRetryDelaysMs.length - 1)];
+      this.deliveryHealth.clawbot = {
+        ...this.deliveryHealth.clawbot,
+        deliveryState: normalizedErrorCode,
+        sessionFailureStage: normalizedErrorCode === "session_refresh_required"
+          ? sessionFailureStage + 1
+          : sessionFailureStage,
+        lastFailureAt: now.toISOString(),
+        lastError: normalizedErrorCode,
+        cooldownUntil: normalizedErrorCode === "session_refresh_required"
+          ? new Date(now.getTime() + sessionDelay).toISOString()
+          : null,
+      };
+      await this.persistDeliveryHealth();
+      return { ok: true, deliveryState: normalizedErrorCode };
+    });
+    this.sendMutation = operation.catch(() => {});
+    return operation;
+  }
+
   async resolveBlockersByKind(kinds, reason = "state_recovered") {
     const operation = this.sendMutation.then(() => this.closeBlockersNow({ kinds, status: "resolved", reason }));
+    this.sendMutation = operation.catch(() => {});
+    return operation;
+  }
+
+  async resolveBlockersByKeys(blockerKeys, reason = "state_recovered") {
+    const operation = this.sendMutation.then(() => this.closeBlockersNow({ blockerKeys, status: "resolved", reason }));
     this.sendMutation = operation.catch(() => {});
     return operation;
   }
@@ -1163,6 +1337,36 @@ export class NotificationCenter {
     return operation;
   }
 
+  /**
+   * 登录二维码等敏感图片只能经已配对的 ClawBot 媒体接口发送。当前 ntfy
+   * 可能是公开主题，绝不把图片或本机路径回退过去；失败时只发无凭证文字。
+   */
+  async sendSensitiveMedia(title, message, png, kind = "publisher_login_qr", { fallbackKey = null } = {}) {
+    if (!isScannablePng(png)) return { ok: false, error: "sensitive_media_invalid", errorCode: "client_error" };
+    const privateDir = join(this.dataDir, "private", "notification-media");
+    await mkdir(privateDir, { recursive: true, mode: 0o700 });
+    await chmod(privateDir, 0o700);
+    const filePath = join(privateDir, `${randomUUID()}.png`);
+    await writeFile(filePath, Buffer.from(png), { flag: "wx", mode: 0o600 });
+    await chmod(filePath, 0o600);
+    let result;
+    try {
+      const operation = this.sendMutation.then(() => this.deliverMediaNow(title, message, filePath, kind));
+      this.sendMutation = operation.catch(() => {});
+      result = await operation;
+    } finally {
+      await unlink(filePath).catch(() => {});
+    }
+    if (result?.ok) return result;
+    const fallback = await this.send(
+      "织台 · 登录二维码等待安全通道",
+      "平台登录二维码已经生成，但 ClawBot 安全会话尚未恢复。织台会自动保留并重试；公开推送不会携带二维码。",
+      `${kind}_waiting`,
+      { dedupeKey: fallbackKey || `${kind}:waiting` },
+    );
+    return { ...result, fallback };
+  }
+
   async deliverMediaNow(title, message, filePath, kind) {
     const now = asDate(this.now());
     const createdAt = now.toISOString();
@@ -1292,18 +1496,6 @@ export class NotificationCenter {
   async clawbotAttemptAvailability(now) {
     const status = await this.clawbot.status().catch(() => ({ ready: false, contextUpdatedAt: null }));
     const contextUpdatedAt = status?.contextUpdatedAt || null;
-    const lastFailureAt = this.deliveryHealth.clawbot.lastFailureAt;
-    if (contextUpdatedAt && lastFailureAt && asDate(contextUpdatedAt).getTime() > asDate(lastFailureAt).getTime()) {
-      this.deliveryHealth.clawbot = {
-        ...this.deliveryHealth.clawbot,
-        deliveryState: "unverified",
-        sessionFailureStage: 0,
-        cooldownUntil: null,
-        lastError: null,
-        contextUpdatedAt,
-      };
-      await this.persistDeliveryHealth();
-    }
     const cooldownUntil = this.deliveryHealth.clawbot.cooldownUntil;
     const blocked = this.deliveryHealth.clawbot.deliveryState === "session_refresh_required"
       && cooldownUntil

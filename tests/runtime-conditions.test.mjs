@@ -21,6 +21,7 @@ function readyInputs(overrides = {}) {
     remote: { paired: false },
     notifications: { clawbot: { operational: false, deliveryState: "unverified" } },
     filehelper: { filehelperPageConnected: true, wechatLoggedIn: true, checkedAt: CHECKED_AT },
+    channelsCard: { online: true, available: true, checkedAt: CHECKED_AT },
     creative: normalizeCreativeConditionReport({
       gpt: { state: "ready", reason: "GPT 已登录" },
       doubao: [{ id: "account-1", label: "豆包账号 1", state: "ready", reason: "可生成" }],
@@ -65,7 +66,7 @@ test("文件传输助手是必需主入口，ClawBot 离线仅影响可选备用
   });
   assert.deepEqual(snapshot.summary, {
     state: "ready",
-    readyCount: 7,
+    readyCount: 8,
     attentionCount: 0,
     unknownCount: 0,
   });
@@ -96,7 +97,27 @@ test("文件传输助手是必需主入口，ClawBot 离线仅影响可选备用
     notifications: { clawbot: { operational: false, deliveryState: "session_refresh_required" } },
   }));
   assert.equal(byId(staleOutbound, "clawbot").state, "optional");
-  assert.match(byId(staleOutbound, "clawbot").reason, /主动通知会话需由用户发一条新消息刷新/);
+  assert.match(byId(staleOutbound, "clawbot").reason, /主动会话待下一条真实私聊刷新/);
+});
+
+test("视频号发布账号就绪不能掩盖卡片解析页断开", () => {
+  const disconnected = buildRuntimeConditions(readyInputs({
+    channelsCard: { online: true, available: false, checkedAt: CHECKED_AT },
+  }));
+  assert.equal(byId(disconnected, "wechat_channels").state, "ready", "发布草稿账号仍是独立状态");
+  assert.equal(byId(disconnected, "wx_channels_card").state, "attention");
+  assert.match(byId(disconnected, "wx_channels_card").reason, /视频号页面未连接/);
+  assert.equal(disconnected.summary.state, "attention");
+  assert.equal(disconnected.summary.attentionCount, 1);
+
+  const offline = buildRuntimeConditions(readyInputs({
+    channelsCard: { online: false, available: false, checkedAt: CHECKED_AT },
+  }));
+  assert.equal(byId(offline, "wx_channels_card").state, "attention");
+  assert.match(byId(offline, "wx_channels_card").reason, /解析引擎离线/);
+
+  const unchecked = buildRuntimeConditions(readyInputs({ channelsCard: {} }));
+  assert.equal(byId(unchecked, "wx_channels_card").state, "unknown");
 });
 
 test("GPT 与多豆包只接受当天上报；账号池任一可用即可继续并逐账号披露", () => {
@@ -173,11 +194,33 @@ test("发布账号按真实登录态汇总，且积压统计原样进入统一�
   assert.deepEqual(snapshot.backlog, backlog);
   assert.deepEqual(snapshot.summary, {
     state: "attention",
-    readyCount: 4,
+    readyCount: 5,
     attentionCount: 3,
     unknownCount: 0,
   });
   assert.doesNotMatch(JSON.stringify(snapshot), /13800138000|13900139000/, "统一状态不得泄露完整手机号");
+});
+
+test("仅有 Cookie 元数据的账号保持待验证，平台明确拒绝后保持登录失效", () => {
+  const unverified = buildRuntimeConditions(readyInputs({
+    publisherAccounts: [
+      { platform: "抖音", authState: "unverified", ready: false, loggedIn: false, loginStatus: "待验证" },
+      { platform: "视频号", authState: "unverified", ready: false, loggedIn: false, loginStatus: "待验证" },
+    ],
+  }));
+  assert.equal(byId(unverified, "douyin").state, "attention");
+  assert.equal(byId(unverified, "wechat_channels").state, "attention");
+  assert.match(byId(unverified, "wechat_channels").reason, /仅发现本地会话/);
+
+  const invalid = buildRuntimeConditions(readyInputs({
+    publisherAccounts: [
+      { platform: "抖音", authState: "verified", ready: true, loggedIn: true, loginStatus: "已登录" },
+      { platform: "视频号", authState: "invalid", ready: false, loggedIn: false, loginStatus: "登录失效" },
+    ],
+  }));
+  assert.equal(byId(invalid, "douyin").state, "ready");
+  assert.equal(byId(invalid, "wechat_channels").state, "attention");
+  assert.match(byId(invalid, "wechat_channels").reason, /认证已失效/);
 });
 
 test("公众号明确权限失败标为 attention，暂时校验失败仍为 unknown", () => {

@@ -14,24 +14,27 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, copyFile, rm, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, copyFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createHttpServer } from "node:http";
 import { createReadStream } from "node:fs";
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
 const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
-const ROOT = join(tmpdir(), `kb_v2b_test_${Date.now()}`);
+const ROOT = await mkdtemp(join(tmpdir(), "kb_v2b_test_"));
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "real.mp4");
 const WATCH_DIR = join(ROOT, "watch");
+const TEMP_HOME = join(ROOT, "home");
+const TEMP_APPDATA = join(TEMP_HOME, "AppData", "Roaming");
+const TEMP_LOCALAPPDATA = join(TEMP_HOME, "AppData", "Local");
 
 let server;
 let baseUrl;
@@ -81,7 +84,9 @@ before(async () => {
   await mkdir(KB_ROOT, { recursive: true });
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(WATCH_DIR, { recursive: true });
-  await copyFile(TEST_MP4, SANDBOX_MP4);
+  await mkdir(TEMP_APPDATA, { recursive: true });
+  await mkdir(TEMP_LOCALAPPDATA, { recursive: true });
+  await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2b-base" });
 
   httpServer = createHttpServer((req, res) => {
     if (req.url.startsWith("/v.mp4")) {
@@ -113,7 +118,18 @@ before(async () => {
   await writeFile(configPath, JSON.stringify(config));
   server = spawn(process.execPath, [AGENT_ENTRY], {
     cwd: repoRoot,
-    env: { ...process.env, ZHITAI_CONFIG_PATH: configPath, ZHITAI_DATA_DIR: DATA_DIR, ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH },
+    env: {
+      ...process.env,
+      HOME: TEMP_HOME,
+      USERPROFILE: TEMP_HOME,
+      APPDATA: TEMP_APPDATA,
+      LOCALAPPDATA: TEMP_LOCALAPPDATA,
+      ZHITAI_CONFIG_PATH: configPath,
+      ZHITAI_DATA_DIR: DATA_DIR,
+      ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(DATA_DIR, "matrix-partitions"),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.unref();
@@ -179,7 +195,7 @@ test("旧 metric_snapshot 1 行迁移后仍 1 行值不丢；重开不增长；�
 
 /* ─────────── 8) P1-9：SSRF IPv6 + 协议降级纯函数 ─────────── */
 test("SSRF：IPv6 unspecified/multicast/映射私网拒绝；HTTPS→HTTP 降级拒绝", async () => {
-  const { isPrivateIp, assertNoProtocolDowngrade } = await import("../local-agent/downloader-adapter.mjs");
+  const { isPrivateIp, assertNoProtocolDowngrade, downloadToTemp } = await import("../local-agent/downloader-adapter.mjs");
   assert.equal(isPrivateIp("::"), true, "IPv6 unspecified 拒绝");
   assert.equal(isPrivateIp("ff02::1"), true, "IPv6 multicast 拒绝");
   assert.equal(isPrivateIp("::1"), true);
@@ -197,6 +213,14 @@ test("SSRF：IPv6 unspecified/multicast/映射私网拒绝；HTTPS→HTTP 降级
   assert.equal(next.hostname, "b.example");
   const next2 = assertNoProtocolDowngrade("https://a.example/x", "https://b.example/y");
   assert.equal(next2.protocol, "https:");
+
+  const privateTempParent = join(ROOT, "private-download-temp");
+  await mkdir(privateTempParent, { recursive: true });
+  await assert.rejects(
+    downloadToTemp("http://127.0.0.1/private.mp4", { dir: privateTempParent }),
+    /ssrf_blocked_private_ip/,
+  );
+  assert.deepEqual(await readdir(privateTempParent), [], "失败下载必须移除整个私有临时目录");
 });
 
 /* ─────────── 7) P1-8：stats.mediaCoverage 语义 ─────────── */

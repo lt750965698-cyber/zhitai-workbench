@@ -1,6 +1,6 @@
 # 织台（Zhitai Workbench）
 
-> Public Preview · v0.1.0-alpha.1
+> Public Preview · v0.2.0-alpha.1
 
 ![织台：本地优先的内容自动化工作台](public/og.png)
 
@@ -18,6 +18,7 @@
 - 仅绑定回环地址的本地节点；
 - SQLite 索引、内容包、任务队列、事件与状态接口；
 - 知识库搜索、筛选、媒体预览、导入记录、修正历史和导出契约；
+- BagIt 1.0 兼容的可验证备份、隔离恢复、新根迁移与可恢复回滚；
 - 固定命令的服务管理、来源白名单、路径边界、可配置且配置后强制的 HMAC 校验，以及公开发布和部分服务控制的确认门；
 - 面向外置采集、分析、生成、通知和发布引擎的适配层。
 
@@ -29,12 +30,25 @@
 | --- | --- | --- |
 | 本地节点与知识库 | 可运行 / Alpha | 本地任务、SQLite、内容包、检索与媒体接口可用；迁移前应自行备份 |
 | Web 工作台 | 可运行 / Alpha | 可查看和操作本地节点；部分桌面能力只在 Electron 外壳中可用 |
-| 桌面外壳 | Public Preview | 主要在 macOS 开发验证；尚无稳定、签名的跨平台发行包 |
+| 桌面外壳 | Public Preview | 主要在 macOS 开发验证；提供 Windows 10 22H2/Windows 11 x64 预览包，但暂未代码签名 |
 | 采集 | 适配器预览 | 分享链接或媒体解析通常需要外置工具、登录态与平台许可 |
 | 视频分析与生成 | 适配器预览 | ASR、OCR、镜头、视觉模型和生成服务均为可选外置能力；缺失字段必须明确标为 unavailable |
 | 多平台发布 | 实验性 | 需要外置发布器和各平台登录；默认优先草稿，公开发布必须显式确认 |
 | 闲鱼、X 收藏、手机控制与通知 | 实验性 | 依赖外置程序或已登录浏览器；可能受平台规则、风控和接口变化影响 |
 | 安全性 | 预览阶段 | 已实现多项本地边界与审核门，但尚未完成独立安全审计 |
+
+## Windows 预览版
+
+Windows 10 22H2 和 Windows 11 x64 用户可从 [v0.2.0-alpha.1 GitHub Release](https://github.com/lt750965698-cyber/zhitai-workbench/releases/tag/v0.2.0-alpha.1) 下载当前用户安装包或便携包。运行前请用同一 Release 中的 `SHA256SUMS.txt` 核对文件哈希。
+
+该安装包是未签名的公开预览版，Windows SmartScreen 可能显示“未知发布者”。当前支持本地工作台、知识库和内容/人工审核流程；原生第三方发布、外置服务自动安装/管理、微信与浏览器自动化会以 `unsupported_on_windows_preview` 失败关闭。安装、校验、数据目录和源码构建步骤见 [Windows 预览版指南](docs/WINDOWS.md)。
+
+## v0.2.0-alpha.1 最新修复
+
+- 可验证备份、隔离恢复、新根迁移和可恢复回滚，不覆盖用户现有数据；
+- 脱敏隐私诊断快照，用稳定错误码和经过缩减的环境证据帮助排查；
+- 统一内容生命周期，明确收件、入库、生成、审核、排期、回执与对账状态；
+- 19 个场景、352 条断言的整链离线 E2E；Windows CI 使用进程级断网护栏，Linux Docker CI 另加内核级断网。该套件使用合成媒体和模拟回执，不代表真实平台已通过验收。
 
 ## 快速开始
 
@@ -43,7 +57,7 @@
 - Node.js 22.13.0 或更高版本；
 - pnpm 11.19.0 或更高版本（建议通过 Corepack 启用）；
 - Git；
-- 当前支持的完整开发流程是 macOS 或带 POSIX shell 的环境。Linux 可用于核心与 CI 测试；原生 Windows 下本地节点可以尝试运行，但 dev、build、start 脚本的环境变量语法、桌面脚本和部分媒体探测尚未适配。
+- macOS 是主要开发验证环境；Linux 可用于 Web/Node.js 核心和 CI 测试；Windows 10 22H2/Windows 11 x64 可使用公开预览包，也可按 [Windows 预览版指南](docs/WINDOWS.md) 在 PowerShell 中构建。Windows 的平台自动化仍受上述支持边界限制。
 
 ### 1. 获取并安装
 
@@ -95,10 +109,29 @@ curl http://127.0.0.1:17890/health
 
 ~~~bash
 pnpm lint
+pnpm test:backup
+pnpm run test:offline-e2e
 pnpm test
 ~~~
 
-pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集成不应在默认测试中访问真实账号或真实内容。
+pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集成不应在默认测试中访问真实账号或真实内容。`test:offline-e2e` 使用全网络拒绝、临时 HOME/SQLite、合成媒体和假平台回执验证整链故障恢复，并在 `.artifacts/offline-e2e/` 生成机器可读 JSON。
+
+## 可验证备份、恢复与迁移
+
+织台提供 BagIt 1.0 兼容的目录型备份，使用 SQLite Online Backup API（旧版 Node 自动回退到 `VACUUM INTO`）生成包含已提交 WAL 的一致性单文件快照，并为内容包、队列、审计、生成、排期和脱敏平台回执生成逐文件 SHA-256。恢复始终先进入新建临时隔离目录；迁移只允许写入不存在的新根，且会暂停生成队列并把可执行发布排期改为待人工重新确认。
+
+~~~bash
+pnpm backup create --data-dir <dataDir> --knowledge-root <内容库> --output <新备份目录>
+pnpm backup verify --backup <备份目录>
+pnpm backup restore --backup <备份目录>
+pnpm backup preview --backup <备份目录> --target-root <新迁移根>
+pnpm backup migrate --backup <备份目录> --target-root <不存在的新迁移根>
+pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
+~~~
+
+创建和验证还会核对 BagIt `Payload-Oxum`、允许路径、敏感字段、SQLite 完整性、资产引用及业务计数。迁移会冻结发布排期、分析、生成和活动导入队列；无法解析的活动路径会阻止启用，失败副本与回滚副本都只做可恢复隔离改名，不删除当前用户数据。
+
+完整命令、范围、排除策略、迁移/回滚和 RPO/RTO 见 [备份与恢复指南](docs/BACKUP_RESTORE.md)。
 
 ## 架构
 
@@ -129,6 +162,7 @@ pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集�
 - 收件和遥控入口在配置共享密钥后会对每个请求强制校验 HMAC、时间窗和 nonce，不能通过省略签名头降级。明确未配置密钥时，仅接受精确白名单 Origin，或来自回环地址且没有 Origin 的同用户本机客户端。
 - 素材路径需要经过允许根目录和真实路径校验，避免符号链接逃逸。
 - 凭据应放在系统钥匙串、受保护的本地文件或进程环境中，不进入仓库、日志、状态接口或导出包。
+- 诊断通道仅持久化固定 schema 的有界计数，不保存正文、HTML、Cookie、Token、手机号、完整 URL 或绝对路径；详见 [诊断隐私策略](docs/DIAGNOSTICS_PRIVACY.md)。
 - 公开发布和部分受管理服务操作已有显式确认门；其他变更接口仍依赖回环地址、Origin 与同用户信任假设，尚未完成统一授权审计。
 - 使用者必须对所有高影响操作保留人工审核：核对内容权利、事实、标题、账号、平台、可见范围和计划时间。
 - 平台草稿不等于公开发布成功；CLI 或接口返回成功也不能替代平台端人工核验。
@@ -162,14 +196,31 @@ pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集�
 
 许可证不明确、限制再分发或与本项目发行方式不兼容的源码和二进制不得打包进织台发行物。尤其不要复制、分叉或捆绑未提供明确许可证的浏览器脚本；织台只保留可替换的接口契约。
 
+## 运营指标与复盘
+
+运营指标合同复用知识库、`metric_snapshot`、生成成片、发布回执和创作审核结构；补充四态平台指标、成片到多平台帖子的血缘、1h/24h/7d/30d 快照、反馈漏斗、单变量实验卡及 D7/D14/D30 复盘。`submitted` / `success` 只表示平台接收，绝不自动计作公开。
+
+- 合同与口径：[docs/OPERATIONS_METRICS_CONTRACT.md](docs/OPERATIONS_METRICS_CONTRACT.md)
+- 后续接入：[docs/OPERATIONS_INTEGRATION.md](docs/OPERATIONS_INTEGRATION.md)
+- 合成示例：[docs/examples/operations-review.synthetic.md](docs/examples/operations-review.synthetic.md)
+- 只读报告：`node scripts/operations-report.mjs --help`
+- 专项测试：`pnpm run test:ops`
+
+合成模式只能用于隔离验收，并在报告中强制标记；它不登录平台、不修改账号、不执行真实发布，也不能代表真实运营结果。
+
 ## 文档
 
 - [开始使用](docs/GETTING_STARTED.md)
 - [架构与信任边界](docs/ARCHITECTURE.md)
+- [统一内容生命周期契约](docs/CONTENT_LIFECYCLE.md)
 - [第三方集成指南](docs/INTEGRATION.md)
 - [知识库字段契约](docs/VIDEO_KNOWLEDGE_SCHEMA.md)
+- [可验证备份、恢复与迁移](docs/BACKUP_RESTORE.md)
 - [安全模型](docs/SECURITY_MODEL.md)
+- [诊断隐私与保留策略](docs/DIAGNOSTICS_PRIVACY.md)
 - [内容与授权政策](docs/CONTENT_POLICY.md)
+- [离线整链 E2E 与故障注入](docs/OFFLINE_E2E.md)
+- [Windows 预览版安装与支持边界](docs/WINDOWS.md)
 - [路线图](ROADMAP.md)
 - [变更记录](CHANGELOG.md)
 - [支持](SUPPORT.md)
@@ -183,7 +234,7 @@ pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集�
 
 ## English summary
 
-Zhitai Workbench is a local-first, Chinese-first public preview for organizing media ingestion, a searchable knowledge base, task state, human review, and optional publishing adapters.
+Zhitai Workbench v0.2.0-alpha.1 is a local-first, Chinese-first public preview for organizing media ingestion, a searchable knowledge base, task state, human review, and optional publishing adapters. An unsigned Windows preview is available for Windows 10 22H2 and Windows 11 x64; see the [Windows guide](docs/WINDOWS.md) for installation and current platform limitations.
 
 The repository contains a runnable local control plane and UI. Platform ingestion, media analysis, generation, remote control, notifications, and publishing require separately obtained and configured engines or services. They are not bundled under Zhitai's MIT license. Keep the local agent on loopback, review every high-impact action, and use only content and accounts you own or are authorized to operate.
 

@@ -61,7 +61,8 @@ test("权利、分析式配音和主题错配会转入完全原创补救", () =>
   assert.equal(result.workflow.shots[0].sourceStartSeconds, null);
   assert.equal(result.workflow.shots[0].sourceEndSeconds, null);
   assert.match(result.workflow.shots[0].narration, /墙面装饰板/);
-  assert.match(result.workflow.shots[0].narration, /更清楚耐看|效果才更完整/);
+  assert.match(result.workflow.shots[0].narration, /中心线|分格比例/);
+  assert.doesNotMatch(result.workflow.shots[0].narration, /更清楚耐看|突出(?:一个)?核心细节|效果才更完整/);
   assert.match(result.workflow.shots[0].gptImagePrompt, /从空白画布重新设计/);
   assert.match(result.workflow.shots[0].seedancePrompt, /不得上传或引用来源视频/);
   assert.doesNotMatch(result.workflow.shots[0].narration, /我怕你|听觉钩子|视频前3秒/);
@@ -104,15 +105,63 @@ test("新分析在来源权利未确认时直接产出原创模式，不等待�
   assert.doesNotMatch(workflow.originality.originalVoiceover, /这一镜|观察|整体关系|自然收束|叙事目的/);
 });
 
-test("主题事实不足时使用不虚构的通用利益点旁白", () => {
+test("主题事实不足时使用不虚构的通用空间旁白", () => {
   const workflow = buildSeedanceWorkflow({
     sourceDurationSeconds: 10,
     sourceShots: [{ evidence: "只有时间边界，没有可靠画面语义" }],
   });
   assert.equal(workflow.mode, "full_original_recovery");
   assert.match(workflow.originality.originalVoiceover, /这个主题/);
-  assert.match(workflow.originality.originalVoiceover, /重点、比例和光线/);
+  assert.match(workflow.originality.originalVoiceover, /使用顺序|主要动线/);
   assert.doesNotMatch(workflow.originality.originalVoiceover, /一家四口|卧室|客厅|户型|这一镜|观察|叙事目的/);
+});
+
+test("老破小全屋主题优先于开放式厨房，并在既有严格计划漂移时重新补救", () => {
+  const sourceTitle = "30㎡老破小翻新：小户型改造加入开放式厨房";
+  const kitchenPlan = remediateToOriginalWorkflow(mismatchedWorkflow(), {
+    title: "开放式厨房改造",
+  }).workflow;
+  assert.match(kitchenPlan.originality.originalTitle, /厨房/);
+
+  const repaired = remediateToOriginalWorkflow(kitchenPlan, { title: sourceTitle });
+  assert.equal(repaired.changed, true, "来源主主题改变后，旧严格原创计划也必须重新补救");
+  assert.equal(repaired.workflow.originality.originalTitle, "小户型空间改造：动线、采光与收纳布局");
+  assert.ok(repaired.workflow.shots.every((shot) => shot.originalDesignReference.subject === "小户型空间改造"));
+  assert.match(repaired.workflow.originality.originalVoiceover, /动线/);
+  assert.match(repaired.workflow.originality.originalVoiceover, /采光|自然光/);
+  assert.match(repaired.workflow.originality.originalVoiceover, /收纳/);
+  assert.match(repaired.workflow.originality.originalVoiceover, /功能分区/);
+  assert.doesNotMatch(repaired.workflow.originality.originalVoiceover, /更清楚耐看|突出(?:一个)?核心细节|效果才更完整/);
+
+  const unchanged = remediateToOriginalWorkflow(repaired.workflow, { title: sourceTitle });
+  assert.equal(unchanged.changed, false, "主题正确的新模板必须保持幂等");
+  assert.equal(unchanged.workflow, repaired.workflow);
+});
+
+test("旧卫生间空泛模板会迁移为四区动线与具体收纳，新模板保持幂等", () => {
+  const sourceTitle = "4㎡小户型卫生间改造 #卫生间收纳";
+  const current = remediateToOriginalWorkflow(mismatchedWorkflow(), { title: sourceTitle }).workflow;
+  const legacy = structuredClone(current);
+  legacy.originality.originalTitle = "小户型卫生间布局怎么做得更清楚耐看？";
+  legacy.originality.originalVoiceover = [
+    "想让小户型卫生间布局更清楚耐看，先统一重点、比例和光线。",
+    "不用堆满元素，突出一个核心细节，信息会更清楚。",
+    "色彩、尺度和光线协调，效果才更完整。",
+  ].join(" ");
+  legacy.shots[0].narration = legacy.originality.originalVoiceover;
+
+  const migrated = remediateToOriginalWorkflow(legacy, { title: sourceTitle });
+  assert.equal(migrated.changed, true);
+  assert.equal(migrated.workflow.originality.originalTitle, "小户型卫生间布局：四区动线与收纳");
+  assert.match(migrated.workflow.originality.originalVoiceover, /洗漱/);
+  assert.match(migrated.workflow.originality.originalVoiceover, /马桶/);
+  assert.match(migrated.workflow.originality.originalVoiceover, /淋浴/);
+  assert.match(migrated.workflow.originality.originalVoiceover, /泡澡/);
+  assert.doesNotMatch(migrated.workflow.originality.originalVoiceover, /更清楚耐看|突出(?:一个)?核心细节|效果才更完整/);
+
+  const unchanged = remediateToOriginalWorkflow(migrated.workflow, { title: sourceTitle });
+  assert.equal(unchanged.changed, false);
+  assert.equal(unchanged.workflow, migrated.workflow);
 });
 
 test("拍摄占位描述会按标题主题重写，已补救旧计划也能再次纠正", () => {
@@ -140,7 +189,9 @@ test("拍摄占位描述会按标题主题重写，已补救旧计划也能再�
   const bathroomRepair = remediateToOriginalWorkflow(repeatedBathroom, { title: "4㎡小户型卫生间改造 #卫生间收纳" });
   assert.equal(bathroomRepair.changed, true);
   assert.match(bathroomRepair.workflow.originality.originalTitle, /小户型卫生间布局/);
+  assert.match(bathroomRepair.workflow.originality.originalVoiceover, /洗漱|马桶|淋浴|泡澡/);
   assert.doesNotMatch(bathroomRepair.workflow.originality.originalVoiceover, /我家|硬是|塞进/);
+  assert.doesNotMatch(bathroomRepair.workflow.originality.originalVoiceover, /更清楚耐看|突出(?:一个)?核心细节|效果才更完整/);
 });
 
 test("原创补救会同步持久化 DB、执行提示词和新旁白", async () => {
@@ -176,6 +227,41 @@ test("原创补救会同步持久化 DB、执行提示词和新旁白", async ()
     assert.match(await readFile(join(packagePath, "reproduction.md"), "utf8"), /完全原创补救/);
   } finally {
     db.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("原创补救 CAS 并发写入相同计划时幂等收敛", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zhitai-originality-cas-"));
+  const packagePath = join(root, "package");
+  const dbPath = join(root, "kb.sqlite");
+  await mkdir(packagePath, { recursive: true });
+  await writeFile(join(packagePath, "reproduction.md"), "# 旧复刻说明\n", "utf8");
+  const seed = openKbDb(dbPath);
+  try {
+    const now = new Date().toISOString();
+    seed.prepare("INSERT INTO video_asset (id,title,package_path,created_at,updated_at) VALUES (?,?,?,?,?)")
+      .run("asset-cas", "墙面装饰板", packagePath, now, now);
+    seed.prepare("INSERT INTO remake_plan (asset_id,plan_json,provider,created_at) VALUES (?,?,?,?)")
+      .run("asset-cas", JSON.stringify({ seedanceWorkflow: mismatchedWorkflow() }), "legacy", now);
+  } finally {
+    seed.close();
+  }
+  const first = openKbDb(dbPath, { migrateSchema: false });
+  const second = openKbDb(dbPath, { migrateSchema: false });
+  try {
+    const workflow = remediateToOriginalWorkflow(mismatchedWorkflow(), { title: "墙面装饰板" }).workflow;
+    const [left, right] = await Promise.all([
+      persistOriginalityRemediation(first, "asset-cas", workflow),
+      persistOriginalityRemediation(second, "asset-cas", workflow),
+    ]);
+    assert.equal(left.ok, true);
+    assert.equal(right.ok, true);
+    const persisted = JSON.parse(first.prepare("SELECT plan_json FROM remake_plan WHERE asset_id='asset-cas'").get().plan_json);
+    assert.equal(persisted.seedanceWorkflow.originality.status, "remediated");
+  } finally {
+    first.close();
+    second.close();
     await rm(root, { recursive: true, force: true });
   }
 });

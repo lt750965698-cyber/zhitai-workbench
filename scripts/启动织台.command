@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+umask 077
 
 # 织台 V1 统一启动器（Finder 双击可用）
 # 一次启动/检查：本地节点 17890、织台页面、ai-goofish 8000、xianyu-auto-reply 18090、
@@ -9,8 +10,9 @@ set -euo pipefail
 script_dir="${0:A:h}"
 project_dir="${script_dir:h}"
 home_dir="${HOME:-$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory | awk '{print $2}')}"
-log_dir="${home_dir}/Library/Logs"
-mkdir -p "${log_dir}"
+log_dir="${home_dir}/Library/Logs/zhitai"
+mkdir -p -m 700 "${log_dir}"
+chmod 700 "${log_dir}" 2>/dev/null || true
 
 agent_log="${log_dir}/zhitai-launcher-agent.log"
 ui_log="${log_dir}/zhitai-launcher-ui.log"
