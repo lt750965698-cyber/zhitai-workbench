@@ -4,7 +4,7 @@ import { createHash, createHmac } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { syntheticMp4Buffer } from "./fixtures/synthetic-mp4.mjs";
@@ -26,7 +26,7 @@ test("local agent integrates content packages, approval gates, and exclusive ser
   const temporaryHome = join(sandbox, "home");
   const temporaryAppData = join(temporaryHome, "AppData", "Roaming");
   const temporaryLocalAppData = join(temporaryHome, "AppData", "Local");
-  const publicKnowledgeBase = `…/${basename(knowledgeBase)}`;
+  const publicKnowledgeBase = "本机内容库";
   const sourceAsset = join(sandbox, "source-video.mp4");
   const publishAsset = join(knowledgeBase, "publish-video.mp4");
   const firstServicePidFile = join(sandbox, "service-one.pid");

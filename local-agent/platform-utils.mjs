@@ -1,4 +1,5 @@
 import { spawn as spawnChild } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as nativePath from "node:path";
@@ -85,7 +86,9 @@ export async function resolveExecutablePath(command, options = {}) {
   const checkAccess = options.accessImpl || access;
   for (const candidate of executableCandidates(command, options)) {
     try {
-      await checkAccess(candidate);
+      await checkAccess(candidate, (options.platform || process.platform) === "win32"
+        ? fsConstants.F_OK
+        : fsConstants.X_OK);
       return candidate;
     } catch {
       // Continue through the explicit PATH/PATHEXT candidate list.

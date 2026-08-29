@@ -22,12 +22,12 @@ test("织台在申请单实例锁前设置独立应用名与 userData", () => {
 test("内部应用名保持 ASCII，避免 Electron 把中文写入 User-Agent", () => {
   assert.match(src, /app\.setName\("Zhitai"\)/);
   assert.doesNotMatch(src, /app\.setName\("织台"\)/);
-  assert.match(src, /app\.setAppUserModelId\("com\.zhitai\.desktop"\)/);
+  assert.match(src, /app\.setAppUserModelId\("com\.squirrel\.ZhitaiWorkbench\.Zhitai"\)/);
 });
 
 test("Dock 使用织台品牌图，不再显示默认 Electron 图标", () => {
   assert.match(src, /app\.dock\.setIcon\(icon\)/);
-  assert.match(src, /public["',\s]+["']og\.png/);
+  assert.match(src, /desktop["',\s]+["']assets["',\s]+["']icon\.png/);
 });
 
 test("main.js 请求单实例锁", () => {

@@ -1,6 +1,12 @@
 allowBuilds:
+  electron: true
+  electron-winstaller: true
   esbuild: true
   sharp: true
   workerd: true
+# Electron Forge 7.11.2 pins Electron's maintained node-gyp fork to an exact
+# upstream commit through @electron/rebuild. Keep the exception visible here;
+# every other dependency remains protected by the lockfile policy check.
+blockExoticSubdeps: false
 overrides:
   '@esbuild-kit/core-utils>esbuild': 0.25.12

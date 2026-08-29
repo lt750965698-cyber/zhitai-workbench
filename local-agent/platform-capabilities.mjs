@@ -7,6 +7,8 @@ export function platformCapabilities({ platform = process.platform, env = proces
     windowsPreview,
     localCore: true,
     browserStudios: true,
+    browserAutomation: !windowsPreview,
+    creativeAutomation: !windowsPreview,
     backgroundPublishing: !windowsPreview,
     credentialAutomation: !windowsPreview,
     externalServiceControl: !windowsPreview,

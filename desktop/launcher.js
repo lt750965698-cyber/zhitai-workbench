@@ -11,17 +11,13 @@ const path = require("node:path");
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
+const { desktopDataRoot, desktopLogRoot, desktopRuntimeRoot } = require("./platform.js");
 
 const HOME = os.homedir();
-const RUNTIME_ROOT = path.resolve(process.env.ZHITAI_RUNTIME_ROOT
-  || path.join(HOME, ".local", "share", "zhitai-runtime"));
+const RUNTIME_ROOT = path.resolve(desktopRuntimeRoot());
 const APPLICATIONS_ROOT = path.resolve(process.env.ZHITAI_APPLICATIONS_DIR
   || path.join(HOME, "Applications"));
-const DEFAULT_LOG_DIR = process.platform === "win32"
-  ? path.join(process.env.LOCALAPPDATA || path.join(HOME, "AppData", "Local"), "Zhitai", "logs")
-  : process.platform === "darwin"
-    ? path.join(HOME, "Library", "Logs", "zhitai")
-    : path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "zhitai", "logs");
+const DEFAULT_LOG_DIR = desktopLogRoot();
 
 // Finder 的 PATH 通常很短：优先显式配置和织台稳定入口，再检查标准安装位置。
 // Electron 自身可通过 ELECTRON_RUN_AS_NODE 作为最终后备，不依赖开发机工具目录。
@@ -36,14 +32,14 @@ const NODE_BIN = [
 const WEB_MARKERS = ["织台 · 内容自动化工作台", "workbench-shell"];
 const xhsStartLockDbs = new Map();
 
-function electronRunAsNodeEnv(nodeBin) {
+function electronRunAsNodeEnv(nodeBin, force = false) {
   let resolvedNodeBin = String(nodeBin || "");
   try { resolvedNodeBin = fs.realpathSync(resolvedNodeBin); } catch (_) { /* 按原路径继续判定 */ }
 
   // 开发版的 runtime/bin/node 可能是指向另一份 Electron 的符号链接，
   // 因此不能只和当前打包应用的 process.execPath 比较。
   const resolvedName = path.basename(resolvedNodeBin).replace(/\.exe$/i, "");
-  if (/^electron$/i.test(resolvedName)) return { ELECTRON_RUN_AS_NODE: "1" };
+  if (force || /^electron$/i.test(resolvedName)) return { ELECTRON_RUN_AS_NODE: "1" };
 
   if (process.versions.electron) {
     let electronExecPath = process.execPath;
@@ -55,10 +51,15 @@ function electronRunAsNodeEnv(nodeBin) {
 
 let ctx = {
   projectDir: path.resolve(__dirname, ".."),
+  runtimeRoot: RUNTIME_ROOT,
+  dataDir: desktopDataRoot(),
   runtimeScript: path.join(HOME, ".local/share/zhitai-runtime/scripts/run-local-agent.command"),
+  localAgentScript: path.join(__dirname, "..", "local-agent", "server.mjs"),
   analyzerScript: path.join(__dirname, "..", "scripts", "video-analysis-server.mjs"),
   logDir: DEFAULT_LOG_DIR,
   nodeBin: NODE_BIN,
+  packaged: false,
+  windowsPreview: false,
   xhsAccountsDir: null,
   xhsLegacyCookiesPath: null,
   xhsBinary: null,
@@ -87,7 +88,7 @@ async function httpUp(url, timeoutMs = 2000) {
 
 async function isZhitaiPage(port, timeoutMs = 1500) {
   try {
-    const res = await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) return false;
     const text = await res.text();
     return WEB_MARKERS.some((m) => text.includes(m));
@@ -136,9 +137,45 @@ function spawnDetached(command, args, logName, options = {}) {
     stdio: ["ignore", fd, fd],
   });
   if (child && typeof child.on === "function") {
-    child.on("exit", () => { try { fs.closeSync(fd); } catch (_) {} });
+    const closeLog = () => { try { fs.closeSync(fd); } catch (_) {} };
+    child.on("error", (error) => {
+      child.zhitaiSpawnError = String(error?.code || error?.message || "spawn_failed");
+      closeLog();
+    });
+    child.on("exit", closeLog);
   }
   return childLike(child);
+}
+
+function loopbackEnvironment(extra = {}) {
+  return {
+    ...process.env,
+    PATH: path.dirname(ctx.nodeBin) + (process.env.PATH ? path.delimiter + process.env.PATH : ""),
+    ...electronRunAsNodeEnv(ctx.nodeBin, ctx.packaged),
+    NO_PROXY: [
+      ...new Set([
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        ...String(process.env.NO_PROXY || "").split(",").map((value) => value.trim()).filter(Boolean),
+      ]),
+    ].join(","),
+    ...extra,
+  };
+}
+
+function spawnLocalAgent() {
+  if (!ctx.windowsPreview) return spawnDetached("/bin/zsh", [ctx.runtimeScript], "agent");
+  return spawnDetached(ctx.nodeBin, [ctx.localAgentScript], "agent", {
+    cwd: ctx.projectDir,
+    env: loopbackEnvironment({
+      ZHITAI_WINDOWS_PREVIEW: "1",
+      ZHITAI_RUNTIME_ROOT: ctx.runtimeRoot,
+      ZHITAI_DATA_DIR: ctx.dataDir,
+      ZHITAI_CONFIG_PATH: path.join(ctx.runtimeRoot, "config.local.json"),
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+    }),
+  });
 }
 
 function xhsDefaultConfig() {
@@ -267,6 +304,18 @@ function releaseXhsStartLock(lockPath) {
 
 // 服务清单（真实路径）
 function serviceDefs() {
+  const localAgent = {
+    id: "local-agent", label: "本地节点", port: 17890,
+    url: "http://127.0.0.1:17890/health",
+    start: () => spawnLocalAgent(),
+  };
+  const web = {
+    id: "web", label: "织台页面", port: null,
+    url: null,
+    start: () => spawnWeb(),
+  };
+  if (ctx.windowsPreview) return [localAgent, web];
+
   const xhsConfig = xhsDefaultConfig();
   const mptRoot = path.resolve(process.env.ZHITAI_MPT_ROOT
     || path.join(RUNTIME_ROOT, "engines", "MoneyPrinterTurbo"));
@@ -277,11 +326,7 @@ function serviceDefs() {
   const wechatMpToolsRoot = path.resolve(process.env.ZHITAI_WECHAT_MP_TOOLS_ROOT
     || path.join(RUNTIME_ROOT, "engines", "wechat-mp-tools-current"));
   return [
-    {
-      id: "local-agent", label: "本地节点", port: 17890,
-      url: "http://127.0.0.1:17890/health",
-      start: () => spawnDetached("/bin/zsh", [ctx.runtimeScript], "agent"),
-    },
+    localAgent,
     {
       id: "analyzer", label: "视频分析代理", port: 17900,
       url: "http://127.0.0.1:17900/health",
@@ -369,47 +414,44 @@ function serviceDefs() {
         }
       },
     },
-    {
-      id: "web", label: "织台页面", port: null,
-      url: null,
-      start: () => spawnWeb(),
-    },
+    web,
   ];
 }
 
-// 直接用明确 Node 启动 vinext CLI，绕过 npm 生命周期在 Finder 干净环境下偶发卡住的问题。
-// PATH 仍前缀 node 目录，供 vinext/插件启动子进程使用。
-// NO_PROXY 覆盖三个回环地址：避免本机代理劫持 localhost/127.0.0.1/::1 导致页面 500。
+// 安装版直接启动 Vinext 生成的自包含 standalone Node 服务，不依赖
+// npm 生命周期或根 node_modules，也不会尝试在 Program Files 中写构建缓存。
 function spawnWeb() {
   const fs = require("node:fs");
   const fd = openLogFd(logFile("ui"));
+  const standaloneDir = path.join(ctx.projectDir, "dist", "standalone");
+  const standaloneEntry = path.join(standaloneDir, "server.js");
   const vinextCli = path.join(ctx.projectDir, "node_modules", "vinext", "dist", "cli.js");
-  const productionBuild = fs.existsSync(path.join(ctx.projectDir, "dist", "server", "BUILD_ID"));
+  const productionBuild = fs.existsSync(standaloneEntry);
+  if (ctx.packaged && !productionBuild) {
+    try { fs.closeSync(fd); } catch (_) {}
+    throw new Error("packaged_standalone_server_missing");
+  }
   // 安装版固定使用 3001，永远不探测/占用 3000（该端口属于用户的其它应用）。
-  // 源码调试若还没有 dist 才回退 dev；日常安装版始终运行已复制到 runtime 的生产构建。
+  // 源码调试若还没有 standalone 才回退 dev。
   const args = productionBuild
-    ? [vinextCli, "start", "--port", "3001", "--hostname", "127.0.0.1"]
+    ? [standaloneEntry]
     : [vinextCli, "dev", "--port", "3001", "--hostname", "127.0.0.1"];
   const child = ctx.spawn(ctx.nodeBin, args, {
-    cwd: ctx.projectDir,
-    env: {
-      ...process.env,
-      PATH: path.dirname(ctx.nodeBin) + (process.env.PATH ? path.delimiter + process.env.PATH : ""),
-      ...electronRunAsNodeEnv(ctx.nodeBin),
-      NO_PROXY: [
-        ...new Set([
-          "localhost",
-          "127.0.0.1",
-          "::1",
-          ...String(process.env.NO_PROXY || "").split(",").map((s) => s.trim()).filter(Boolean),
-        ]),
-      ].join(","),
-      WRANGLER_LOG_PATH: path.join(ctx.projectDir, ".wrangler", "wrangler.log"),
-    },
+    cwd: productionBuild ? standaloneDir : ctx.projectDir,
+    env: loopbackEnvironment({
+      PORT: "3001",
+      HOST: "127.0.0.1",
+      ZHITAI_RUNTIME_ROOT: ctx.runtimeRoot,
+    }),
     stdio: ["ignore", fd, fd],
   });
   if (child && typeof child.on === "function") {
-    child.on("exit", () => { try { fs.closeSync(fd); } catch (_) {} });
+    const closeLog = () => { try { fs.closeSync(fd); } catch (_) {} };
+    child.on("error", (error) => {
+      child.zhitaiSpawnError = String(error?.code || error?.message || "spawn_failed");
+      closeLog();
+    });
+    child.on("exit", closeLog);
   }
   return childLike(child);
 }
@@ -437,14 +479,23 @@ async function doEnsure(defId) {
 
   if (def.id === "web") {
     const port = await scanWebPort();
-    if (port) { state.online = true; state.port = port; state.url = `http://localhost:${port}`; return state; }
-    const child = def.start();
-    if (!child) { state.error = "未找到 npm，无法启动织台页面"; return state; }
+    if (port) { state.online = true; state.port = port; state.url = `http://127.0.0.1:${port}`; return state; }
+    let child;
+    try { child = def.start(); }
+    catch (error) {
+      state.error = `启动失败：${String(error?.message || error)}`;
+      return state;
+    }
+    if (!child) { state.error = "无法启动织台页面"; return state; }
     owned.set(def.id, child);
     state.owned = true;
     for (let i = 0; i < 40; i++) {
+      if (child.zhitaiSpawnError) {
+        state.error = `启动失败：${child.zhitaiSpawnError}`;
+        return state;
+      }
       const p = await scanWebPort();
-      if (p) { state.online = true; state.port = p; state.url = `http://localhost:${p}`; return state; }
+      if (p) { state.online = true; state.port = p; state.url = `http://127.0.0.1:${p}`; return state; }
       await ctx.sleep(750);
     }
     state.error = "织台页面 30 秒内未就绪（请查看桌面版 ui 日志）";
@@ -468,6 +519,10 @@ async function doEnsure(defId) {
   const readyTimeout = def.id === "reply" ? 25 : (def.id === "generator" ? 45 : (def.id === "mptools" ? 15 : (def.id === "xhs-publisher" ? 30 : 12)));
   try {
     for (let i = 0; i < Math.ceil(readyTimeout / 0.75); i++) {
+      if (child.zhitaiSpawnError) {
+        state.error = `启动失败：${child.zhitaiSpawnError}`;
+        break;
+      }
       if (await probeUp(def)) { state.online = true; break; }
       await ctx.sleep(750);
     }
@@ -514,7 +569,7 @@ async function getStates() {
     if (def.id === "web") {
       const port = await scanWebPort();
       online = Boolean(port);
-      out.push({ id: def.id, label: def.label, port, url: port ? `http://localhost:${port}` : null, online, owned: owned.has(def.id), error: null });
+      out.push({ id: def.id, label: def.label, port, url: port ? `http://127.0.0.1:${port}` : null, online, owned: owned.has(def.id), error: null });
       continue;
     }
     online = await probeUp(def);
@@ -536,7 +591,7 @@ async function waitWebReady(seconds) {
   const deadline = Date.now() + seconds * 1000;
   while (Date.now() < deadline) {
     const port = await scanWebPort();
-    if (port) return `http://localhost:${port}`;
+    if (port) return `http://127.0.0.1:${port}`;
     await ctx.sleep(1000);
   }
   return null;
@@ -552,17 +607,17 @@ function stopOwned() {
   for (const [id, child] of owned) {
     // 本地节点承担文件传输助手的不定时接收，不能随织台窗口退出。
     // LaunchAgent 会继续监管；即使本次由桌面版临时拉起，也保留到系统接管。
-    if (id === "local-agent") continue;
+    if (id === "local-agent" && !ctx.windowsPreview) continue;
     try {
       if (child && typeof child.kill === "function" && isAlive(child)) child.kill("SIGTERM");
     } catch (_) { /* 尽力而为 */ }
   }
-  const localAgent = owned.get("local-agent");
+  const localAgent = ctx.windowsPreview ? null : owned.get("local-agent");
   owned.clear();
   if (localAgent) owned.set("local-agent", localAgent);
 }
 
 module.exports = {
   init, ensureServices, ensureService, getStates, stopOwned, waitWebReady,
-  scanWebPort, isZhitaiPage, httpUp, isAlive, WEB_MARKERS, NODE_BIN,
+  scanWebPort, isZhitaiPage, httpUp, isAlive, serviceDefs, WEB_MARKERS, NODE_BIN,
 };

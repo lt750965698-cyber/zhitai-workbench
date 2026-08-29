@@ -53,6 +53,20 @@ import * as wechatOfficial from "./wechat-official-publisher.mjs";
 import { CreativeQueue } from "./creative-queue.mjs";
 import { assertLifecycleTransition, publishFailureDisposition } from "./content-lifecycle.mjs";
 import { createDiagnosticStore } from "./diagnostics.mjs";
+import {
+  childEnvironment,
+  isPathInside,
+  openLocalPath,
+  resolveExecutablePath,
+  runtimeRootForPlatform,
+  writableAppRoot,
+} from "./platform-utils.mjs";
+import {
+  assertPlatformCapability,
+  platformCapabilities,
+  WINDOWS_PREVIEW_ERROR,
+  windowsPreviewStatus,
+} from "./platform-capabilities.mjs";
 import { AnalysisQueue } from "./analysis-queue.mjs";
 import { buildRuntimeConditions, normalizeCreativeConditionReport } from "./runtime-conditions.mjs";
 import { assessGenerationReadiness } from "./seedance-workflow.mjs";
@@ -72,7 +86,6 @@ import {
 } from "./autonomous-review.mjs";
 import { publishContentForPlan, publishSourceUrlForPlan, publishTitleForPlan, remediateToOriginalWorkflow } from "./originality-remediation.mjs";
 import { persistOriginalityRemediation } from "./originality-remediation-store.mjs";
-import { publicDisplayPath } from "./public-path.mjs";
 import {
   assertPublishScheduleBinding,
   deterministicPublishScheduleId,
@@ -84,13 +97,16 @@ import {
 import { migrateLibraryToKb } from "./kb-migrate.mjs";
 
 const agentRoot = dirname(fileURLToPath(import.meta.url));
-const runtimeRoot = resolve(process.env.ZHITAI_RUNTIME_ROOT
-  || join(homedir(), ".local", "share", "zhitai-runtime"));
+const capabilities = platformCapabilities();
+const windowsPreview = capabilities.windowsPreview === true;
+const writableRoot = writableAppRoot();
+const runtimeRoot = resolve(process.env.ZHITAI_RUNTIME_ROOT || runtimeRootForPlatform());
 const applicationsRoot = resolve(process.env.ZHITAI_APPLICATIONS_DIR
-  || join(homedir(), "Applications"));
+  || (windowsPreview ? join(writableRoot, "applications") : join(homedir(), "Applications")));
 const xianyuRoot = resolve(process.env.ZHITAI_XIANYU_ROOT
   || join(applicationsRoot, "xianyu-auto-reply-fix"));
-const configPath = process.env.ZHITAI_CONFIG_PATH || join(agentRoot, "config.local.json");
+const configPath = process.env.ZHITAI_CONFIG_PATH
+  || (windowsPreview ? join(writableRoot, "config.local.json") : join(agentRoot, "config.local.json"));
 const exampleConfigPath = join(agentRoot, "config.example.json");
 const config = await loadConfig();
 assertLoopback(config.host);
@@ -101,7 +117,9 @@ const publisherLoginRecoveryAutomationDisabled = process.env.ZHITAI_DISABLE_PUBL
   || (process.env.ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY !== "0"
     && Boolean(process.env.NODE_TEST_CONTEXT || process.env.NODE_TEST_WORKER_ID));
 
-const dataDir = resolve(process.env.ZHITAI_DATA_DIR || config.dataDir || join(agentRoot, "data"));
+const dataDir = resolve(process.env.ZHITAI_DATA_DIR
+  || (windowsPreview ? join(writableRoot, "data") : config.dataDir)
+  || join(agentRoot, "data"));
 const tasksPath = join(dataDir, "tasks.json");
 const eventsPath = join(dataDir, "events.json");
 const webhookNoncesPath = join(dataDir, "webhook-nonces.json");
@@ -115,7 +133,7 @@ const publisherReceiptsPath = join(dataDir, "publisher-receipts.json");
 const publisherSchedulePath = join(dataDir, "publisher-schedule.json");
 const publisherReceiptStore = matrix.createPublishReceiptStore({ path: publisherReceiptsPath });
 const knowledgeBase = expandHome(config.knowledgeBase);
-const publicKnowledgeBase = publicDisplayPath(knowledgeBase);
+const publicKnowledgeBase = "本机内容库";
 // ── 快点控制台 V1：伴生桥心跳（内存，TTL 默认 15s；测试可用 ZHITAI_KUAIDIAN_TTL_MS 缩短） ──
 const KUAIDIAN_HEARTBEAT_TTL_MS = Math.max(200, Number(process.env.ZHITAI_KUAIDIAN_TTL_MS) || 90_000);
 const kuaidianHeartbeat = {
@@ -1123,6 +1141,7 @@ async function ensurePublisherSchedulerReady() {
 
 creativeQueue = new CreativeQueue({
   filePath: creativeJobsPath,
+  autoDrain: !windowsPreview,
   analyze: analyzeCreativeAsset,
   persistRemediatedWorkflow: async (assetId, workflow, { signal } = {}) => {
     signal?.throwIfAborted?.();
@@ -1140,13 +1159,16 @@ creativeQueue = new CreativeQueue({
   },
 });
 await creativeQueue.init();
-const creativeRepair = await creativeQueue.reconcile(inspectCreativePreparation);
+const creativeRepair = windowsPreview
+  ? { repaired: 0, remapped: 0 }
+  : await creativeQueue.reconcile(inspectCreativePreparation);
 if (creativeRepair.repaired || creativeRepair.remapped) {
   await recordEvent("warning", "CREATIVE_RECOVER", `生成队列恢复：重置 ${creativeRepair.repaired} 条假就绪任务，重映射 ${creativeRepair.remapped} 条旧资产`);
 }
 
 analysisQueue = new AnalysisQueue({
   filePath: analysisJobsPath,
+  autoDrain: !windowsPreview,
   analyze: (assetId) => analyzeCreativeAsset(assetId),
   onEvent: async (kind, assetId, jobId, error) => {
     if (kind === "completed") {
@@ -1162,7 +1184,7 @@ analysisQueue = new AnalysisQueue({
   },
 });
 await analysisQueue.init();
-{
+if (!windowsPreview) {
   const activeCreative = new Set((await creativeQueue.list())
     .filter((job) => !["completed", "cancelled"].includes(job.status))
     .map((job) => job.assetId));
@@ -1509,9 +1531,11 @@ clawbotKeepaliveSupervisor = createClawbotKeepaliveSupervisor({
 await resolveCreativeFailureBlockersIfRecovered();
 // 升级前遗留的 pending_review 不能批量改状态或沿用旧选择接口放行；启动后逐条
 // 走与新成片完全相同的严格预检和自主语义审核。后台执行，不阻塞本地节点启动。
-setTimeout(() => void reassessPendingCreativeReviews().catch(async (error) => {
-  await recordEvent("error", "CREATIVE_AUTONOMOUS_REVIEW", `历史待审记录复审任务失败：${safeMessage(error?.message || error)}`);
-}), 0).unref?.();
+if (!windowsPreview) {
+  setTimeout(() => void reassessPendingCreativeReviews().catch(async (error) => {
+    await recordEvent("error", "CREATIVE_AUTONOMOUS_REVIEW", `历史待审记录复审任务失败：${safeMessage(error?.message || error)}`);
+  }), 0).unref?.();
+}
 
 // 下载入口看门狗：不猜测“某条未被网页看见的转发”，只提醒可验证的两类异常：
 // 1) 网页/微信登录连续未就绪；2) 已接收的文件传输助手任务长时间未完成。
@@ -1576,9 +1600,11 @@ async function checkDownloadNotifications() {
   }
 }
 
-downloadWatchdogTimer = setInterval(() => void checkDownloadNotifications().catch(() => {}), 15_000);
-downloadWatchdogTimer.unref?.();
-setTimeout(() => void checkDownloadNotifications().catch(() => {}), 2_000).unref?.();
+if (!windowsPreview) {
+  downloadWatchdogTimer = setInterval(() => void checkDownloadNotifications().catch(() => {}), 15_000);
+  downloadWatchdogTimer.unref?.();
+  setTimeout(() => void checkDownloadNotifications().catch(() => {}), 2_000).unref?.();
+}
 
 async function supplementalCredentialStates() {
   let weread = { ready: false, reason: "补充采集引擎未连接" };
@@ -1956,9 +1982,11 @@ async function refreshRuntimeConditions() {
   return runtimeConditionsRefreshInFlight;
 }
 
-credentialReminderTimer = setInterval(() => void checkCredentialNotifications().catch(() => {}), 15 * 60_000);
-credentialReminderTimer.unref?.();
-setTimeout(() => void checkCredentialNotifications().catch(() => {}), 5_000).unref?.();
+if (!windowsPreview) {
+  credentialReminderTimer = setInterval(() => void checkCredentialNotifications().catch(() => {}), 15 * 60_000);
+  credentialReminderTimer.unref?.();
+  setTimeout(() => void checkCredentialNotifications().catch(() => {}), 5_000).unref?.();
+}
 
 remoteController = new RemoteController({
   dataDir,
@@ -1986,9 +2014,44 @@ await remoteController.init();
 
 // 桌面端会额外上报 GPT/豆包真实页面状态；本地节点每 6 小时低频深检
 // 发布账号与公众号权限，并由 ClawBot/ntfy 聚合提醒一次。
-runtimeConditionsTimer = setInterval(() => void refreshRuntimeConditions().catch(() => {}), 6 * 60 * 60_000);
-runtimeConditionsTimer.unref?.();
-setTimeout(() => void refreshRuntimeConditions().catch(() => {}), 60_000).unref?.();
+if (!windowsPreview) {
+  runtimeConditionsTimer = setInterval(() => void refreshRuntimeConditions().catch(() => {}), 6 * 60 * 60_000);
+  runtimeConditionsTimer.unref?.();
+  setTimeout(() => void refreshRuntimeConditions().catch(() => {}), 60_000).unref?.();
+}
+
+function windowsCapabilityForRoute(method, pathname) {
+  if (!windowsPreview) return null;
+  if (pathname === "/channels-proxy.pac" || pathname.startsWith("/api/v1/channels/")
+    || pathname.startsWith("/api/v1/kuaidian")) return "wechatAutomation";
+  if (pathname.startsWith("/api/v1/notifications") || pathname.startsWith("/api/v1/remote")) {
+    return "notificationAutomation";
+  }
+  if (pathname.startsWith("/api/v1/credentials")) return "credentialAutomation";
+  if (pathname.startsWith("/api/v1/updates")) return "moduleUpdates";
+  if (pathname.startsWith("/api/v1/services")) return "externalServiceControl";
+  if (pathname.startsWith("/api/v1/runtime-conditions")) return "externalServiceControl";
+  if (method !== "GET" && (pathname.startsWith("/api/v1/analysis/")
+    || pathname.startsWith("/api/v1/creative/jobs"))) return "creativeAutomation";
+  if (pathname.startsWith("/api/v1/publisher") || pathname.startsWith("/api/v1/publish")) {
+    return method === "GET" ? "backgroundPublishing" : "nativePublishing";
+  }
+  return null;
+}
+
+function sendUnsupportedOnWindows(response, request, capability) {
+  try {
+    assertPlatformCapability(capabilities, capability);
+  } catch (error) {
+    sendJson(response, Number(error?.statusCode || 501), {
+      error: WINDOWS_PREVIEW_ERROR,
+      capability: error?.capability || capability,
+      platform: windowsPreviewStatus(capabilities),
+    }, request);
+    return true;
+  }
+  return false;
+}
 
 const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
@@ -2000,6 +2063,9 @@ const server = createServer(async (request, response) => {
   }
 
   try {
+    const blockedCapability = windowsCapabilityForRoute(request.method, requestUrl.pathname);
+    if (blockedCapability && sendUnsupportedOnWindows(response, request, blockedCapability)) return;
+
     if (request.method === "GET" && requestUrl.pathname === "/channels-proxy.pac") {
       const body = Buffer.from(CHANNELS_PROXY_PAC, "utf8");
       response.writeHead(200, {
@@ -2013,7 +2079,10 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/health") {
-      const [tasks, services] = await Promise.all([readTasks(), getServiceStates()]);
+      const [tasks, services] = await Promise.all([
+        readTasks(),
+        windowsPreview ? Promise.resolve({}) : getServiceStates(),
+      ]);
       sendJson(response, 200, {
         ok: true,
         service: "zhitai-local-companion",
@@ -2026,6 +2095,8 @@ const server = createServer(async (request, response) => {
         webhookSecretSource: config.webhookSecretSource,
         adapters: publicAdapterState(),
         services,
+        platform: windowsPreviewStatus(capabilities),
+        capabilities,
       }, request);
       return;
     }
@@ -2060,7 +2131,9 @@ const server = createServer(async (request, response) => {
         inboxMode: config.webhookSecret ? "signature_required" : "origin_or_loopback",
         webhookSecretSource: config.webhookSecretSource,
         adapters: publicAdapterState(),
-        services: await getServiceStates(),
+        services: windowsPreview ? {} : await getServiceStates(),
+        platform: windowsPreviewStatus(capabilities),
+        capabilities,
       }, request);
       return;
     }
@@ -2105,7 +2178,7 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && requestUrl.pathname === "/api/v1/creative/reviews") {
       // API 读回前等待同一轮逐条复审，避免桌面端继续把旧 pending_review 当作运营条件。
-      await reassessPendingCreativeReviews();
+      if (!windowsPreview) await reassessPendingCreativeReviews();
       const reviews = await readCreativeReviews();
       sendJson(response, 200, {
         ok: true,
@@ -2320,12 +2393,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/library/open-folder") {
       requireConfirmedAction(request);
       await access(knowledgeBase, fsConstants.R_OK);
-      const child = spawn("/usr/bin/open", [knowledgeBase], {
-        shell: false,
-        detached: true,
-        stdio: "ignore",
-      });
-      child.unref();
+      if (!await openLocalPath(knowledgeBase)) throw httpError(503, "open_local_path_failed");
       sendJson(response, 200, { ok: true }, request);
       return;
     }
@@ -3451,30 +3519,36 @@ const server = createServer(async (request, response) => {
 server.listen(config.port, config.host, async () => {
   // Publish timers start only after this process has won the listening socket;
   // a second EADDRINUSE process must never race a due external submission.
-  publisherSchedulerInit = publisherScheduler.init();
+  if (!windowsPreview) publisherSchedulerInit = publisherScheduler.init();
   // 只有成功占用监听端口的实例才启动通知轮询，避免双启动并发投递同一 outbox。
-  notificationCenter.start();
-  if (openInterpreterKeepaliveEnabled) clawbotKeepaliveSupervisor.start();
+  if (!windowsPreview) notificationCenter.start();
+  if (!windowsPreview && openInterpreterKeepaliveEnabled) clawbotKeepaliveSupervisor.start();
   // 账号失效恢复由监听成功的唯一实例持有；服务重启后从私有账本继续，
   // 不依赖用户重新打开发布页。
-  setTimeout(() => void reconcilePublisherLogins().catch((error) => recordEvent(
-    "warning",
-    "PUBLISH_LOGIN_RECOVERY",
-    `发布账号自动登录恢复暂未启动：${safeMessage(error?.message || error)}`,
-  )), 2_000).unref?.();
+  if (!windowsPreview) {
+    setTimeout(() => void reconcilePublisherLogins().catch((error) => recordEvent(
+      "warning",
+      "PUBLISH_LOGIN_RECOVERY",
+      `发布账号自动登录恢复暂未启动：${safeMessage(error?.message || error)}`,
+    )), 2_000).unref?.();
+  }
   console.log(`织台本地节点已启动：http://${config.host}:${config.port}`);
   console.log(`知识库目录：${publicKnowledgeBase}`);
   await recordEvent("info", "READY", `本地节点已启动，知识库 ${publicKnowledgeBase}`);
-  try {
-    await publisherSchedulerInit;
+  if (windowsPreview) {
     await deactivateLegacyScheduledTasks();
-  } catch (error) {
-    await recordEvent("error", "PUBLISH_SCHEDULER", `持久发布调度器启动失败：${safeMessage(error?.message || error)}`);
+  } else {
+    try {
+      await publisherSchedulerInit;
+      await deactivateLegacyScheduledTasks();
+    } catch (error) {
+      await recordEvent("error", "PUBLISH_SCHEDULER", `持久发布调度器启动失败：${safeMessage(error?.message || error)}`);
+    }
   }
   await startWatcher();
-  if (config.services?.wx_channels_card) channelsPageRecovery.start();
+  if (!windowsPreview && config.services?.wx_channels_card) channelsPageRecovery.start();
   const autoStartEntries = Object.entries(config.services)
-    .filter(([, service]) => service?.autoStart === true);
+    .filter(([, service]) => !windowsPreview && service?.autoStart === true);
   const autoStartResults = await Promise.allSettled(autoStartEntries
     .map(([serviceId]) => runServiceAction(() => startService(serviceId))));
   for (let index = 0; index < autoStartResults.length; index += 1) {
@@ -3487,7 +3561,7 @@ server.listen(config.port, config.host, async () => {
   }
   // 先以 data.available 确认解析页真实重连，再回收近期瞬态失败，
   // 避免固定 8 秒定时器与引擎启动竞态。
-  const channelsReady = config.services?.wx_channels_card
+  const channelsReady = !windowsPreview && config.services?.wx_channels_card
     ? await ensureChannelsPageConnected({ force: true, reason: "startup" })
     : null;
   if (channelsReady?.ok) {
@@ -6141,8 +6215,10 @@ async function inspectServiceInstall(service, configured) {
 }
 
 async function readGitDirtyPaths(repositoryRoot) {
+  const gitExecutable = await resolveExecutable("git");
+  if (!gitExecutable) return null;
   return new Promise((resolvePromise) => {
-    const child = spawn("/usr/bin/git", ["-C", repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], {
+    const child = spawn(gitExecutable, ["-C", repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], {
       env: safeChildEnv(),
       shell: false,
       stdio: ["ignore", "pipe", "ignore"],
@@ -6206,27 +6282,7 @@ async function readGitRevision(repositoryRoot) {
 }
 
 async function resolveExecutable(command) {
-  if (command.includes("/") || isAbsolute(command)) {
-    return executablePath(expandHome(command));
-  }
-  for (const directory of String(process.env.PATH || "").split(":")) {
-    if (!directory) continue;
-    const candidate = join(directory, command);
-    const executable = await executablePath(candidate);
-    if (executable) return executable;
-  }
-  return null;
-}
-
-async function executablePath(path) {
-  try {
-    const info = await stat(path);
-    if (!info.isFile()) return null;
-    await access(path, fsConstants.X_OK);
-    return path;
-  } catch {
-    return null;
-  }
+  return resolveExecutablePath(expandHome(command));
 }
 
 function clearServiceRestartTimer(id) {
@@ -6254,6 +6310,7 @@ function scheduleServiceRestart(id) {
 }
 
 async function startService(id) {
+  assertPlatformCapability(capabilities, "externalServiceControl");
   const service = config.services[id];
   if (!service) throw httpError(404, "service_not_found");
   intentionalServiceStops.delete(id);
@@ -6322,6 +6379,7 @@ async function runServiceAction(action) {
 }
 
 async function stopService(id) {
+  assertPlatformCapability(capabilities, "externalServiceControl");
   if (!config.services[id]) throw httpError(404, "service_not_found");
   const child = managedProcesses.get(id);
   if (!child) throw httpError(409, "service_not_managed_by_zhitai");
@@ -6348,6 +6406,7 @@ async function stopService(id) {
 }
 
 async function setupService(id) {
+  assertPlatformCapability(capabilities, "externalServiceControl");
   const service = config.services[id];
   if (!service) throw httpError(404, "service_not_found");
   const currentState = (await getServiceStates())[id];
@@ -6370,17 +6429,7 @@ function expandArgument(value) {
 }
 
 function safeChildEnv(...overrides) {
-  const allowed = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV"];
-  const env = Object.fromEntries(allowed.filter((key) => typeof process.env[key] === "string").map((key) => [key, process.env[key]]));
-  for (const values of overrides) {
-    if (!values || typeof values !== "object") continue;
-    for (const [key, value] of Object.entries(values)) {
-      if (/^[A-Z][A-Z0-9_]{0,63}$/.test(key) && ["string", "number", "boolean"].includes(typeof value)) {
-        env[key] = String(value);
-      }
-    }
-  }
-  return env;
+  return childEnvironment(Object.assign({}, ...overrides.filter((value) => value && typeof value === "object")));
 }
 
 async function filesChangedSince(root, timestamp) {
@@ -6755,7 +6804,7 @@ async function recordEvent(level, type, message, taskId = null) {
     await writeJsonAtomic(eventsPath, events.slice(0, 1_000));
   });
   await eventMutation;
-  if (notificationCenter) {
+  if (notificationCenter && capabilities.notificationAutomation) {
     void notificationCenter.notifyEvent(event.type, event.message).catch(() => {});
   }
 }
@@ -6829,13 +6878,17 @@ async function spawnAndCaptureJson(command, args, options) {
 }
 
 function pathIsInside(path, root) {
-  const absolutePath = resolve(path);
-  const absoluteRoot = resolve(root);
-  return absolutePath === absoluteRoot || absolutePath.startsWith(`${absoluteRoot}/`);
+  return isPathInside(path, root);
 }
 
 function sanitizeFilename(value) {
-  return stripControlCharacters(String(value || "asset")).replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "asset";
+  const cleaned = stripControlCharacters(String(value || "asset"))
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[. ]+$/g, "")
+    .slice(0, 120) || "asset";
+  return /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(cleaned)
+    ? `_${cleaned}`
+    : cleaned;
 }
 
 function sanitizeTitle(value) {

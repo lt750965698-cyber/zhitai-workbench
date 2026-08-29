@@ -1,15 +1,25 @@
 "use strict";
 
+/* global __dirname */
+
+const path = require("node:path");
+
+const desktopIcon = path.join(__dirname, "desktop", "assets", "icon");
+const windowsIcon = `${desktopIcon}.ico`;
+
 const runtimePaths = [
-  /^\/app(?:\/|$)/,
-  /^\/build(?:\/|$)/,
-  /^\/desktop(?:\/|$)/,
-  /^\/dist(?:\/|$)/,
-  /^\/local-agent(?:\/|$)/,
-  /^\/node_modules(?:\/|$)/,
-  /^\/public(?:\/|$)/,
-  /^\/worker(?:\/|$)/,
-  /^\/(?:next\.config\.[^/]+|package\.json|vite\.config\.[^/]+)$/,
+  /^\/desktop$/,
+  /^\/desktop\/(?:[^/]+\.js|package\.json)$/,
+  /^\/desktop\/assets$/,
+  /^\/desktop\/assets\/icon\.png$/,
+  /^\/dist(?:$|\/standalone(?:\/|$))/,
+  /^\/local-agent$/,
+  /^\/local-agent\/(?:[^/]+\.(?:mjs|js)|config\.example\.json)$/,
+  /^\/node_modules$/,
+  /^\/node_modules\/@electron$/,
+  /^\/node_modules\/@electron\/asar(?:\/|$)/,
+  /^\/node_modules\/electron-squirrel-startup(?:\/|$)/,
+  /^\/(?:LICENSE|THIRD_PARTY_NOTICES\.md|package\.json)$/,
 ];
 
 const alwaysIgnored = [
@@ -17,8 +27,10 @@ const alwaysIgnored = [
   /^\/(?:coverage|docs|operations|out|outputs|patches|test-results|tests|work)(?:\/|$)/,
   /^\/desktop\/(?:node_modules|package-lock\.json|织台桌面版\.command)(?:\/|$)/,
   /^\/local-agent\/(?:config\.local\.json|data)(?:\/|$)/,
+  /^\/local-agent\/(?:inbox-secret|yuanbao-cookie|.*\.(?:cookie|secret))(?:\/|$)/,
   /^\/node_modules\/(?:\.cache)(?:\/|$)/,
-  /\.(?:db|db-shm|db-wal|log|pem|key|pfx)$/i,
+  /\/(?:\.env[^/]*|credentials[^/]*\.json|secrets[^/]*\.json)$/i,
+  /\.(?:db|db-shm|db-wal|log|pem|key|crt|cer|der|p12|pfx|jks|keystore|mobileprovision)$/i,
 ];
 
 module.exports = {
@@ -27,6 +39,7 @@ module.exports = {
     // unpacked lets them use a real cwd while remaining inside the installer.
     asar: false,
     executableName: "Zhitai",
+    icon: desktopIcon,
     appBundleId: "com.zhitai.desktop",
     appCopyright: "Copyright (c) 2026 Zhitai contributors",
     win32metadata: {
@@ -51,6 +64,7 @@ module.exports = {
         authors: "Zhitai contributors",
         description: "本地优先的内容采集、知识库、分析与多平台发布工作台。",
         setupExe: "Zhitai-Setup.exe",
+        setupIcon: windowsIcon,
         noMsi: true,
       },
     },

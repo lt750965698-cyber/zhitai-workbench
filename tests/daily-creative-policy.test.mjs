@@ -17,6 +17,7 @@ async function loadDailyCreativePolicy() {
     setAppUserModelId() {},
     setPath() {},
     getPath() { return "/tmp/zhitai-policy-test"; },
+    getAppPath() { return dirname(fileURLToPath(mainUrl)); },
     requestSingleInstanceLock() { return false; },
     whenReady() { return new Promise(() => {}); },
     quit() {},
@@ -45,6 +46,14 @@ async function loadDailyCreativePolicy() {
       }
       if (specifier === "./launcher.js") return {};
       if (specifier === "./adapter.js") return {};
+      if (specifier === "./platform.js") {
+        return {
+          desktopDataRoot: () => "/tmp/zhitai-policy-test/data",
+          desktopLogRoot: () => "/tmp/zhitai-policy-test/logs",
+          desktopProjectDir: () => dirname(fileURLToPath(mainUrl)),
+          desktopRuntimeRoot: () => "/tmp/zhitai-policy-test/runtime",
+        };
+      }
       return nativeRequire(specifier);
     },
     process: { env: {}, defaultApp: false, platform: process.platform },
@@ -90,7 +99,8 @@ async function loadDailyCreativePolicy() {
     transientRetryMs: TRANSIENT_CREATIVE_RETRY_MS,
     providerRetryMs: CREATIVE_RETRY_BACKOFF_MS,
   };`;
-  vm.runInNewContext(source + expose, sandbox, { filename: fileURLToPath(mainUrl) });
+  const instrumented = source.replace(/\n\}\s*$/u, `${expose}\n}`);
+  vm.runInNewContext(instrumented, sandbox, { filename: fileURLToPath(mainUrl) });
   return { policy: module.exports.__dailyCreativePolicy, source };
 }
 

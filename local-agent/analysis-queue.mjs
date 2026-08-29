@@ -47,6 +47,7 @@ export class AnalysisQueue {
     retryDelaysMs = [30_000, 2 * 60_000, 10 * 60_000],
     maxAttempts = 4,
     clock = () => Date.now(),
+    autoDrain = true,
   }) {
     this.filePath = filePath;
     this.analyze = analyze;
@@ -58,6 +59,7 @@ export class AnalysisQueue {
     this.draining = false;
     this.timer = null;
     this.activeJobId = null;
+    this.autoDrain = autoDrain !== false;
   }
 
   async init() {
@@ -177,6 +179,7 @@ export class AnalysisQueue {
   }
 
   #scheduleDrain(delayMs = 0) {
+    if (!this.autoDrain) return;
     if (this.timer) clearTimeout(this.timer);
     const delay = Math.max(0, delayMs);
     this.timer = setTimeout(() => {

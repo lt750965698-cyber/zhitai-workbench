@@ -13,6 +13,8 @@ test("Windows preview keeps the local core and fails closed for native automatio
   assert.equal(capabilities.localCore, true);
   assert.equal(capabilities.browserStudios, true);
   for (const capability of [
+    "browserAutomation",
+    "creativeAutomation",
     "backgroundPublishing",
     "credentialAutomation",
     "externalServiceControl",

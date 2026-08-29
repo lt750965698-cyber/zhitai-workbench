@@ -3,28 +3,51 @@
 "use strict";
 
 const { app, BrowserWindow, ipcMain, nativeImage } = require("electron");
+
+// Squirrel starts the executable briefly while installing, updating or
+// removing it. Exit before loading any runtime modules or starting services.
+if (require("electron-squirrel-startup")) {
+  app.quit();
+} else {
+
+const fs = require("node:fs");
 const path = require("node:path");
-const os = require("node:os");
 const fsp = require("node:fs/promises");
 const launcher = require("./launcher.js");
 const adapter = require("./adapter.js");
+const {
+  desktopDataRoot,
+  desktopLogRoot,
+  desktopProjectDir,
+  desktopRuntimeRoot,
+} = require("./platform.js");
 const { createCreativeRunner, localMotionFallbackEnabled } = require("./creative-runner.js");
 const { createXBookmarkRunner } = require("./x-bookmark-runner.js");
 const { createYuanbaoRunner } = require("./yuanbao-runner.js");
 
 const WEB_TITLE = "织台";
-const RUNTIME_ROOT = process.env.ZHITAI_RUNTIME_ROOT
-  || path.join(os.homedir(), ".local", "share", "zhitai-runtime");
-const PROJECT_DIR = process.env.ZHITAI_PROJECT_DIR
-  || (process.defaultApp ? path.dirname(__dirname) : path.join(RUNTIME_ROOT, "web"));
+const WINDOWS_PREVIEW = process.platform === "win32";
+const WINDOWS_PREVIEW_ERROR = "unsupported_on_windows_preview";
+const RUNTIME_ROOT = desktopRuntimeRoot();
+const DATA_ROOT = process.env.ZHITAI_DATA_DIR || desktopDataRoot();
+const PROJECT_DIR = desktopProjectDir({
+  isPackaged: app.isPackaged,
+  appPath: app.getAppPath(),
+  moduleDir: __dirname,
+});
+const APP_ICON = path.join(PROJECT_DIR, "desktop", "assets", "icon.png");
 
 // 未打包 Electron 默认都叫 “Electron”，并共享默认 userData/单实例锁语义。
 // 织台必须在申请单实例锁前拥有独立身份，避免 MatrixMedia 退出或重启时互相影响。
 // Chromium 会把应用名写入 User-Agent；这里必须使用 ASCII，中文会形成非法 HTTP header。
 // 用户可见窗口标题仍是“织台”，Dock 显示自定义品牌图。
 app.setName("Zhitai");
-app.setAppUserModelId("com.zhitai.desktop");
-app.setPath("userData", path.join(app.getPath("appData"), "织台"));
+app.setAppUserModelId("com.squirrel.ZhitaiWorkbench.Zhitai");
+const userDataPath = WINDOWS_PREVIEW
+  ? path.join(RUNTIME_ROOT, "electron")
+  : path.join(app.getPath("appData"), "织台");
+fs.mkdirSync(userDataPath, { recursive: true });
+app.setPath("userData", userDataPath);
 
 let mainWindow = null;
 let yuanbaoRunner = null;
@@ -129,6 +152,7 @@ function openCreativeStudio(provider, { show = true, accountId = "account-1" } =
     parent: mainWindow || undefined,
     title: studio.title,
     backgroundColor: "#f6f5f0",
+    icon: APP_ICON,
     webPreferences: {
       // account-1 沿用旧分区，保留用户已经登录的豆包；新增账号各自持久化 Cookie。
       partition: provider === "seedance" && cleanAccountId !== "account-1"
@@ -206,6 +230,7 @@ async function dailyAccountIds() {
 }
 
 async function checkRuntimeConditions(accountIds = [], refresh = false) {
+  if (WINDOWS_PREVIEW) return windowsUnsupported("externalServiceControl");
   if (!refresh) return localJson("/api/v1/runtime-conditions");
   if (runtimeConditionsInFlight) return runtimeConditionsInFlight;
   runtimeConditionsInFlight = (async () => {
@@ -224,6 +249,15 @@ async function checkRuntimeConditions(accountIds = [], refresh = false) {
   })();
   try { return await runtimeConditionsInFlight; }
   finally { runtimeConditionsInFlight = null; }
+}
+
+function windowsUnsupported(capability) {
+  return {
+    ok: false,
+    error: WINDOWS_PREVIEW_ERROR,
+    capability,
+    platform: "windows_preview",
+  };
 }
 
 async function readDailyCreativeState() {
@@ -1201,6 +1235,7 @@ function createWindow(url) {
     minHeight: 700,
     title: WEB_TITLE,
     backgroundColor: "#f6f5f0",
+    icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true, // 保持上下文隔离
@@ -1244,19 +1279,21 @@ if (!gotSingleInstanceLock) {
 
 app.whenReady().then(async () => {
   if (app.dock) {
-    const iconPath = app.isPackaged
-      ? path.join(process.resourcesPath, "zhitai-icon.png")
-      : path.join(__dirname, "..", "public", "og.png");
-    const icon = nativeImage.createFromPath(iconPath);
+    const icon = nativeImage.createFromPath(APP_ICON);
     if (!icon.isEmpty()) app.dock.setIcon(icon);
   }
   launcher.init({
     projectDir: PROJECT_DIR,
+    runtimeRoot: RUNTIME_ROOT,
+    dataDir: DATA_ROOT,
     runtimeScript: path.join(RUNTIME_ROOT, "scripts", "run-local-agent.command"),
-    analyzerScript: path.join(RUNTIME_ROOT, "scripts", "video-analysis-server.mjs"),
-    logDir: path.join(process.env.HOME, "Library", "Logs"),
+    localAgentScript: path.join(PROJECT_DIR, "local-agent", "server.mjs"),
+    analyzerScript: path.join(PROJECT_DIR, "scripts", "video-analysis-server.mjs"),
+    logDir: desktopLogRoot(),
+    packaged: app.isPackaged,
+    windowsPreview: WINDOWS_PREVIEW,
   });
-  yuanbaoRunner.startBridge();
+  if (!WINDOWS_PREVIEW) yuanbaoRunner.startBridge();
 
   // 窄 IPC（先注册，窗口加载即可用）
   ipcMain.handle("zhitai:services:list", () => launcher.getStates());
@@ -1265,8 +1302,12 @@ app.whenReady().then(async () => {
     const result = openCreativeStudio(provider, { accountId });
     return { ok: result.ok, reused: result.reused, error: result.error };
   });
-  ipcMain.handle("zhitai:creative:run", (_event, jobId, assetId, accountIds) => creativeRunner.run(jobId, assetId, accountIds));
-  ipcMain.handle("zhitai:x-bookmarks:sync", (_event, interactive = true) => xBookmarkRunner.sync({ interactive: interactive !== false }));
+  ipcMain.handle("zhitai:creative:run", (_event, jobId, assetId, accountIds) => WINDOWS_PREVIEW
+    ? windowsUnsupported("creativeAutomation")
+    : creativeRunner.run(jobId, assetId, accountIds));
+  ipcMain.handle("zhitai:x-bookmarks:sync", (_event, interactive = true) => WINDOWS_PREVIEW
+    ? windowsUnsupported("browserAutomation")
+    : xBookmarkRunner.sync({ interactive: interactive !== false }));
   ipcMain.handle("zhitai:runtime-conditions:check", (_event, accountIds, refresh = false) => checkRuntimeConditions(accountIds, refresh === true));
 
   // 1) 服务监管只执行一次：web 优先（窗口尽快就绪），其余服务后台逐项；
@@ -1279,7 +1320,7 @@ app.whenReady().then(async () => {
   if (!webUrl) webUrl = await launcher.waitWebReady(45);
 
   createWindow(webUrl || "data:text/html;charset=utf-8," + encodeURIComponent(
-    '<!doctype html><meta charset="utf-8"><title>织台</title><body style="font-family:-apple-system,sans-serif;background:#f6f5f0;display:grid;place-items:center;height:100vh"><div style="text-align:center;color:#8a5a3c"><h2>织台页面未就绪</h2><p>请确认已在本项目目录执行过 npm install，再重启桌面版。</p></div></body>'));
+    '<!doctype html><meta charset="utf-8"><title>织台</title><body style="font-family:-apple-system,sans-serif;background:#f6f5f0;display:grid;place-items:center;height:100vh"><div style="text-align:center;color:#8a5a3c"><h2>织台页面未就绪</h2><p>本地服务启动失败，请重启桌面版并查看诊断日志。</p></div></body>'));
 
   // 其余服务后台逐项监管（web 已在线会直接跳过，不重复启动）
   launcher.ensureServices().then(pushStates).catch((err) => {
@@ -1288,23 +1329,29 @@ app.whenReady().then(async () => {
 
   // X 收藏使用织台自己的持久登录窗口。启动后静默同步一次，此后每 6 小时检查；
   // 未登录时保持静默，用户从知识库点“登录 X”即可完成一次性登录。
-  setTimeout(() => { void xBookmarkRunner.sync({ interactive: false }); }, 20_000);
-  setInterval(() => { void xBookmarkRunner.sync({ interactive: false }); }, 6 * 60 * 60_000);
+  if (!WINDOWS_PREVIEW) {
+    setTimeout(() => { void xBookmarkRunner.sync({ interactive: false }); }, 20_000);
+    setInterval(() => { void xBookmarkRunner.sync({ interactive: false }); }, 6 * 60 * 60_000);
+  }
 
   // 创作账号需在持久登录的真实网页中检查；启动后错峰深检一次，此后每 6 小时低频检查。
   const scheduledRuntimeCheck = async () => {
     const ids = await dailyAccountIds();
     await checkRuntimeConditions(ids, true);
   };
-  setTimeout(() => { void scheduledRuntimeCheck().catch(() => {}); }, 2 * 60_000);
-  runtimeConditionsTimer = setInterval(() => { void scheduledRuntimeCheck().catch(() => {}); }, 6 * 60 * 60_000);
+  if (!WINDOWS_PREVIEW) {
+    setTimeout(() => { void scheduledRuntimeCheck().catch(() => {}); }, 2 * 60_000);
+    runtimeConditionsTimer = setInterval(() => { void scheduledRuntimeCheck().catch(() => {}); }, 6 * 60 * 60_000);
+  }
 
   // 每日目标是 1 条已通过自主审核的同主题内容包；pending_review 和 needs_revision
   // 都不占目标，避免把“还没有结论”误当成可创建草稿或公开发布的内容。
   // 只生成、不公开发布。登录失效或额度不足按提供方退避 4 小时；
   // GPT 只是暂时忙则在当日窗口内 60 秒后续跑同一条。
-  setTimeout(() => { void runDailyCreativeQueue(); }, 90_000);
-  setInterval(() => { void runDailyCreativeQueue(); }, 30 * 60_000);
+  if (!WINDOWS_PREVIEW && process.env.ZHITAI_DAILY_CREATIVE_ENABLED === "1") {
+    setTimeout(() => { void runDailyCreativeQueue(); }, 90_000);
+    setInterval(() => { void runDailyCreativeQueue(); }, 30 * 60_000);
+  }
 
   // 状态中心推送（每 5 秒刷新一次）
   setInterval(() => {
@@ -1342,3 +1389,4 @@ app.on("before-quit", () => {
   try { yuanbaoRunner?.stopBridge(); } catch (_) { /* 尽力而为 */ }
   try { launcher.stopOwned(); } catch (_) { /* 尽力而为 */ }
 });
+}

@@ -105,7 +105,7 @@ function publicJob(job) {
 }
 
 export class CreativeQueue {
-  constructor({ filePath, analyze, persistRemediatedWorkflow = null, onEvent = async () => {} }) {
+  constructor({ filePath, analyze, persistRemediatedWorkflow = null, onEvent = async () => {}, autoDrain = true }) {
     this.filePath = filePath;
     this.analyze = analyze;
     this.persistRemediatedWorkflow = persistRemediatedWorkflow;
@@ -116,6 +116,7 @@ export class CreativeQueue {
     this.activeJobId = null;
     this.retryTimer = null;
     this.retryTimerAt = 0;
+    this.autoDrain = autoDrain !== false;
   }
 
   async init() {
@@ -372,6 +373,7 @@ export class CreativeQueue {
   }
 
   #scheduleDrain(delayMs = 0) {
+    if (!this.autoDrain) return;
     if (delayMs <= 0) {
       queueMicrotask(() => { void this.#drain(); });
       return;

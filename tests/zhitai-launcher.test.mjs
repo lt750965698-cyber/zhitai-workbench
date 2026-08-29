@@ -62,16 +62,30 @@ test("分析器（process.execPath 为 Electron）子进程显式 ELECTRON_RUN_A
   assert.equal(options.env && options.env.ELECTRON_RUN_AS_NODE, "1", "analyzer 子进程必须进入 Node 模式");
 });
 
-// ---- 3. 织台页面用绝对 node + vinext 生产构建，不依赖 Finder PATH / npm 生命周期 ----
-test("织台页面使用明确现有 node 与 vinext CLI 绝对路径", async () => {
+// ---- 3. 织台页面用绝对 node + standalone 生产构建，不依赖 Finder PATH / npm 生命周期 ----
+test("织台页面使用明确现有 node 与 standalone 入口", async () => {
   const spawnLog = [];
   setupFake(spawnLog);
   mockNoWeb();
   await ensureService("web");
   const call = spawnLog.find(([cmd]) => cmd === NODE_BIN);
   assert.ok(call, "web 必须用绝对 node 启动");
-  assert.equal(call[1][0], path.join(PROJECT_DIR, "node_modules", "vinext", "dist", "cli.js"));
-  assert.deepEqual(call[1].slice(1), ["start", "--port", "3001", "--hostname", "127.0.0.1"]);
+  assert.deepEqual(call[1], [path.join(PROJECT_DIR, "dist", "standalone", "server.js")]);
+  assert.equal(call[2].cwd, path.join(PROJECT_DIR, "dist", "standalone"));
+  assert.equal(call[2].env.PORT, "3001");
+  assert.equal(call[2].env.HOST, "127.0.0.1");
+});
+
+test("织台页面探测与返回地址固定使用 IPv4 回环地址", async () => {
+  setupFake([], false);
+  let probedUrl = null;
+  globalThis.fetch = async (url) => {
+    probedUrl = String(url);
+    return new Response("workbench-shell", { status: 200 });
+  };
+  const state = await ensureService("web");
+  assert.equal(probedUrl, "http://127.0.0.1:3000/");
+  assert.equal(state.url, "http://127.0.0.1:3000");
 });
 
 test("vinext 子进程：nodeBin 为指向另一路径 Electron 的符号链接时进入 Node 模式", async () => {
@@ -258,7 +272,7 @@ test("vinext start 子进程 env：干净 PATH 下 PATH 以 node 目录开头、
     await ensureService("web");
     const call = spawnLog.find(([cmd]) => cmd === NODE_BIN);
     assert.ok(call, "web 必须用绝对 node 启动");
-    assert.deepEqual(call[1], [path.join(PROJECT_DIR, "node_modules", "vinext", "dist", "cli.js"), "start", "--port", "3001", "--hostname", "127.0.0.1"]);
+    assert.deepEqual(call[1], [path.join(PROJECT_DIR, "dist", "standalone", "server.js")]);
     const env = call[2]?.env || {};
     const nodeDir = path.dirname(NODE_BIN);
     assert.ok(env.PATH.startsWith(nodeDir + path.delimiter), "PATH 必须以 node 目录开头：实际 " + env.PATH);
