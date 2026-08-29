@@ -1,16 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import audio from "../desktop/audio-postprocessor.js";
 
 const {
+  buildAudioQualityReport,
   cleanSpokenText,
   isUsableNarration,
   narrationQualityBlocker,
   narrationTimingDecision,
+  normalizeNarrationEvidence,
+  parseEdgeTtsSrt,
   parseVolume,
+  secureOutputScope,
   selectNarration,
   truncateForDuration,
+  verifiedSynthesizedNarration,
+  writePrivateReportAtomic,
 } = audio;
 
 test("配音文案会去掉链接、标签和分析尾句", () => {
@@ -67,8 +75,8 @@ test("完全原创音频后期明确丢弃输入音轨并记录审计字段", as
   const source = await readFile(new URL("../desktop/audio-postprocessor.js", import.meta.url), "utf8");
   assert.match(source, /tts && media\.hasAudio && !discardInputAudio/);
   assert.match(source, /完全原创补救缺少原创配音文案，不能回退来源音轨/);
-  assert.match(source, /inputAudioDiscarded:\s*discardInputAudio/);
-  assert.match(source, /originalityPolicy:\s*originality\.policy/);
+  assert.match(source, /inputAudioDiscarded:\s*Boolean\(discardInputAudio\)/);
+  assert.match(source, /originalityPolicy = originality\?\.policy === "strict_full_original"/);
 });
 
 test("解析 FFmpeg 音量质检结果", () => {
@@ -115,4 +123,119 @@ test("音频后期不用 -t 截断旁白，并写入可复算的完整性证据"
   assert.match(source, /narrationDurationMs:/);
   assert.match(source, /finalDurationMs:/);
   assert.match(source, /timingVerified:/);
+});
+
+test("Edge TTS 字幕必须按顺序反读，规范化后与选中旁白严格一致", async () => {
+  const srt = [
+    "1", "00:00:00,000 --> 00:00:01,000", "厨房改造先统一", "",
+    "2", "00:00:01,000 --> 00:00:02,000", "动线、收纳和光线。", "",
+  ].join("\n");
+  assert.equal(parseEdgeTtsSrt(srt), "厨房改造先统一动线、收纳和光线。");
+  assert.equal(normalizeNarrationEvidence("厨房\r\n 改造"), "厨房 改造");
+  assert.throws(() => parseEdgeTtsSrt(srt.replace(/^2$/m, "3")), /顺序 SRT/);
+  assert.throws(() => normalizeNarrationEvidence(`旁白\u0000注入`), /控制字符/);
+
+  const directory = await mkdtemp(join(tmpdir(), "zhitai-edge-srt-"));
+  const subtitlePath = join(directory, "subtitles.srt");
+  try {
+    await writeFile(subtitlePath, srt, { mode: 0o600 });
+    assert.equal(
+      await verifiedSynthesizedNarration(subtitlePath, "厨房改造先统一 动线、收纳和光线。"),
+      "厨房改造先统一动线、收纳和光线。",
+    );
+    await assert.rejects(
+      verifiedSynthesizedNarration(subtitlePath, "厨房改造先统一动线和光线。"),
+      /与选中旁白不一致/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+function reportFixture(overrides = {}) {
+  return {
+    jobId: "creative_11111111-1111-4111-8111-111111111111",
+    tts: { voice: "zh-CN-XiaoxiaoNeural", rate: "+10%" },
+    narration: "厨房改造先统一动线、收纳和光线。",
+    narrationSource: "originality_voiceover",
+    narrationTiming: { passed: true, narrationDurationMs: 4_200 },
+    finalTimingPassed: true,
+    durationTarget: 10,
+    outputMedia: { durationSeconds: 10 },
+    media: { hasAudio: true, durationSeconds: 10 },
+    discardInputAudio: true,
+    originality: { policy: "strict_full_original" },
+    outputSizeBytes: 4_096,
+    outputSha256: "a".repeat(64),
+    quality: { meanVolumeDb: -16, maxVolumeDb: -1.5 },
+    checkedAt: "2026-08-30T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("音频质检报告使用固定有界字段，并保留 TTS 字幕验证证据", () => {
+  const { report, json } = buildAudioQualityReport(reportFixture());
+  assert.deepEqual(Object.keys(report), [
+    "schemaVersion", "status", "jobId", "provider", "voice", "rate", "narrationSource", "narration",
+    "narrationSha256", "narrationComplete", "narrationVerifiedFromSubtitles", "narrationDurationMs",
+    "finalDurationMs", "outputDurationMs", "timingVerified", "inputHadAudio", "inputAudioDiscarded",
+    "originalityPolicy", "durationSeconds", "outputSizeBytes", "outputSha256", "meanVolumeDb", "maxVolumeDb",
+    "checkedAt",
+  ]);
+  assert.equal(report.narrationVerifiedFromSubtitles, true);
+  assert.equal(report.originalityPolicy, "strict_full_original");
+  assert.ok(Buffer.byteLength(json) < 16 * 1024);
+  assert.throws(() => buildAudioQualityReport(reportFixture({ jobId: "creative_../../etc" })), /作业 ID/);
+  assert.throws(() => buildAudioQualityReport(reportFixture({ narrationSource: "https://attacker.invalid/source" })), /旁白来源/);
+  assert.throws(() => buildAudioQualityReport(reportFixture({ tts: { voice: "bad\nvoice", rate: "+10%" } })), /voice/);
+});
+
+test("非 TTS 报告明确保持无旁白语义", () => {
+  const { report } = buildAudioQualityReport(reportFixture({
+    tts: null,
+    narration: "不能进入报告的候选文案",
+    narrationSource: "voiceover_draft",
+    narrationTiming: null,
+    discardInputAudio: false,
+    originality: { policy: "来自 HTTP 的任意值" },
+  }));
+  assert.equal(report.provider, "FFmpeg loudnorm");
+  assert.equal(report.narrationSource, "none");
+  assert.equal(report.narration, null);
+  assert.equal(report.narrationComplete, false);
+  assert.equal(report.narrationVerifiedFromSubtitles, false);
+  assert.equal(report.narrationDurationMs, null);
+  assert.equal(report.voice, null);
+  assert.equal(report.rate, null);
+  assert.equal(report.originalityPolicy, null);
+});
+
+test("creative 输出作用域和质检凭据使用私有权限与原子落盘", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zhitai-audio-scope-"));
+  const directory = join(root, "creative_11111111-1111-4111-8111-111111111111");
+  const input = join(directory, "final.visual.mp4");
+  const output = join(directory, "final.mp4");
+  const reportPath = join(directory, "audio-quality.json");
+  try {
+    const scope = await secureOutputScope(output, input, { generationRoot: root });
+    assert.equal(scope.jobId, "creative_11111111-1111-4111-8111-111111111111");
+    assert.equal((await stat(directory)).mode & 0o777, 0o700);
+    await assert.rejects(
+      secureOutputScope(
+        join(root, "creative_not-a-uuid", "final.mp4"),
+        join(root, "creative_not-a-uuid", "final.visual.mp4"),
+        { generationRoot: root },
+      ),
+      /canonical creative UUID/,
+    );
+    await assert.rejects(
+      secureOutputScope(output, input, { generationRoot: join(root, "other") }),
+      /固定 generation 根目录/,
+    );
+    await writePrivateReportAtomic(reportPath, "{\"status\":\"passed\"}\n");
+    assert.equal((await stat(reportPath)).mode & 0o777, 0o600);
+    assert.equal(await readFile(reportPath, "utf8"), "{\"status\":\"passed\"}\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

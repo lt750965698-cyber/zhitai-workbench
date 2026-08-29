@@ -2,7 +2,7 @@
 "use strict";
 
 const fsp = require("node:fs/promises");
-const { createHash } = require("node:crypto");
+const { createHash, randomUUID } = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
@@ -16,6 +16,17 @@ const FFPROBE = process.env.ZHITAI_FFPROBE
 const EDGE_TTS = process.env.ZHITAI_EDGE_TTS
   || path.join(RUNTIME_ROOT, "engines", "MoneyPrinterTurbo", ".venv", "bin", "edge-tts");
 const DEFAULT_VOICE = process.env.ZHITAI_TTS_VOICE || "zh-CN-XiaoxiaoNeural";
+const GENERATION_ROOT = path.join(os.homedir(), ".local", "share", "zhitai-runtime", "generation");
+const CREATIVE_JOB_ID = /^creative_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const NARRATION_SOURCES = new Set([
+  "originality_voiceover", "original_shot_narration", "original_title_fallback",
+  "voiceover_draft", "shot_narration", "title", "hook", "publish_copy", "title_fallback",
+]);
+const TTS_RATES = new Set(["+0%", "+10%", "+20%"]);
+const MAX_NARRATION_CHARS = 180;
+const MAX_SUBTITLE_BYTES = 64 * 1024;
+const MAX_REPORT_BYTES = 16 * 1024;
+const FORBIDDEN_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u;
 
 function run(command, args, { timeoutMs = 180_000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -56,6 +67,169 @@ function cleanSpokenText(value) {
     .replace(/\s+/g, " ")
     .replace(/\s+([，。！？；：])/g, "$1")
     .trim();
+}
+
+function normalizeNarrationEvidence(value, { allowEmpty = false } = {}) {
+  const normalized = String(value ?? "")
+    .normalize("NFC")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\t\n ]+/g, " ")
+    .trim();
+  if ((!allowEmpty && !normalized) || FORBIDDEN_TEXT_CONTROL.test(normalized)) {
+    throw new Error("旁白证据包含空文本或控制字符");
+  }
+  if ([...normalized].length > MAX_NARRATION_CHARS) throw new Error("旁白证据超过长度上限");
+  return normalized;
+}
+
+function narrationComparisonKey(value) {
+  return normalizeNarrationEvidence(value).normalize("NFKC").replace(/\s+/gu, "");
+}
+
+function parseEdgeTtsSrt(value) {
+  const source = String(value || "").replace(/^\uFEFF/u, "").replace(/\r\n?/g, "\n").trim();
+  if (!source || FORBIDDEN_TEXT_CONTROL.test(source)) throw new Error("Edge TTS 字幕为空或包含控制字符");
+  const cues = source.split(/\n{2,}/u);
+  const texts = cues.map((cue, index) => {
+    const lines = cue.split("\n");
+    if (lines[0] !== String(index + 1)
+      || !/^\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}$/u.test(lines[1] || "")
+      || lines.length < 3) {
+      throw new Error("Edge TTS 字幕格式不符合顺序 SRT 契约");
+    }
+    const text = lines.slice(2).join(" ").trim();
+    if (!text || /[<>]/u.test(text)) throw new Error("Edge TTS 字幕包含空提示或标记");
+    return text;
+  });
+  // edge-tts 的 WordBoundary 提示可能把一句话拆成多个 cue；直接拼接可还原
+  // 实际送入合成器的字符序列，比较时只规范化 Unicode 与空白。
+  return normalizeNarrationEvidence(texts.join(""));
+}
+
+async function verifiedSynthesizedNarration(subtitlePath, expectedNarration) {
+  const stat = await fsp.lstat(subtitlePath).catch(() => null);
+  if (!stat?.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > MAX_SUBTITLE_BYTES) {
+    throw new Error("Edge TTS 没有生成大小合规的本地字幕证据");
+  }
+  const bytes = await fsp.readFile(subtitlePath);
+  let subtitle;
+  try { subtitle = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new Error("Edge TTS 字幕不是有效 UTF-8"); }
+  const actual = parseEdgeTtsSrt(subtitle);
+  const expected = normalizeNarrationEvidence(expectedNarration);
+  if (narrationComparisonKey(actual) !== narrationComparisonKey(expected)) {
+    throw new Error("Edge TTS 字幕反读文本与选中旁白不一致");
+  }
+  return actual;
+}
+
+function validatedVoice(value) {
+  const voice = String(value || "");
+  if (voice.length > 64 || !/^[a-z]{2,3}-[A-Z]{2}-[A-Za-z0-9]+Neural$/u.test(voice)) {
+    throw new Error("Edge TTS voice 不在允许格式内");
+  }
+  return voice;
+}
+
+async function secureOutputScope(output, input, { generationRoot = GENERATION_ROOT } = {}) {
+  if (typeof output !== "string" || !path.isAbsolute(output) || path.normalize(output) !== output
+    || path.basename(output) !== "final.mp4") {
+    throw new Error("音频后期输出路径不符合固定文件契约");
+  }
+  const outputDir = path.dirname(output);
+  const jobId = path.basename(outputDir);
+  if (!CREATIVE_JOB_ID.test(jobId)) throw new Error("音频后期作业 ID 不是 canonical creative UUID");
+  const trustedGenerationRoot = path.resolve(String(generationRoot));
+  if (path.dirname(outputDir) !== trustedGenerationRoot
+    || outputDir !== path.join(trustedGenerationRoot, jobId)) {
+    throw new Error("音频后期输出目录不属于固定 generation 根目录");
+  }
+  const expectedInput = path.join(outputDir, "final.visual.mp4");
+  if (typeof input !== "string" || path.normalize(input) !== expectedInput) {
+    throw new Error("音频后期输入路径不属于当前 creative 作业");
+  }
+  await fsp.mkdir(outputDir, { recursive: true, mode: 0o700 });
+  const stat = await fsp.lstat(outputDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("音频后期作业目录不是本地实体目录");
+  await fsp.chmod(outputDir, 0o700);
+  return { jobId, outputDir };
+}
+
+function buildAudioQualityReport({
+  jobId, tts, narration, narrationSource, narrationTiming, finalTimingPassed,
+  durationTarget, outputMedia, media, discardInputAudio, originality, outputSizeBytes,
+  outputSha256, quality, checkedAt,
+}) {
+  if (!CREATIVE_JOB_ID.test(jobId)) throw new Error("音频质检报告作业 ID 无效");
+  const hasTts = Boolean(tts);
+  const boundedNarration = hasTts ? normalizeNarrationEvidence(narration) : null;
+  const source = hasTts && NARRATION_SOURCES.has(narrationSource) ? narrationSource : hasTts ? null : "none";
+  if (hasTts && source === null) throw new Error("音频质检报告旁白来源无效");
+  const voice = hasTts ? validatedVoice(tts.voice) : null;
+  const rate = hasTts && TTS_RATES.has(tts.rate) ? tts.rate : null;
+  if (hasTts && rate === null) throw new Error("音频质检报告语速无效");
+  const originalityPolicy = originality?.policy === "strict_full_original" ? "strict_full_original" : null;
+  const report = {
+    schemaVersion: 1,
+    status: "passed",
+    jobId,
+    provider: hasTts ? "MoneyPrinterTurbo Edge TTS + FFmpeg" : "FFmpeg loudnorm",
+    voice,
+    rate,
+    narrationSource: source,
+    narration: boundedNarration,
+    narrationSha256: createHash("sha256").update(boundedNarration || "").digest("hex"),
+    narrationComplete: Boolean(hasTts && narrationTiming?.passed && finalTimingPassed),
+    narrationVerifiedFromSubtitles: hasTts,
+    narrationDurationMs: hasTts ? narrationTiming?.narrationDurationMs || null : null,
+    finalDurationMs: Math.round(durationTarget * 1_000),
+    outputDurationMs: Math.round(outputMedia.durationSeconds * 1_000),
+    timingVerified: Boolean(finalTimingPassed),
+    inputHadAudio: Boolean(media.hasAudio),
+    inputAudioDiscarded: Boolean(discardInputAudio),
+    originalityPolicy,
+    durationSeconds: Number(media.durationSeconds),
+    outputSizeBytes: Number(outputSizeBytes),
+    outputSha256: String(outputSha256),
+    meanVolumeDb: Number(quality.meanVolumeDb),
+    maxVolumeDb: Number(quality.maxVolumeDb),
+    checkedAt: String(checkedAt),
+  };
+  const narrationDurationValid = !hasTts || (Number.isSafeInteger(report.narrationDurationMs)
+    && report.narrationDurationMs > 0 && report.narrationDurationMs <= report.finalDurationMs);
+  if (!/^[a-f0-9]{64}$/u.test(report.outputSha256)
+    || !Number.isSafeInteger(report.outputSizeBytes) || report.outputSizeBytes < 1
+    || !Number.isFinite(report.durationSeconds) || report.durationSeconds <= 0 || report.durationSeconds > 3_600
+    || !Number.isSafeInteger(report.finalDurationMs) || report.finalDurationMs <= 0 || report.finalDurationMs > 3_600_000
+    || !Number.isSafeInteger(report.outputDurationMs) || report.outputDurationMs <= 0 || report.outputDurationMs > 3_600_000
+    || !narrationDurationValid
+    || !Number.isFinite(report.meanVolumeDb) || report.meanVolumeDb < -200 || report.meanVolumeDb > 20
+    || !Number.isFinite(report.maxVolumeDb) || report.maxVolumeDb < -200 || report.maxVolumeDb > 20
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(report.checkedAt)) {
+    throw new Error("音频质检报告固定字段验证失败");
+  }
+  const json = `${JSON.stringify(report, null, 2)}\n`;
+  if (Buffer.byteLength(json, "utf8") > MAX_REPORT_BYTES) throw new Error("音频质检报告超过大小上限");
+  return { report, json };
+}
+
+async function writePrivateReportAtomic(reportPath, json) {
+  const temporary = path.join(path.dirname(reportPath), `.audio-quality-${process.pid}-${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await fsp.open(temporary, "wx", 0o600);
+    await handle.writeFile(json, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fsp.chmod(temporary, 0o600);
+    await fsp.rename(temporary, reportPath);
+    await fsp.chmod(reportPath, 0o600);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await fsp.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function isUsableNarration(value) {
@@ -191,9 +365,11 @@ async function synthesizeNarration(text, outputDir, durationSeconds) {
   const subtitlePath = path.join(outputDir, "subtitles.srt");
   const density = text.length / Math.max(1, Number(durationSeconds) || 10);
   const rate = density > 4.6 ? "+20%" : density > 4 ? "+10%" : "+0%";
+  const voice = validatedVoice(DEFAULT_VOICE);
+  const expectedNarration = normalizeNarrationEvidence(text);
   await run(EDGE_TTS, [
-    "--text", text,
-    "--voice", DEFAULT_VOICE,
+    "--text", expectedNarration,
+    "--voice", voice,
     "--rate", rate,
     "--volume", "+0%",
     "--write-media", mediaPath,
@@ -201,32 +377,33 @@ async function synthesizeNarration(text, outputDir, durationSeconds) {
   ], { timeoutMs: 180_000 });
   const result = await fsp.stat(mediaPath).catch(() => null);
   if (!result?.isFile() || result.size < 1_024) throw new Error("织台语音引擎没有生成有效配音");
-  return { mediaPath, subtitlePath, voice: DEFAULT_VOICE, rate };
+  const verifiedNarration = await verifiedSynthesizedNarration(subtitlePath, expectedNarration);
+  return { mediaPath, subtitlePath, voice, rate, verifiedNarration };
 }
 
 async function postprocessAudio({ input, output, detail, shots = [], expectedDurationSeconds = null }) {
+  const { jobId, outputDir } = await secureOutputScope(output, input);
   const media = await probeMedia(input);
   if (!media.hasVideo) throw new Error("待后期文件没有可用视频轨");
   if (expectedDurationSeconds !== null
     && Math.abs(media.videoDurationSeconds - Number(expectedDurationSeconds)) > 0.08) {
     throw new Error(`待后期视频时长不是要求的 ${Number(expectedDurationSeconds).toFixed(3)} 秒`);
   }
-  await fsp.mkdir(path.dirname(output), { recursive: true });
   // 新一轮开始前先撤销旧质检凭据。即使后期失败并留下旧 final.mp4，
   // 持久化门也不能把上一次的报告错认成本轮已通过。
   await Promise.all([
-    fsp.rm(path.join(path.dirname(output), "audio-quality.json"), { force: true }),
-    fsp.rm(path.join(path.dirname(output), "narration.mp3"), { force: true }),
-    fsp.rm(path.join(path.dirname(output), "subtitles.srt"), { force: true }),
+    fsp.rm(path.join(outputDir, "audio-quality.json"), { force: true }),
+    fsp.rm(path.join(outputDir, "narration.mp3"), { force: true }),
+    fsp.rm(path.join(outputDir, "subtitles.srt"), { force: true }),
   ]);
   const narration = selectNarration(detail, shots, media.durationSeconds);
-  const narrationBlocker = narrationQualityBlocker(narration.text);
+  const narrationBlocker = narration.text ? narrationQualityBlocker(narration.text) : null;
   if (narrationBlocker) throw new Error(`配音语义质量门未通过：${narrationBlocker}`);
   const originality = detail?.remake_plan?.plan?.seedanceWorkflow?.originality || {};
   const discardInputAudio = originality.policy === "strict_full_original"
     && originality.status === "remediated"
     && originality.sourceAudioAllowed === false;
-  const tts = narration.text ? await synthesizeNarration(narration.text, path.dirname(output), media.durationSeconds) : null;
+  const tts = narration.text ? await synthesizeNarration(narration.text, outputDir, media.durationSeconds) : null;
   if (discardInputAudio && !tts) throw new Error("完全原创补救缺少原创配音文案，不能回退来源音轨");
   if (!tts && !media.hasAudio) throw new Error("成片既没有原音轨，也没有可用配音文案，已停止交付");
   const ttsMedia = tts ? await probeMedia(tts.mediaPath) : null;
@@ -283,35 +460,24 @@ async function postprocessAudio({ input, output, detail, shots = [], expectedDur
     }
     await fsp.rename(temporary, output);
     const outputBuffer = await fsp.readFile(output);
-    const report = {
-      status: "passed",
-      jobId: /^creative_[0-9a-f-]{36}$/i.test(path.basename(path.dirname(output)))
-        ? path.basename(path.dirname(output))
-        : null,
-      provider: tts ? "MoneyPrinterTurbo Edge TTS + FFmpeg" : "FFmpeg loudnorm",
-      voice: tts?.voice || null,
-      rate: tts?.rate || null,
+    const { json } = buildAudioQualityReport({
+      jobId,
+      tts,
+      narration: tts?.verifiedNarration || null,
       narrationSource: narration.source,
-      narration: narration.text || null,
-      narrationSha256: createHash("sha256").update(narration.text || "").digest("hex"),
-      narrationComplete: Boolean(tts && narrationTiming?.passed && finalTimingPassed),
-      narrationDurationMs: narrationTiming?.narrationDurationMs || null,
-      finalDurationMs: Math.round(durationTarget * 1_000),
-      outputDurationMs: Math.round(outputMedia.durationSeconds * 1_000),
-      timingVerified: finalTimingPassed,
-      inputHadAudio: media.hasAudio,
-      inputAudioDiscarded: discardInputAudio,
-      originalityPolicy: originality.policy || null,
-      durationSeconds: media.durationSeconds,
+      narrationTiming,
+      finalTimingPassed,
+      durationTarget,
+      outputMedia,
+      media,
+      discardInputAudio,
+      originality,
       outputSizeBytes: outputBuffer.length,
       outputSha256: createHash("sha256").update(outputBuffer).digest("hex"),
-      ...quality,
+      quality,
       checkedAt: new Date().toISOString(),
-    };
-    const reportPath = path.join(path.dirname(output), "audio-quality.json");
-    const reportTemporary = `${reportPath}.${process.pid}.${Date.now()}.tmp`;
-    await fsp.writeFile(reportTemporary, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-    await fsp.rename(reportTemporary, reportPath);
+    });
+    await writePrivateReportAtomic(path.join(outputDir, "audio-quality.json"), json);
     return output;
   } catch (error) {
     await fsp.rm(temporary, { force: true }).catch(() => {});
@@ -320,15 +486,21 @@ async function postprocessAudio({ input, output, detail, shots = [], expectedDur
 }
 
 module.exports = {
+  buildAudioQualityReport,
   cleanSpokenText,
   detectVolume,
   isGenericTitle,
   isUsableNarration,
   narrationQualityBlocker,
   narrationTimingDecision,
+  normalizeNarrationEvidence,
+  parseEdgeTtsSrt,
   parseVolume,
   postprocessAudio,
   probeMedia,
+  secureOutputScope,
   selectNarration,
   truncateForDuration,
+  verifiedSynthesizedNarration,
+  writePrivateReportAtomic,
 };
