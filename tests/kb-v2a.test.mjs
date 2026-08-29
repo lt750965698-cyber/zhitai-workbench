@@ -241,7 +241,7 @@ test("签名 URL 不落库/API；稳定分享 URL 移除全部查询参数", asy
 /* ─────────── ④ temporary 清理（success + duplicate） ─────────── */
 test("downloadUrl 临时文件在 success 与 duplicate 后均被清理", async () => {
   const dl = `http://127.0.0.1:${httpPort}/v.mp4`;
-  const beforeFiles = new Set((await readdir("/tmp")).filter((f) => f.startsWith("kb_dl_")));
+  const beforeFiles = new Set((await readdir(tmpdir())).filter((f) => f.startsWith("zhitai-kb-download-")));
   // 第一次：success
   const r1 = await request("/api/v1/kuaidian", { method: "POST", body: { downloadUrl: dl, title: "临时清理测试" } });
   assert.equal(r1.status, 202);
@@ -250,7 +250,7 @@ test("downloadUrl 临时文件在 success 与 duplicate 后均被清理", async 
   const r2 = await request("/api/v1/kuaidian", { method: "POST", body: { downloadUrl: dl, title: "临时清理测试2" } });
   assert.equal(r2.status, 202);
   await new Promise((res) => setTimeout(res, 2500));
-  const afterFiles = (await readdir("/tmp")).filter((f) => f.startsWith("kb_dl_"));
+  const afterFiles = (await readdir(tmpdir())).filter((f) => f.startsWith("zhitai-kb-download-"));
   const leaked = afterFiles.filter((f) => !beforeFiles.has(f));
   assert.deepEqual(leaked, [], `临时文件应全部清理，残留: ${leaked.join(",")}`);
 });

@@ -1407,8 +1407,12 @@ export async function ingestOne(db, { receipt, input, input_kind, batchId, ctx =
   } finally {
     // 临时文件统一清理（success 已复制 / duplicate / partial / 异常）
     if (receipt?.temporary) {
-      if (receipt?.temporaryRoot) {
-        await rm(receipt.temporaryRoot, { recursive: true, force: true }).catch(() => {});
+      const temporaryRoot = receipt?.temporaryRoot ? resolve(String(receipt.temporaryRoot)) : null;
+      const managedTemporaryRoot = temporaryRoot && localPath
+        && /^zhitai-kb-download-[A-Za-z0-9_-]+$/u.test(basename(temporaryRoot))
+        && resolve(String(localPath)) === join(temporaryRoot, "media.mp4");
+      if (managedTemporaryRoot) {
+        await rm(temporaryRoot, { recursive: true, force: true }).catch(() => {});
       } else if (localPath) {
         await rm(localPath, { force: true }).catch(() => {});
       }

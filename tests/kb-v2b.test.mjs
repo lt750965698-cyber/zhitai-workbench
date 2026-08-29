@@ -195,7 +195,7 @@ test("旧 metric_snapshot 1 行迁移后仍 1 行值不丢；重开不增长；�
 
 /* ─────────── 8) P1-9：SSRF IPv6 + 协议降级纯函数 ─────────── */
 test("SSRF：IPv6 unspecified/multicast/映射私网拒绝；HTTPS→HTTP 降级拒绝", async () => {
-  const { isPrivateIp, assertNoProtocolDowngrade } = await import("../local-agent/downloader-adapter.mjs");
+  const { isPrivateIp, assertNoProtocolDowngrade, downloadToTemp } = await import("../local-agent/downloader-adapter.mjs");
   assert.equal(isPrivateIp("::"), true, "IPv6 unspecified 拒绝");
   assert.equal(isPrivateIp("ff02::1"), true, "IPv6 multicast 拒绝");
   assert.equal(isPrivateIp("::1"), true);
@@ -213,6 +213,14 @@ test("SSRF：IPv6 unspecified/multicast/映射私网拒绝；HTTPS→HTTP 降级
   assert.equal(next.hostname, "b.example");
   const next2 = assertNoProtocolDowngrade("https://a.example/x", "https://b.example/y");
   assert.equal(next2.protocol, "https:");
+
+  const privateTempParent = join(ROOT, "private-download-temp");
+  await mkdir(privateTempParent, { recursive: true });
+  await assert.rejects(
+    downloadToTemp("http://127.0.0.1/private.mp4", { dir: privateTempParent }),
+    /ssrf_blocked_private_ip/,
+  );
+  assert.deepEqual(await readdir(privateTempParent), [], "失败下载必须移除整个私有临时目录");
 });
 
 /* ─────────── 7) P1-8：stats.mediaCoverage 语义 ─────────── */
