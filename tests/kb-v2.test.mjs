@@ -115,8 +115,22 @@ before(async () => {
 
 after(async () => {
   if (serverErr.trim()) console.log("SERVER_STDERR:", serverErr.slice(-800));
-  try { server.kill(); } catch { /* ignore */ }
-  await rm(ROOT, { recursive: true, force: true });
+  if (server && server.exitCode === null && server.signalCode === null) {
+    const closed = new Promise((resolve) => server.once("close", () => resolve(true)));
+    try { server.kill(); } catch { /* ignore */ }
+    const exited = await Promise.race([
+      closed,
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    if (!exited) {
+      try { server.kill("SIGKILL"); } catch { /* ignore */ }
+      await Promise.race([
+        closed,
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+    }
+  }
+  await rm(ROOT, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 /* ─────────── 用例 1：nested enrich 映射 + 6 文件 + 无敏感键 ─────────── */

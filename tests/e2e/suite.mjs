@@ -485,6 +485,18 @@ async function spawnCrashWorker(configuration) {
   });
 }
 
+function assertHardCrashExit(context, child, label) {
+  if (process.platform === "win32") {
+    context.check(Number.isInteger(child.code) && child.code !== 0,
+      `${label} must report a non-zero forced-termination code on Windows`);
+    context.equal(child.signal, null,
+      `${label} must not claim a POSIX signal on Windows`);
+    return;
+  }
+  context.equal(child.code, null, `${label} must not report a normal exit code`);
+  context.equal(child.signal, "SIGKILL", `${label} must be killed at the authenticated crash boundary`);
+}
+
 const SCENARIOS = [
   {
     id: "full_chain_success",
@@ -950,8 +962,7 @@ const SCENARIOS = [
         faultPoint: "generate",
         platformNames: PLATFORM_NAMES,
       });
-      context.equal(child.code, null, "worker hard crash must not report a normal exit code");
-      context.equal(child.signal, "SIGKILL", "worker must be killed at the authenticated crash boundary");
+      assertHardCrashExit(context, child, "worker hard crash");
       context.check(child.messages.some((message) => message.type === "worker_armed"), "worker must persist receive before crashing");
       context.check(child.messages.some((message) => message.type === "worker_crashed"), "worker must report the injected crash boundary");
       const armed = child.messages.find((message) => message.type === "worker_armed");
@@ -1026,8 +1037,7 @@ const SCENARIOS = [
         crashPlatform: "fake-alpha",
         platformNames: PLATFORM_NAMES,
       });
-      context.equal(child.code, null, "publishing hard crash must not report a normal exit code");
-      context.equal(child.signal, "SIGKILL", "publishing worker must be killed at the adapter side effect boundary");
+      assertHardCrashExit(context, child, "publishing hard crash");
       context.check(child.messages.some((message) => message.type === "worker_publishing_crashed"),
         "worker must prove it entered adapter.publish before exiting");
       const armed = child.messages.find((message) => message.type === "worker_armed");
