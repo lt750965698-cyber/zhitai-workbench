@@ -17,6 +17,11 @@ const RUNTIME_ROOT = path.resolve(process.env.ZHITAI_RUNTIME_ROOT
   || path.join(HOME, ".local", "share", "zhitai-runtime"));
 const APPLICATIONS_ROOT = path.resolve(process.env.ZHITAI_APPLICATIONS_DIR
   || path.join(HOME, "Applications"));
+const DEFAULT_LOG_DIR = process.platform === "win32"
+  ? path.join(process.env.LOCALAPPDATA || path.join(HOME, "AppData", "Local"), "Zhitai", "logs")
+  : process.platform === "darwin"
+    ? path.join(HOME, "Library", "Logs", "zhitai")
+    : path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "zhitai", "logs");
 
 // Finder 的 PATH 通常很短：优先显式配置和织台稳定入口，再检查标准安装位置。
 // Electron 自身可通过 ELECTRON_RUN_AS_NODE 作为最终后备，不依赖开发机工具目录。
@@ -52,7 +57,7 @@ let ctx = {
   projectDir: path.resolve(__dirname, ".."),
   runtimeScript: path.join(HOME, ".local/share/zhitai-runtime/scripts/run-local-agent.command"),
   analyzerScript: path.join(__dirname, "..", "scripts", "video-analysis-server.mjs"),
-  logDir: path.join(HOME, "Library", "Logs"),
+  logDir: DEFAULT_LOG_DIR,
   nodeBin: NODE_BIN,
   xhsAccountsDir: null,
   xhsLegacyCookiesPath: null,
@@ -102,9 +107,19 @@ async function scanWebPort() {
 // 会抛 ERR_INVALID_ARG_VALUE，导致 web/各服务 spawn 失败——必须用同步 fd。
 function openLogFd(file, mode = null) {
   const fs = require("node:fs");
-  try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch (_) {}
-  const fd = fs.openSync(file, "a", mode || 0o644);
-  if (mode) fs.chmodSync(file, mode);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") fs.chmodSync(path.dirname(file), 0o700);
+  } catch {
+    // openSync below returns a stable launch error; never echo a private path here.
+  }
+  const fileMode = mode || 0o600;
+  const fd = fs.openSync(file, "a", fileMode);
+  try {
+    if (process.platform !== "win32") fs.fchmodSync(fd, fileMode);
+  } catch {
+    // Creation mode already requested least privilege on POSIX systems.
+  }
   return fd;
 }
 

@@ -15,12 +15,18 @@ const SENSITIVE_QUERY_NAMES = new Set([
   "authorization",
   "authkey",
   "auth_key",
+  "credential",
+  "credentials",
   "decode_key",
   "decodekey",
   "decrypt_key",
   "encfilekey",
   "expires",
   "key",
+  "pass_ticket",
+  "session",
+  "session_id",
+  "sessionid",
   "signature",
   "sig",
   "token",
@@ -45,6 +51,34 @@ const SENSITIVE_FIELD_EXACT = new Set([
   "videourl", "playableurl", "downloadurl",
   "auth", "uskey", "x-uskey",
 ]);
+
+const URL_VALUE_CREDENTIAL_RE = /(?:^|[\s?&;,/])(?:bearer(?:\s+|[A-Za-z0-9._~+/-])|(?:access[_-]?token|auth(?:orization)?|cookie|credential|password|pass[_-]?ticket|secret|session(?:_?id)?|signature|sig|token|uskey|x-uskey|x-amz-signature|x-cos-signature|x-oss-security-token)\s*[=:])/i;
+const URL_VALUE_PHONE_RE = /(?:\+?86[ -]?)?1[3-9]\d{9}/;
+const URL_VALUE_PATH_RE = /(?:file:\/\/\/|(?:^|[\s=:])\/(?:Users|home|private|var|tmp|opt|srv)\/|[A-Za-z]:\\(?:Users|Documents|Desktop)\\|~\/)/i;
+const URL_PATH_PRIVATE_SEGMENT_RE = /(?:^|\/)(?:Users|home|private|var|tmp|opt|srv)(?:\/|$)/i;
+const URL_VALUE_HTML_RE = /<(?:html|body|script|style|div|span|p|a|img|video|article|section)\b/i;
+
+function decodedQueryValue(value) {
+  let decoded = String(value ?? "");
+  for (let index = 0; index < 2; index += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  return decoded;
+}
+
+function queryValueHasSensitiveMaterial(value) {
+  const decoded = decodedQueryValue(value);
+  return URL_VALUE_CREDENTIAL_RE.test(decoded)
+    || URL_VALUE_PHONE_RE.test(decoded)
+    || URL_VALUE_PATH_RE.test(decoded)
+    || URL_VALUE_HTML_RE.test(decoded);
+}
 
 /** 语义非凭据负例白名单（D2 终审）：cookiePolicy/tokenizer/monkey/oauth/ordinary_key/author/title
  *  即使含 cookie/token/key 子串也绝不判敏感（有界识别，不用无边界 contains） */
@@ -89,7 +123,7 @@ export function isSensitiveFieldName(name) {
   // （lower/digit→Upper、acronym→CapitalizedWord），ALL_CAPS 段保持整体后 lower。
   // AUTH_HEADER→[auth,header]、X_USKEY→[x,uskey]、AUTHHeader→[auth,header]、
   // authorizationHeader→[authorization,header]；monkey/oauth/ordinary_key/cookiePolicy/tokenizer 不误伤。
-  const segments = raw.split(/[-_.[\]]+/)
+  const segments = raw.split(/(?:_|-|\.|\[|\])+/)
     .flatMap((part) => part.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
       .map((seg) => seg.toLowerCase()));
   return segments.some((seg) => SENSITIVE_SEGMENT_WORDS.has(seg));
@@ -164,8 +198,21 @@ export function canonicalizeSourceUrl(input) {
     const url = new URL(raw);
     if (!["http:", "https:"].includes(url.protocol)) return raw;
     url.hash = "";
+    url.username = "";
+    url.password = "";
     url.hostname = url.hostname.toLowerCase();
-    const safeEntries = [...url.searchParams.entries()].filter(([key]) => !isSensitiveQueryName(key));
+    const decodedPath = decodedQueryValue(url.pathname);
+    if (queryValueHasSensitiveMaterial(decodedPath) || URL_PATH_PRIVATE_SEGMENT_RE.test(decodedPath)) {
+      url.pathname = "/";
+    }
+    // 受支持的分享 URL 以路径中的平台 ID 作为稳定身份。查询参数不是身份所需，
+    // 且任意看似普通的 key 都可被滥用为正文/凭据隐蔽通道，因此一律丢弃。
+    if (hasStableSharePath(url)) {
+      url.search = "";
+      return url.toString();
+    }
+    const safeEntries = [...url.searchParams.entries()]
+      .filter(([key, value]) => !isSensitiveQueryName(key) && !queryValueHasSensitiveMaterial(value));
     const sorted = safeEntries.sort(([leftKey, leftValue], [rightKey, rightValue]) =>
       leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue));
     url.search = "";
@@ -181,9 +228,18 @@ export function containsSensitiveUrlMaterial(input) {
   if (!raw) return false;
   try {
     const url = new URL(raw);
-    return [...url.searchParams.keys()].some(isSensitiveQueryName);
+    if (url.username || url.password) return true;
+    const decodedPath = decodedQueryValue(url.pathname);
+    const decodedHash = decodedQueryValue(url.hash);
+    if (queryValueHasSensitiveMaterial(decodedPath)
+      || URL_PATH_PRIVATE_SEGMENT_RE.test(decodedPath)
+      || queryValueHasSensitiveMaterial(decodedHash)
+      || URL_PATH_PRIVATE_SEGMENT_RE.test(decodedHash)) return true;
+    return [...url.searchParams.entries()]
+      .some(([key, value]) => isSensitiveQueryName(key) || queryValueHasSensitiveMaterial(value));
   } catch {
-    return /(?:^|[?&])(token|encfilekey|decode_?key|decrypt_?key|signature|authorization|access_token)=/i.test(raw);
+    return /(?:^|[?&])(token|encfilekey|decode_?key|decrypt_?key|signature|authorization|access_token|credential|session(?:_?id)?|pass_ticket)=/i.test(raw)
+      || queryValueHasSensitiveMaterial(raw);
   }
 }
 
@@ -663,13 +719,22 @@ export function isStableShareUrl(input) {
   try { url = new URL(raw); } catch { return false; }
   if (!["http:", "https:"].includes(url.protocol)) return false;
   if (containsSensitiveUrlMaterial(raw)) return false;
+  return hasStableSharePath(url);
+}
+
+function hasStableSharePath(url) {
   const host = url.hostname.toLowerCase();
   const path = url.pathname;
   // 视频号：weixin.qq.com/sph/xxx、channels.weixin.qq.com/mobile/sf/xxx、weixin.qq.com/s/xxx
-  const wechatShare = (host === "weixin.qq.com" || host === "channels.weixin.qq.com" || host === "mp.weixin.qq.com")
-    && /(?:^|\/)(sph|sf|s)\/[A-Za-z0-9_-]+/i.test(path);
+  const wechatShare = (host === "weixin.qq.com" && /^\/(?:sph|sf|s)\/[A-Za-z0-9_-]+\/?$/i.test(path))
+    || (host === "channels.weixin.qq.com" && /^\/mobile\/sf\/[A-Za-z0-9_-]+\/?$/i.test(path))
+    || (host === "mp.weixin.qq.com" && /^\/s\/[A-Za-z0-9_-]+\/?$/i.test(path));
   // 抖音短链 / 小红书短链
-  const dyShare = host === "v.douyin.com" || (host.endsWith(".douyin.com") && /\/video\//.test(path));
-  const xhsShare = host === "xhslink.com" || host === "www.xiaohongshu.com";
+  const dyShare = (host === "v.douyin.com" && /^\/[A-Za-z0-9_-]+\/?$/i.test(path))
+    || (["douyin.com", "www.douyin.com", "m.douyin.com"].includes(host)
+      && /^\/video\/[A-Za-z0-9_-]+\/?$/i.test(path));
+  const xhsShare = (host === "xhslink.com" && /^\/[A-Za-z0-9_-]+\/?$/i.test(path))
+    || (["xiaohongshu.com", "www.xiaohongshu.com"].includes(host)
+      && /^\/(?:explore|discovery\/item)\/[A-Za-z0-9_-]+\/?$/i.test(path));
   return Boolean(wechatShare || dyShare || xhsShare);
 }

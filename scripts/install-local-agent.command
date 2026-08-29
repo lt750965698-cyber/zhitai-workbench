@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+umask 077
 
 script_dir="${0:A:h}"
 user_id="$(id -u)"
@@ -10,9 +11,15 @@ target_plist="${launch_agents_dir}/com.zhitai.local-agent.plist"
 runtime_dir="${user_dir}/.local/share/zhitai-runtime"
 engine_dir="${runtime_dir}/engines"
 openclaw_runtime_dir="${ZHITAI_OPENCLAW_RUNTIME_DIR:-${user_dir}/Applications/openclaw-runtime}"
+service_log_dir="${user_dir}/Library/Logs/zhitai"
+service_stdout="${service_log_dir}/local-agent.log"
+service_stderr="${service_log_dir}/local-agent.error.log"
 
 mkdir -p "${launch_agents_dir}"
-mkdir -p "${runtime_dir}/local-agent" "${runtime_dir}/scripts"
+mkdir -p -m 700 "${runtime_dir}/local-agent" "${runtime_dir}/scripts" "${service_log_dir}"
+chmod 700 "${runtime_dir}" "${runtime_dir}/local-agent" "${runtime_dir}/scripts" "${service_log_dir}" 2>/dev/null || true
+touch "${service_stdout}" "${service_stderr}"
+chmod 600 "${service_stdout}" "${service_stderr}"
 # 模块更新使用稳定入口；首次升级前先把当前已验证版本接到稳定别名。
 for alias_target in \
   "mcp-video-analyzer-current:mcp-video-analyzer-v0.9.0" \
@@ -27,7 +34,8 @@ for alias_target in \
 done
 # server 的模块已拆分，必须整组同步；本机 Cookie 和既有运行配置不参与批量覆盖。
 rsync -a \
-  --exclude='config.local.json' --exclude='yuanbao-cookie' --exclude='data/' \
+  --exclude='config.local.json' --exclude='yuanbao-cookie' --exclude='data/' --exclude='diag/' \
+  --exclude='*.log' --exclude='*.tmp' \
   --exclude='zhitai-kuaidian-bridge.user.js' --exclude='zhitai-edge-all-in-one.user.js' \
   "${script_dir}/../local-agent/" "${runtime_dir}/local-agent/"
 if [[ -d "${script_dir}/../integrations/zhitai-clawbot-control" && -d "${openclaw_runtime_dir}" ]]; then
@@ -99,8 +107,8 @@ fi
 
 cp "${script_dir}/com.zhitai.local-agent.plist" "${target_plist}"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:1 ${runtime_dir}/scripts/run-local-agent.command" "${target_plist}"
-/usr/libexec/PlistBuddy -c "Set :StandardOutPath ${user_dir}/Library/Logs/zhitai-local-agent.log" "${target_plist}"
-/usr/libexec/PlistBuddy -c "Set :StandardErrorPath ${user_dir}/Library/Logs/zhitai-local-agent.error.log" "${target_plist}"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath ${service_stdout}" "${target_plist}"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath ${service_stderr}" "${target_plist}"
 chmod 600 "${target_plist}"
 launchctl bootout "gui/${user_id}" "${target_plist}" 2>/dev/null || true
 launchctl bootstrap "gui/${user_id}" "${target_plist}"
@@ -116,7 +124,7 @@ for _attempt in {1..40}; do
   sleep 0.25
 done
 if [[ "${ready}" -ne 1 ]]; then
-  print -u2 "本地节点已安装，但健康检查未在 10 秒内通过。请查看 ~/Library/Logs/zhitai-local-agent.error.log。"
+  print -u2 "本地节点已安装，但健康检查未在 10 秒内通过。请查看 ~/Library/Logs/zhitai/local-agent.error.log。"
   exit 1
 fi
 

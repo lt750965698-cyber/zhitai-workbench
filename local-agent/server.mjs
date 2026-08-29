@@ -38,7 +38,13 @@ import {
   ZHITAI_LOCAL_MOTION_ENGINE,
   ZHITAI_SEEDANCE_ENGINE,
 } from "./kb.mjs";
-import { isStableShareUrl, canonicalizeSourceUrl, probeLocalMedia, redactUrlForStorage } from "./downloader-adapter.mjs";
+import {
+  isStableShareUrl,
+  canonicalizeSourceUrl,
+  containsSensitiveUrlMaterial,
+  probeLocalMedia,
+  redactUrlForStorage,
+} from "./downloader-adapter.mjs";
 import { downloadSafeImage } from "./safe-image-download.mjs";
 import * as matrix from "./matrixmedia-adapter.mjs";
 import { createPlatformReceipts, persistPlatformReceipts, redactPlatformReceiptText } from "./platform-receipts.mjs";
@@ -46,6 +52,7 @@ import * as xhsPublisher from "./xiaohongshu-publisher.mjs";
 import * as wechatOfficial from "./wechat-official-publisher.mjs";
 import { CreativeQueue } from "./creative-queue.mjs";
 import { assertLifecycleTransition, publishFailureDisposition } from "./content-lifecycle.mjs";
+import { createDiagnosticStore } from "./diagnostics.mjs";
 import { AnalysisQueue } from "./analysis-queue.mjs";
 import { buildRuntimeConditions, normalizeCreativeConditionReport } from "./runtime-conditions.mjs";
 import { assessGenerationReadiness } from "./seedance-workflow.mjs";
@@ -121,6 +128,19 @@ const kuaidianHeartbeat = {
   pendingReportCount: 0,
   lastResult: null,
 };
+const KUAIDIAN_PAGE_KINDS = new Set(["filehelper", "unknown"]);
+const KUAIDIAN_RESULT_CODES = new Set([
+  "idle",
+  "ok",
+  "card_accepted",
+  "card_rejected",
+  "card_unreachable",
+  "card_timeout",
+  "reported_success",
+  "needs_attention",
+  "report_failed",
+  "unknown",
+]);
 // 重供命令队列（仅 itemId + 内部 deliveryId；绝不含下载 URL/签名），持久化 dataDir/kuaidian-commands.json
 const kuaidianCommandsPath = join(dataDir, "kuaidian-commands.json");
 // 可测试性注入：ZHITAI_ENRICH_SCRIPT=<path> 时用脚本默认导出替代真实元宝补元数据（测试用，生产不设置）
@@ -1014,6 +1034,12 @@ await Promise.all([
   mkdir(knowledgeBase, { recursive: true }),
 ]);
 await chmod(platformReceiptsDir, 0o700);
+
+const diagnostics = createDiagnosticStore({
+  dataDir,
+  policy: config.diagnostics,
+});
+await diagnostics.initialize();
 
 // 先启动且等待唯一的启动迁移，再恢复创作队列。迁移预处理阶段不持锁，
 // 提交阶段与后续手动刷新/自主复审又共用 serializeLibraryDbWork。
@@ -2537,28 +2563,41 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    // 诊断通道:桥接脚本把 webwxsync 等原始响应转发过来存盘,
-    // 用于排查"网页版到底收到了什么消息结构"(视频号卡片提取)。
+    // 隐私最小化诊断：任何输入都先投影到固定统计 schema；未知字段、正文、HTML、
+    // Cookie/Token、手机号、URL 和绝对路径不会进入磁盘、日志、API 或导出。
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/diag") {
       if (!guardJsonWrite(request, response)) return;
-      const { json } = await readJsonBody(request, 300_000);
-      const diagDir = join(dataDir, "diag");
-      await mkdir(diagDir, { recursive: true });
-      const fname = `sync-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.json`;
-      await writeFile(
-        join(diagDir, fname),
-        JSON.stringify({
-          at: new Date().toISOString(),
-          url: String(json?.url || "").slice(0, 500),
-          text: String(json?.text || "").slice(0, 60_000),
-        }, null, 2),
-      );
-      sendJson(response, 202, { ok: true }, request);
+      const { json } = await readJsonBody(request, 96_000);
+      const result = await diagnostics.record(json, {
+        kind: "sync_response",
+        source: "filehelper_bridge",
+        outcome: "observed",
+        transport: json?.transport,
+        contentType: "json",
+      });
+      sendJson(response, 202, { ok: true, ...result }, request);
+      return;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/v1/diagnostics") {
+      sendJson(response, 200, await diagnostics.status(), request);
+      return;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/v1/diagnostics/export") {
+      const bundle = await diagnostics.exportBundle();
+      response.writeHead(200, {
+        ...corsHeaders(request),
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Disposition": 'attachment; filename="zhitai-diagnostics.json"',
+      });
+      response.end(JSON.stringify(bundle));
       return;
     }
 
     // 快点工具下载引擎上报（主力通道）：
-    // {downloadUrl|localPath, sourceUrl?, deliveryId?, title?} —— 向后兼容 url
+    // {downloadUrl|localPath, sourceUrl?, deliveryId?} —— 向后兼容 url
     // downloadUrl=临时媒体直链（永不落库/出 API/日志；落库前 fingerprint）；
     // sourceUrl=稳定分享链接（sph/sf），只有真实稳定分享 URL 才调元宝补元数据；
     // deliveryId=本机投递 ID（原版快点 okd[].m = 微信 MsgId），仅作投递溯源/查重，
@@ -2568,8 +2607,9 @@ const server = createServer(async (request, response) => {
       const { json } = await readJsonBody(request, 100_000);
       const downloadUrl = String(json?.downloadUrl || json?.url || "").trim();
       const localPath = String(json?.localPath || "").trim() || (downloadUrl && !/^https?:\/\//i.test(downloadUrl) ? downloadUrl : "");
-      const title = String(json?.title || "视频号内容").trim().slice(0, 200);
-      const content = String(json?.content || "").trim().slice(0, 2000);
+      // 旧桥曾把同步响应中的 title/content 带过此边界。调用方提供的这两个
+      // 字段现在一律忽略，避免私聊正文、手机号或凭据进入日志、回执和任务 API。
+      const title = "视频号内容";
       const rawSourceUrl = String(json?.sourceUrl || "").trim().slice(0, 500) || null;
       // A4.3-B：原版快点 okd[].m 是微信 MsgId（投递 ID），不是平台 contentId。
       // deliveryId（限定长度/字符）只作本机投递溯源，绝不复制进 contentId/标题/sourceUrl；
@@ -2761,14 +2801,14 @@ const server = createServer(async (request, response) => {
           const ctx = { privDir: kbPrivDir, yuanbaoEnrich: enrich, displayInput: sourceUrl || displayInput, itemId };
           const startedAt = new Date().toISOString();
           try {
-            const receipt = await adapterKuaidian({ downloadUrl: isDl ? downloadUrl : null, localPath, sourceUrl, title: title || content });
+            const receipt = await adapterKuaidian({ downloadUrl: isDl ? downloadUrl : null, localPath, sourceUrl, title });
             // A4.3-B：显式提供的真实平台 contentId 优先于 adapter 推导值（覆盖）；deliveryId 绝不复制进 contentId
             if (contentId) receipt.contentId = contentId;
             const r = await kbIngestOne(workerDb, { receipt, input: inputForIngest, input_kind: "kuaidian", batchId, ctx });
             recountBatch(workerDb, batchId);
             if (sourceUrl) await updateAwaitingTask(sourceUrl, r, workerDb);
             if (r?.assetId && ["success", "duplicate", "linked"].includes(String(r.status))) {
-              scheduleCreativePreparation(r.assetId, receipt.title || title || content);
+              scheduleCreativePreparation(r.assetId, receipt.title || title);
             }
             recordEvent(r.status === "success" ? "info" : "error", "KUAIDIAN_INGEST",
               `快点通道[${receipt.mediaValidation}]${r.status === "partial" ? "（加密流/探测失败）" : ""}${enrich ? " 元数据已补" : " 无sourceUrl(元数据unavailable)"}：${(title || "").slice(0, 40)}`);
@@ -2807,13 +2847,16 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && requestUrl.pathname === "/api/v1/kuaidian/heartbeat") {
       if (!guardJsonWrite(request, response)) return;
       const { json } = await readJsonBody(request, 8_000);
-      // 白名单安全字段：version/pageKind/wechatLoggedIn/originalKuaidianDetected/pendingReportCount/lastResult
-      kuaidianHeartbeat.version = String(json?.version ?? kuaidianHeartbeat.version ?? "").slice(0, 32) || null;
-      kuaidianHeartbeat.pageKind = String(json?.pageKind ?? "").slice(0, 32) || null;
-      kuaidianHeartbeat.wechatLoggedIn = Boolean(json?.wechatLoggedIn);
-      kuaidianHeartbeat.originalKuaidianDetected = Boolean(json?.originalKuaidianDetected);
-      kuaidianHeartbeat.pendingReportCount = Math.max(0, Number(json?.pendingReportCount) || 0);
-      kuaidianHeartbeat.lastResult = String(json?.lastResult ?? "").slice(0, 200) || null;
+      // 字段名和字段值都用白名单，防止任意字符串通过 heartbeat 进入状态 API。
+      const version = normalizeCompanionVersion(json?.version);
+      const pageKind = normalizeFixedValue(json?.pageKind, KUAIDIAN_PAGE_KINDS);
+      const lastResult = normalizeFixedValue(json?.lastResultCode ?? json?.lastResult, KUAIDIAN_RESULT_CODES);
+      kuaidianHeartbeat.version = version ?? kuaidianHeartbeat.version;
+      kuaidianHeartbeat.pageKind = pageKind;
+      kuaidianHeartbeat.wechatLoggedIn = json?.wechatLoggedIn === true;
+      kuaidianHeartbeat.originalKuaidianDetected = json?.originalKuaidianDetected === true;
+      kuaidianHeartbeat.pendingReportCount = boundedCount(json?.pendingReportCount, 10_000);
+      kuaidianHeartbeat.lastResult = lastResult;
       kuaidianHeartbeat.online = true;
       kuaidianHeartbeat.lastSeen = new Date().toISOString();
       sendJson(response, 202, { ok: true }, request);
@@ -3535,6 +3578,7 @@ async function loadConfig() {
       enabled: parsed.mediaFallback?.enabled === true,
       providers: Array.isArray(parsed.mediaFallback?.providers) ? parsed.mediaFallback.providers : [],
     },
+    diagnostics: parsed.diagnostics && typeof parsed.diagnostics === "object" ? parsed.diagnostics : {},
   };
 }
 
@@ -3710,7 +3754,10 @@ function extractSupportedUrl(value) {
   try {
     const parsed = new URL(cleaned);
     if (!["https:", "http:"].includes(parsed.protocol)) return null;
-    return allowedHosts.has(parsed.hostname.toLowerCase()) ? parsed.toString() : null;
+    if (!allowedHosts.has(parsed.hostname.toLowerCase())
+      || containsSensitiveUrlMaterial(parsed.toString())
+      || !isStableShareUrl(parsed.toString())) return null;
+    return canonicalizeSourceUrl(parsed.toString());
   } catch {
     return null;
   }
@@ -3726,7 +3773,12 @@ function sanitizeUserNote(value) {
 
 function noteAfterUrl(text, url) {
   if (typeof text !== "string" || !url) return "";
-  return sanitizeUserNote(text.replace(url, ""));
+  // `url` 可能已 canonicalize 并丢弃 query/hash，不能用它从原文做字面替换；
+  // 否则签名 query 或伪装成普通 query 的私聊会被误当备注持久化。
+  const match = text.match(/https?:\/\/[^\s<>"']+/i);
+  if (!match || match.index === undefined) return sanitizeUserNote(text);
+  const withoutUrl = `${text.slice(0, match.index)} ${text.slice(match.index + match[0].length)}`;
+  return sanitizeUserNote(withoutUrl);
 }
 
 const DOWNLOAD_FAILURE_ZH = {
@@ -3907,7 +3959,8 @@ async function createChannelsCardTask(body, source) {
   if (!/^[A-Za-z0-9_-]{1,240}$/.test(nonceId)) throw httpError(400, "invalid_channels_nonce_id");
   const deliveryValidation = validateDeliveryId(body?.deliveryId);
   if (deliveryValidation.has && !deliveryValidation.valid) throw httpError(400, "invalid_delivery_id");
-  const title = sanitizeTitle(String(body?.title || "视频号内容").slice(0, 200));
+  // 浏览器同步响应中的 desc/title 不跨越此边界；可信标题由后续媒体元数据补全。
+  const title = "视频号内容";
   const sourceUrl = `https://channels.weixin.qq.com/web/pages/feed?oid=${encodeURIComponent(objectId)}&nid=${encodeURIComponent(nonceId)}`;
   const now = new Date().toISOString();
 
@@ -5630,7 +5683,7 @@ async function startWatcher() {
   await loadWatcherState();
   setInterval(() => { void scanWatcherLibsSingleFlight(); }, WATCHER_INTERVAL);
   void scanWatcherLibsSingleFlight();
-  console.log(`目录 watcher 已启动：${watcherRoots.map((r) => `${r.dir}→${r.channel}`).join(" / ")}`);
+  console.log(`目录 watcher 已启动：${watcherRoots.length} 个本机目录（路径已省略）`);
 }
 
 async function deactivateLegacyScheduledTasks() {
@@ -6968,10 +7021,31 @@ function safeErrorCode(error) {
     .slice(0, 120);
 }
 
+function normalizeCompanionVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value.trim());
+  return match ? `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}` : null;
+}
+
+function normalizeFixedValue(value, allowed) {
+  if (typeof value !== "string" || value.length > 32) return "unknown";
+  const normalized = value.toLowerCase();
+  return allowed.has(normalized) ? normalized : "unknown";
+}
+
+function boundedCount(value, maximum) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(maximum, Math.max(0, Math.trunc(value)))
+    : 0;
+}
+
 function safeMessage(value) {
-  return String(value || "")
-    .replace(/(cookie|token|authorization|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
-    .replace(/https?:\/\/[^\s]+/g, "[url]")
+  const withoutCredentials = String(value || "")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/(cookie|token|authorization|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]");
+  return sanitizeFailureText(withoutCredentials)
+    .replace(/<[^>]{0,2048}>/g, "[html]")
+    .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, "[phone]")
     .slice(0, 500);
 }
 

@@ -268,25 +268,16 @@ test("local agent integrates content packages, approval gates, and exclusive ser
   });
 
   await t.test("视频号可用性探针与卡片解析共用配置的自定义引擎端口", async () => {
-    const body = {
+    const cardBody = {
       objectId: "14950209185632029317",
       nonceId: "custom_port_nonce_1",
-      title: "自定义端口卡片",
+      title: "这个浏览器标题必须被忽略",
       source: "fixture",
     };
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const nonce = "channels_card_custom_port_123456";
-    const signature = `v1=${createHmac("sha256", webhookSecret)
-      .update(`${timestamp}.${nonce}.${JSON.stringify(body)}`)
-      .digest("hex")}`;
     const created = await requestJson(baseUrl, "/api/v1/channels/card", {
       method: "POST",
-      headers: {
-        "X-Zhitai-Timestamp": timestamp,
-        "X-Zhitai-Nonce": nonce,
-        "X-Zhitai-Signature": signature,
-      },
-      body,
+      body: cardBody,
+      headers: signedHeaders(cardBody, "fixture-channels-card-custom-port"),
     });
     assert.equal(created.response.status, 202);
     const completed = await waitFor(async () => {
@@ -654,6 +645,16 @@ async function requestJson(baseUrl, path, options = {}) {
   });
   const body = await response.json();
   return { response, body };
+}
+
+function signedHeaders(body, nonce) {
+  const timestamp = String(Date.now());
+  const raw = JSON.stringify(body);
+  return {
+    "X-Zhitai-Timestamp": timestamp,
+    "X-Zhitai-Nonce": nonce,
+    "X-Zhitai-Signature": `v1=${createHmac("sha256", webhookSecret).update(`${timestamp}.${nonce}.${raw}`).digest("hex")}`,
+  };
 }
 
 async function requestRawChunks(baseUrl, path, chunks, headers) {

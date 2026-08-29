@@ -149,6 +149,7 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 - 收件和遥控入口在配置共享密钥后会对每个请求强制校验 HMAC、时间窗和 nonce，不能通过省略签名头降级。明确未配置密钥时，仅接受精确白名单 Origin，或来自回环地址且没有 Origin 的同用户本机客户端。
 - 素材路径需要经过允许根目录和真实路径校验，避免符号链接逃逸。
 - 凭据应放在系统钥匙串、受保护的本地文件或进程环境中，不进入仓库、日志、状态接口或导出包。
+- 诊断通道仅持久化固定 schema 的有界计数，不保存正文、HTML、Cookie、Token、手机号、完整 URL 或绝对路径；详见 [诊断隐私策略](docs/DIAGNOSTICS_PRIVACY.md)。
 - 公开发布和部分受管理服务操作已有显式确认门；其他变更接口仍依赖回环地址、Origin 与同用户信任假设，尚未完成统一授权审计。
 - 使用者必须对所有高影响操作保留人工审核：核对内容权利、事实、标题、账号、平台、可见范围和计划时间。
 - 平台草稿不等于公开发布成功；CLI 或接口返回成功也不能替代平台端人工核验。
@@ -203,6 +204,7 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 - [知识库字段契约](docs/VIDEO_KNOWLEDGE_SCHEMA.md)
 - [可验证备份、恢复与迁移](docs/BACKUP_RESTORE.md)
 - [安全模型](docs/SECURITY_MODEL.md)
+- [诊断隐私与保留策略](docs/DIAGNOSTICS_PRIVACY.md)
 - [内容与授权政策](docs/CONTENT_POLICY.md)
 - [离线整链 E2E 与故障注入](docs/OFFLINE_E2E.md)
 - [路线图](ROADMAP.md)

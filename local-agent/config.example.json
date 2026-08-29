@@ -14,6 +14,18 @@
     "intervalMs": 1000,
     "timeoutMs": 1800000
   },
+  "diagnostics": {
+    "retention": {
+      "maxAgeMs": 86400000,
+      "maxFiles": 100,
+      "maxBytes": 5242880,
+      "maxEventBytes": 16384
+    },
+    "debug": {
+      "enabled": false,
+      "expiresAt": null
+    }
+  },
   "adapters": {
     "douyin": {
       "enabled": false,

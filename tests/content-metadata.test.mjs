@@ -191,7 +191,7 @@ test("isSensitiveFieldName：exact/alias/endsWith/前缀/语义段命中，monke
   }
 });
 
-test("x-uskey/X_USKEY 分享 URL：判敏感/拒稳定/canonical 去掉；普通 query 与安全稳定 URL 保留", () => {
+test("分享 URL canonical 丢弃全部 query，敏感参数拒绝稳定分类", () => {
   for (const [url, keyName, secret] of [
     ["https://weixin.qq.com/sph/abc?x-uskey=XUS_SECRET&foo=1", "x-uskey", "XUS_SECRET"],
     ["https://weixin.qq.com/sph/abc?X_USKEY=UPPER_SECRET&foo=1", "X_USKEY", "UPPER_SECRET"],
@@ -200,8 +200,38 @@ test("x-uskey/X_USKEY 分享 URL：判敏感/拒稳定/canonical 去掉；普通
     assert.equal(isStableShareUrl(url), false, `${keyName} 拒稳定`);
     const canonical = canonicalizeSourceUrl(url);
     assert.ok(!canonical.includes(keyName) && !canonical.includes(secret), `${keyName} canonical 去掉：${canonical}`);
-    assert.ok(canonical.includes("foo=1"), `${keyName} 普通 query 保留：${canonical}`);
+    assert.equal(new URL(canonical).search, "", `${keyName} URL 的全部 query 均应丢弃`);
   }
   const safe = "https://weixin.qq.com/sph/abc?foo=1";
-  assert.ok(canonicalizeSourceUrl(safe).includes("foo=1") && isStableShareUrl(safe), "安全稳定 URL 普通 query 保留");
+  assert.equal(canonicalizeSourceUrl(safe), "https://weixin.qq.com/sph/abc");
+  assert.equal(isStableShareUrl(safe), true, "稳定路径可识别，但 canonical 绝不保留任意 query");
+  const privateChat = "仅供回归测试的私聊正文_query_301";
+  assert.equal(
+    canonicalizeSourceUrl(`https://weixin.qq.com/sph/abc?foo=${encodeURIComponent(privateChat)}`).includes(privateChat),
+    false,
+    "未知 query key 也不能成为正文隐蔽通道",
+  );
+});
+
+test("URL 凭据旁路：userinfo、敏感别名、嵌套 token、手机号、HTML 与私有路径均拒绝并从 canonical 移除", () => {
+  const marker = "BearerTokenCanaryURL91";
+  const variants = [
+    [`https://${marker}@weixin.qq.com/sph/abc`, marker],
+    [`https://weixin.qq.com/sph/abc?credential=${marker}&foo=1`, marker],
+    [`https://weixin.qq.com/sph/abc?ref=${encodeURIComponent(`token=${marker}`)}&foo=1`, marker],
+    ["https://weixin.qq.com/sph/abc?phone=13912345678&foo=1", "13912345678"],
+    [`https://weixin.qq.com/sph/abc?next=${encodeURIComponent("/Users/example/Private/chat.txt")}&foo=1`, "/Users/example/Private/chat.txt"],
+    [`https://weixin.qq.com/sph/abc?preview=${encodeURIComponent("<article>private</article>")}&foo=1`, "<article>private</article>"],
+    ["https://weixin.qq.com/sph/abc/13912345678", "13912345678"],
+    ["https://weixin.qq.com/sph/abc/Users/example/Private/chat.txt", "Users/example/Private/chat.txt"],
+    [`https://weixin.qq.com/sph/abc/${encodeURIComponent(`token=${marker}`)}`, marker],
+  ];
+  for (const [url, secret] of variants) {
+    assert.equal(containsSensitiveUrlMaterial(url), true, `应拒绝敏感 URL：${url}`);
+    assert.equal(isStableShareUrl(url), false, "敏感 URL 不得成为稳定来源");
+    const canonical = canonicalizeSourceUrl(url);
+    assert.equal(canonical.includes(secret), false, "canonical 不得保留敏感值");
+    assert.equal(canonical.includes(encodeURIComponent(secret)), false, "canonical 不得保留编码后的敏感值");
+  }
+  assert.equal(isStableShareUrl("https://weixin.qq.com/sph/abc/extra"), false, "稳定分享 path 必须完整匹配");
 });

@@ -273,5 +273,5 @@ test("快点伴生桥可从 spD 已转发记录补提取卡片", async () => {
   assert.equal(cards[0].objectId, "14989479495539628554");
   assert.equal(cards[0].nonceId, "nonce_direct_1");
   assert.equal(cards[0].deliveryId, "msg-direct-1");
-  assert.equal(cards[0].title, "最新视频");
+  assert.equal(cards[0].title, "视频号内容", "浏览器派生标题不得跨越本地 API 边界");
 });

@@ -42,7 +42,7 @@ test("A. isSensitiveFieldName 正反例（auth/uskey/x-uskey/别名/全大写复
   for (const name of negatives) assert.equal(isSensitiveFieldName(name), false, `不应命中：${name}`);
 });
 
-test("A4. x-uskey/X_USKEY 分享 URL：判敏感/拒稳定/canonical 去掉；普通 query 保留", () => {
+test("A4. 稳定分享 URL canonical 丢弃全部 query，敏感参数拒稳定", () => {
   for (const [url, keyName, secret] of [
     ["https://weixin.qq.com/sph/abc?x-uskey=XUS_SECRET&foo=1", "x-uskey", "XUS_SECRET"],
     ["https://weixin.qq.com/sph/abc?X_USKEY=UPPER_SECRET&foo=1", "X_USKEY", "UPPER_SECRET"],
@@ -51,10 +51,17 @@ test("A4. x-uskey/X_USKEY 分享 URL：判敏感/拒稳定/canonical 去掉；�
     assert.equal(isStableShareUrl(url), false, `${keyName} 拒稳定`);
     const canonical = canonicalizeSourceUrl(url);
     assert.ok(!canonical.includes(keyName) && !canonical.includes(secret), `${keyName} canonical 去掉：${canonical}`);
-    assert.ok(canonical.includes("foo=1"), `${keyName} 普通 query 保留：${canonical}`);
+    assert.equal(new URL(canonical).search, "", `${keyName} URL 的全部 query 均应丢弃`);
   }
   const safe = canonicalizeSourceUrl("https://weixin.qq.com/sph/abc?foo=1");
-  assert.ok(safe.includes("foo=1") && isStableShareUrl(safe), `安全稳定 URL 保留：${safe}`);
+  assert.equal(safe, "https://weixin.qq.com/sph/abc");
+  assert.equal(isStableShareUrl(safe), true, `canonical 后仍是稳定分享 URL：${safe}`);
+  const privateChat = "PRIVATE_CHAT_BODY_QUERY_6W2N";
+  assert.equal(
+    canonicalizeSourceUrl(`https://weixin.qq.com/sph/abc?foo=${privateChat}`).includes(privateChat),
+    false,
+    "未知 query key 也不能携带任意正文",
+  );
 });
 
 /* ─────────── B：assignment scanner 组合选择器 ─────────── */
