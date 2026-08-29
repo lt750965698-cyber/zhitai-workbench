@@ -288,11 +288,25 @@ function assertNoSensitiveVariants(values, label, extraMarkers = []) {
 
 async function readTreeFiles(root) {
   const buffers = [];
-  const walk = async (directory) => {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
+  const walk = async (directory, allowMissing = false) => {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (allowMissing && error?.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
       const path = join(directory, entry.name);
-      if (entry.isDirectory()) await walk(path);
-      else if (entry.isFile()) buffers.push({ name: entry.name, content: await readFile(path) });
+      if (entry.isDirectory()) {
+        await walk(path, true);
+      } else if (entry.isFile()) {
+        try {
+          buffers.push({ name: entry.name, content: await readFile(path) });
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
     }
   };
   await walk(root);
