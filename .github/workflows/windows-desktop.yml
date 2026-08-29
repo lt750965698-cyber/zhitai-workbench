@@ -34,6 +34,15 @@ jobs:
           cache: true
           require-lockfile: true
 
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match package version $version"
+          }
+
       - name: Verify source
         run: pnpm lint
 
@@ -41,26 +50,86 @@ jobs:
         run: pnpm build
 
       - name: Test portable contracts
-        run: pnpm test:node
+        run: pnpm test:windows
 
       - name: Make Windows installer and portable ZIP
         run: pnpm make:windows
 
-      - name: Write SHA-256 checksums
+      - name: Smoke-test packaged Windows runtime
+        run: pnpm smoke:windows-package
+
+      - name: Give the portable ZIP a stable ASCII name
         shell: pwsh
         run: |
-          $files = Get-ChildItem out/make -Recurse -File | Where-Object { $_.Name -ne "RELEASES" }
+          $zipFiles = @(Get-ChildItem out/make/zip/win32/x64 -Filter *.zip -File)
+          if ($zipFiles.Count -ne 1) { throw "Expected exactly one portable ZIP, found $($zipFiles.Count)" }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $destination = Join-Path $zipFiles[0].DirectoryName "Zhitai-Windows-x64-$version.zip"
+          Move-Item -LiteralPath $zipFiles[0].FullName -Destination $destination -Force
+
+      - name: Stage flat release assets and SHA-256 checksums
+        shell: pwsh
+        run: |
+          $releaseDir = New-Item -ItemType Directory -Path out/release -Force
+          foreach ($pattern in @('Zhitai-Setup.exe', 'Zhitai-Windows-x64-*.zip', '*.nupkg', 'RELEASES')) {
+            $matches = @(Get-ChildItem out/make -Recurse -File -Filter $pattern)
+            if ($matches.Count -ne 1) { throw "Expected exactly one $pattern release asset, found $($matches.Count)" }
+            Copy-Item -LiteralPath $matches[0].FullName -Destination $releaseDir.FullName
+          }
+          $files = Get-ChildItem $releaseDir.FullName -File
           $lines = foreach ($file in $files) {
             $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLowerInvariant()
-            $relative = [IO.Path]::GetRelativePath((Resolve-Path "out/make"), $file.FullName).Replace("\\", "/")
-            "$hash  $relative"
+            "$hash  $($file.Name)"
           }
-          $lines | Sort-Object | Set-Content -Encoding utf8NoBOM out/make/SHA256SUMS.txt
+          $lines | Sort-Object | Set-Content -Encoding utf8NoBOM (Join-Path $releaseDir.FullName 'SHA256SUMS.txt')
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
           name: zhitai-windows-x64-${{ github.sha }}
-          path: out/make/**
+          path: out/release/**
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish tagged Windows release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: make
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@v7
+
+      - name: Download verified Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: zhitai-windows-x64-${{ github.sha }}
+          path: release-assets
+
+      - name: Create or update the GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          notes="docs/RELEASE_${version}.md"
+          test "$(node -p 'require("./package.json").version')" = "$version"
+          mapfile -d '' assets < <(find release-assets -type f \( -name 'Zhitai-Setup.exe' -o -name 'Zhitai-Windows-x64-*.zip' -o -name 'SHA256SUMS.txt' -o -name '*.nupkg' -o -name 'RELEASES' \) -print0)
+          test -f "$notes"
+          test "${#assets[@]}" -ge 5
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "织台 $GITHUB_REF_NAME · Windows x64 Preview" \
+              --notes-file "$notes" \
+              --prerelease
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --title "织台 $GITHUB_REF_NAME · Windows x64 Preview" \
+              --notes-file "$notes" \
+              --prerelease
+          fi
