@@ -7,17 +7,17 @@ import { createDeterministicMedia } from "./synthetic-media.mjs";
 import { createFakePlatforms, FaultPlan, FAULT_CODES } from "./fakes.mjs";
 import { createChainHarness } from "./chain-harness.mjs";
 
-const CRASH_EXIT_CODE = 86;
-
 function sendAndExit(message, exitCode) {
   if (typeof process.send !== "function") process.exit(exitCode);
   process.send(message, () => process.exit(exitCode));
 }
 
-function exitWhileAwaiting(message, exitCode) {
+function waitForParentCrash(message) {
   return new Promise(() => {
-    if (typeof process.send !== "function") process.exit(exitCode);
-    process.send(message, () => process.exit(exitCode));
+    if (typeof process.send !== "function") process.exit(2);
+    process.send(message, (error) => {
+      if (error) process.exit(2);
+    });
   });
 }
 
@@ -41,12 +41,12 @@ if (globalThis.__ZHITAI_E2E_NETWORK_LOCKDOWN__ !== true
       : new FaultPlan({ [faultPoint]: { code: FAULT_CODES.PROCESS_CRASH, times: 1 } });
     if (mode === "publish") {
       const crashPlatform = configuration.crashPlatform || Object.keys(platforms)[0];
-      platforms[crashPlatform].publish = async (request) => exitWhileAwaiting({
+      platforms[crashPlatform].publish = async (request) => waitForParentCrash({
         type: "worker_publishing_crashed",
         correlationId: request.correlationId,
         platform: crashPlatform,
         code: FAULT_CODES.PROCESS_CRASH,
-      }, CRASH_EXIT_CODE);
+      });
     }
 
     try {
@@ -86,12 +86,12 @@ if (globalThis.__ZHITAI_E2E_NETWORK_LOCKDOWN__ !== true
       }, 3);
     } catch (error) {
       if (error?.code === FAULT_CODES.PROCESS_CRASH || error?.name === "SimulatedProcessCrash") {
-        sendAndExit({
+        await waitForParentCrash({
           type: "worker_crashed",
           correlationId: error?.details?.correlationId || null,
           code: FAULT_CODES.PROCESS_CRASH,
           faultPoint,
-        }, CRASH_EXIT_CODE);
+        });
       } else {
         sendAndExit({
           type: "worker_unexpected_error",
@@ -101,5 +101,3 @@ if (globalThis.__ZHITAI_E2E_NETWORK_LOCKDOWN__ !== true
     }
   });
 }
-
-export { CRASH_EXIT_CODE };

@@ -25,7 +25,6 @@ import { createDeterministicMedia } from "./synthetic-media.mjs";
 const SUITE = "zhitai-offline-chain-e2e";
 const FIXED_NOW = "2030-01-01T00:00:00.000Z";
 const PLATFORM_NAMES = Object.freeze(["fake-alpha", "fake-beta"]);
-const CRASH_EXIT_CODE = 86;
 const CRASH_WORKER = fileURLToPath(new URL("./crash-worker.mjs", import.meta.url));
 const NETWORK_LOCKDOWN = fileURLToPath(new URL("./network-lockdown.mjs", import.meta.url));
 
@@ -459,11 +458,21 @@ async function spawnCrashWorker(configuration) {
   });
   const messages = [];
   return new Promise((resolve, reject) => {
+    let crashRequested = false;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("crash worker timed out"));
     }, 10_000);
-    child.on("message", (message) => messages.push(message));
+    child.on("message", (message) => {
+      messages.push(message);
+      if (!crashRequested && ["worker_crashed", "worker_publishing_crashed"].includes(message?.type)) {
+        crashRequested = true;
+        if (!child.kill("SIGKILL")) {
+          clearTimeout(timer);
+          reject(new Error("crash worker could not be terminated at the authenticated boundary"));
+        }
+      }
+    });
     child.once("error", (error) => {
       clearTimeout(timer);
       reject(error);
@@ -941,8 +950,8 @@ const SCENARIOS = [
         faultPoint: "generate",
         platformNames: PLATFORM_NAMES,
       });
-      context.equal(child.code, CRASH_EXIT_CODE, "worker must terminate with the intentional crash exit code");
-      context.equal(child.signal, null, "worker must use a controlled process exit rather than an external signal");
+      context.equal(child.code, null, "worker hard crash must not report a normal exit code");
+      context.equal(child.signal, "SIGKILL", "worker must be killed at the authenticated crash boundary");
       context.check(child.messages.some((message) => message.type === "worker_armed"), "worker must persist receive before crashing");
       context.check(child.messages.some((message) => message.type === "worker_crashed"), "worker must report the injected crash boundary");
       const armed = child.messages.find((message) => message.type === "worker_armed");
@@ -1017,8 +1026,8 @@ const SCENARIOS = [
         crashPlatform: "fake-alpha",
         platformNames: PLATFORM_NAMES,
       });
-      context.equal(child.code, CRASH_EXIT_CODE, "publishing worker must exit at the adapter side effect boundary");
-      context.equal(child.signal, null, "publishing crash must use the controlled crash exit");
+      context.equal(child.code, null, "publishing hard crash must not report a normal exit code");
+      context.equal(child.signal, "SIGKILL", "publishing worker must be killed at the adapter side effect boundary");
       context.check(child.messages.some((message) => message.type === "worker_publishing_crashed"),
         "worker must prove it entered adapter.publish before exiting");
       const armed = child.messages.find((message) => message.type === "worker_armed");

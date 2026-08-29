@@ -31,6 +31,7 @@ import {
 const TEST_TIMEOUT_MS = 10_000;
 const TAG_FILES = ["bagit.txt", "bag-info.txt", "manifest-sha256.txt", "manifest.json"];
 const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "local-agent", "backup-cli.mjs");
+const CLI_NODE_ARGS = ["--disable-warning=ExperimentalWarning", CLI_PATH];
 
 async function pathExists(path) {
   try {
@@ -255,7 +256,7 @@ test("self-consistent checksum rewrites cannot inject excluded state or unknown 
 test("CLI errors expose only a stable error code and never echo a fake secret marker", { timeout: TEST_TIMEOUT_MS }, () => {
   const marker = "FAKE_CLI_SECRET_MARKER_7f43f49a_TEST_ONLY";
   const missingBackup = join(tmpdir(), marker, "missing-backup");
-  const result = spawnSync(process.execPath, [CLI_PATH, "verify", "--backup", missingBackup], {
+  const result = spawnSync(process.execPath, [...CLI_NODE_ARGS, "verify", "--backup", missingBackup], {
     encoding: "utf8",
     timeout: 5_000,
   });
@@ -275,7 +276,7 @@ test("CLI errors expose only a stable error code and never echo a fake secret ma
 
 test("CLI accepts direct arguments and a forwarded package-manager separator", () => {
   for (const args of [["--help"], ["--", "--help"]]) {
-    const result = spawnSync(process.execPath, [CLI_PATH, ...args], {
+    const result = spawnSync(process.execPath, [...CLI_NODE_ARGS, ...args], {
       encoding: "utf8",
       timeout: 5_000,
     });

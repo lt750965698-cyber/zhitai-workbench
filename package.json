@@ -36,7 +36,7 @@
     "make:windows": "pnpm run build:desktop-assets && electron-forge make --platform=win32 --arch=x64",
     "smoke:windows-package": "node scripts/smoke-packaged-windows.mjs",
     "agent": "node local-agent/server.mjs",
-    "backup": "node local-agent/backup-cli.mjs",
+    "backup": "node --disable-warning=ExperimentalWarning local-agent/backup-cli.mjs",
     "test:backup": "node --test --test-timeout=15000 tests/backup-recovery.test.mjs tests/backup-security.test.mjs tests/platform-receipts.test.mjs",
     "test": "pnpm run build && pnpm run test:node && pnpm run test:integrations",
     "test:node": "node scripts/test-node.mjs",
