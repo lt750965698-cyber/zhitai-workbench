@@ -10,3 +10,7 @@ allowBuilds:
 blockExoticSubdeps: false
 overrides:
   '@esbuild-kit/core-utils>esbuild': 0.25.12
+  # Forge 7.11.2 still requests vulnerable archive/temp helpers. These patched
+  # releases preserve the APIs used by @electron/rebuild and Forge's prompts.
+  tar: 7.5.22
+  tmp: 0.2.7

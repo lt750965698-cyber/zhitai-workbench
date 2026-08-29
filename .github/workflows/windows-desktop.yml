@@ -46,6 +46,9 @@ jobs:
       - name: Verify source
         run: pnpm lint
 
+      - name: Audit runtime dependencies
+        run: pnpm audit --prod
+
       - name: Build application
         run: pnpm build
 
