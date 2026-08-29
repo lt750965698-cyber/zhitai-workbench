@@ -2,9 +2,10 @@
 "use strict";
 
 const fsp = require("node:fs/promises");
+const { constants: fsConstants } = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { createHash } = require("node:crypto");
+const { createHash, randomBytes } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { postprocessAudio } = require("./audio-postprocessor.js");
 
@@ -33,6 +34,9 @@ const LOCAL_MOTION_FPS = 30;
 const LOCAL_MOTION_SEGMENT_FRAMES = 250;
 const LOCAL_MOTION_TOTAL_FRAMES = 750;
 const LOCAL_MOTION_DURATION_MS = 25_000;
+const RUN_CHECKPOINT_SCHEMA_VERSION = 1;
+const RUN_CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
+const LOCAL_MOTION_CLIP_NAMES = Object.freeze(["clip-01.mp4", "clip-02.mp4", "clip-03.mp4"]);
 const LOCAL_MOTION_MOTIONS = Object.freeze([
   Object.freeze({
     name: "gentle_push_in",
@@ -57,6 +61,14 @@ const TRUSTED_LEGACY_DOUBAO_TIMEOUT_MIGRATIONS = Object.freeze([]);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function sanitizeId(value) { return String(value || "job").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120); }
+
+function requireSafeScopeId(value, fieldName) {
+  const id = String(value || "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(id) || id === "." || id === "..") {
+    throw new Error(`${fieldName}_invalid`);
+  }
+  return id;
+}
 
 function gptPageBusyError(detail = "GPT 页面仍忙，发送按钮尚未恢复") {
   const error = new Error(`${GPT_PAGE_BUSY_CODE}: ${detail}`);
@@ -519,14 +531,44 @@ function localMotionSegmentArgs({ imagePath, outputPath, segmentIndex } = {}) {
 function localMotionConcatArgs({ listPath, outputPath } = {}) {
   return [
     "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-    "-f", "concat", "-safe", "0", "-i", listPath,
+    "-f", "concat", "-safe", "1", "-i", listPath,
     "-map", "0:v:0", "-an", "-c", "copy", "-movflags", "+faststart", outputPath,
   ];
 }
 
-function runSilentCommand(command, args, { timeoutMs = 600_000 } = {}) {
+async function createPrivateConcatList(directory, clipNames) {
+  if (!Array.isArray(clipNames) || !clipNames.length
+    || clipNames.some((name) => !/^clip-[0-9]{2}\.mp4$/.test(name))) {
+    throw new Error("concat_clip_names_invalid");
+  }
+  const listPath = path.join(
+    directory,
+    `.concat.${process.pid}.${randomBytes(12).toString("hex")}.txt`,
+  );
+  let handle;
+  let created = false;
+  try {
+    handle = await fsp.open(listPath, "wx", 0o600);
+    created = true;
+    await handle.writeFile(`${clipNames.map((name) => `file '${name}'`).join("\n")}\n`, "utf8");
+    await handle.sync();
+    return listPath;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    handle = null;
+    if (created) await fsp.unlink(listPath).catch(() => {});
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+function runSilentCommand(command, args, { timeoutMs = 600_000, cwd } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let out = "";
     let err = "";
     let settled = false;
@@ -688,23 +730,99 @@ async function executableVersion(command, runCommandImpl = runSilentCommand) {
   return String(out || err || "").split(/\r?\n/)[0].trim().slice(0, 240);
 }
 
+function sameFileIdentity(left, right) {
+  return Boolean(left && right)
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+function sameFileVersion(left, right) {
+  return sameFileIdentity(left, right)
+    && left.mode === right.mode
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+async function readStableRegularFile(filePath, {
+  minimumBytes = 1_024,
+  maximumBytes = Number.MAX_SAFE_INTEGER,
+} = {}) {
+  const noFollow = Number(fsConstants.O_NOFOLLOW || 0);
+  let handle;
+  try {
+    handle = await fsp.open(filePath, fsConstants.O_RDONLY | noFollow);
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size < BigInt(minimumBytes)
+      || before.size > BigInt(Math.min(maximumBytes, Number.MAX_SAFE_INTEGER))) return null;
+
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const named = await fsp.lstat(filePath, { bigint: true });
+    if (!after.isFile() || !named.isFile() || named.isSymbolicLink()
+      || !sameFileVersion(before, after) || !sameFileIdentity(after, named)
+      || BigInt(bytes.length) !== after.size) return null;
+
+    return { bytes, sizeBytes: Number(after.size) };
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function withPrivateArtifactSnapshot(filePath, stableFile, operation) {
+  const extension = path.extname(filePath);
+  const stem = path.basename(filePath, extension);
+  const snapshotPath = path.join(
+    path.dirname(filePath),
+    `.${stem}.${process.pid}.${randomBytes(12).toString("hex")}.snapshot${extension}`,
+  );
+  let handle;
+  try {
+    handle = await fsp.open(snapshotPath, "wx", 0o600);
+    await handle.writeFile(stableFile.bytes);
+    await handle.sync();
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size !== BigInt(stableFile.bytes.length)) {
+      throw new Error("artifact_snapshot_write_incomplete");
+    }
+
+    const result = await operation(snapshotPath);
+    const after = await handle.stat({ bigint: true });
+    const named = await fsp.lstat(snapshotPath, { bigint: true });
+    if (!after.isFile() || !named.isFile() || named.isSymbolicLink()
+      || !sameFileVersion(before, after) || !sameFileIdentity(after, named)) {
+      throw new Error("artifact_snapshot_changed_during_probe");
+    }
+    return result;
+  } finally {
+    await handle?.close().catch(() => {});
+    await fsp.unlink(snapshotPath).catch(() => {});
+  }
+}
+
 async function inspectLocalMotionArtifact(filePath, {
   expectedFrames,
   expectedDurationMs,
   allowAudio = false,
   probeVideoImpl = probeLocalMotionVideo,
 } = {}) {
-  const stat = await fsp.stat(filePath).catch(() => null);
-  if (!stat?.isFile() || stat.size < 1_024) return null;
-  const probe = await probeVideoImpl(filePath).catch(() => null);
+  const stableFile = await readStableRegularFile(filePath);
+  if (!stableFile) return null;
+  const probe = await withPrivateArtifactSnapshot(
+    filePath,
+    stableFile,
+    (snapshotPath) => probeVideoImpl(snapshotPath),
+  ).catch(() => null);
   const decision = localMotionProbeDecision(probe, {
     frames: expectedFrames,
     durationMs: expectedDurationMs,
     allowAudio,
   });
   if (!decision.passed) return null;
-  const bytes = await fsp.readFile(filePath);
-  return { ...probe, sizeBytes: stat.size, sha256: sha256(bytes) };
+  return { ...probe, sizeBytes: stableFile.sizeBytes, sha256: sha256(stableFile.bytes) };
 }
 
 function doubaoInputFingerprint({ imageSha256, prompt, negativePrompt = "", durationSeconds } = {}) {
@@ -749,34 +867,92 @@ function effectiveCreativeStatus(job) {
 }
 
 async function writeRunCheckpoint(filePath, value) {
-  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await fsp.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await fsp.rename(temporary, filePath);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("run_checkpoint_schema_invalid");
+  }
+  const jobId = requireSafeScopeId(value.jobId, "jobId");
+  const assetId = requireSafeScopeId(value.assetId, "assetId");
+  if (value.schemaVersion !== undefined && value.schemaVersion !== RUN_CHECKPOINT_SCHEMA_VERSION) {
+    throw new Error("run_checkpoint_schema_version_invalid");
+  }
+  const payload = `${JSON.stringify({
+    ...value,
+    schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
+    jobId,
+    assetId,
+  }, null, 2)}\n`;
+  if (Buffer.byteLength(payload) > RUN_CHECKPOINT_MAX_BYTES) {
+    throw new Error("run_checkpoint_too_large");
+  }
+
+  const directory = path.dirname(filePath);
+  const fileName = path.basename(filePath);
+  if (!new Set(["run-state.json", LOCAL_MOTION_MANIFEST]).has(fileName)) {
+    throw new Error("run_checkpoint_filename_invalid");
+  }
+  await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+  const directoryStat = await fsp.lstat(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+    throw new Error("run_checkpoint_directory_invalid");
+  }
+  await fsp.chmod(directory, 0o700);
+
+  const target = path.join(directory, fileName);
+  const temporary = path.join(
+    directory,
+    `.${fileName}.${process.pid}.${randomBytes(12).toString("hex")}.tmp`,
+  );
+  let handle;
+  try {
+    handle = await fsp.open(temporary, "wx", 0o600);
+    await handle.writeFile(payload, "utf8");
+    await handle.sync();
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    handle = null;
+    await fsp.unlink(temporary).catch(() => {});
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  try {
+    await fsp.rename(temporary, target);
+    await fsp.chmod(target, 0o600);
+  } catch (error) {
+    await fsp.unlink(temporary).catch(() => {});
+    throw error;
+  }
 }
 
-async function inspectStoryboard(filePath, { ffprobePath = FFPROBE, timeoutMs = 10_000 } = {}) {
-  const stat = await fsp.stat(filePath).catch(() => null);
-  if (!stat?.isFile() || stat.size < 1_024) return null;
+async function inspectStoryboard(filePath, {
+  ffprobePath = FFPROBE,
+  timeoutMs = 10_000,
+  spawnImpl = spawn,
+} = {}) {
+  const stableFile = await readStableRegularFile(filePath);
+  if (!stableFile) return null;
   let output = "";
   try {
-    output = await new Promise((resolve, reject) => {
-      const child = spawn(ffprobePath, [
-        "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type,width,height",
-        "-of", "json", filePath,
-      ], { stdio: ["ignore", "pipe", "ignore"] });
-      let text = "";
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-        reject(new Error("storyboard_probe_timeout"));
-      }, timeoutMs);
-      child.stdout.on("data", (chunk) => { if (text.length < 64_000) text += chunk.toString(); });
-      child.once("error", (error) => { clearTimeout(timer); reject(error); });
-      child.once("exit", (code) => {
-        clearTimeout(timer);
-        if (code !== 0) reject(new Error(`storyboard_probe_failed_${code}`));
-        else resolve(text);
-      });
-    });
+    output = await withPrivateArtifactSnapshot(filePath, stableFile, (snapshotPath) => (
+      new Promise((resolve, reject) => {
+        const child = spawnImpl(ffprobePath, [
+          "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type,width,height",
+          "-of", "json", snapshotPath,
+        ], { stdio: ["ignore", "pipe", "ignore"] });
+        let text = "";
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("storyboard_probe_timeout"));
+        }, timeoutMs);
+        child.stdout.on("data", (chunk) => { if (text.length < 64_000) text += chunk.toString(); });
+        child.once("error", (error) => { clearTimeout(timer); reject(error); });
+        child.once("exit", (code) => {
+          clearTimeout(timer);
+          if (code !== 0) reject(new Error(`storyboard_probe_failed_${code}`));
+          else resolve(text);
+        });
+      })
+    ));
   } catch {
     return null;
   }
@@ -786,24 +962,22 @@ async function inspectStoryboard(filePath, { ffprobePath = FFPROBE, timeoutMs = 
   const height = Number(stream?.height);
   if (stream?.codec_type !== "video" || !Number.isFinite(width) || !Number.isFinite(height)
     || width < 256 || height < 256) return null;
-  const bytes = await fsp.readFile(filePath);
   return {
     path: path.basename(filePath),
-    sizeBytes: stat.size,
+    sizeBytes: stableFile.sizeBytes,
     width,
     height,
-    sha256: sha256(bytes),
+    sha256: sha256(stableFile.bytes),
   };
 }
 
 async function inspectGeneratedClip(filePath) {
-  const stat = await fsp.stat(filePath).catch(() => null);
-  if (!stat?.isFile() || stat.size < 1_024) return null;
-  const bytes = await fsp.readFile(filePath);
+  const stableFile = await readStableRegularFile(filePath);
+  if (!stableFile) return null;
   return {
     path: path.basename(filePath),
-    sizeBytes: stat.size,
-    sha256: sha256(bytes),
+    sizeBytes: stableFile.sizeBytes,
+    sha256: sha256(stableFile.bytes),
   };
 }
 
@@ -1976,13 +2150,23 @@ async function generateDoubaoClip(window, imagePath, prompt, negativePrompt, dur
 async function concatClips(clips, output) {
   if (!clips.length) throw new Error("没有可拼接的视频片段");
   if (clips.length === 1) { await fsp.copyFile(clips[0], output); return output; }
-  const list = `${output}.concat.txt`;
-  await fsp.writeFile(list, clips.map((file) => `file '${file.replaceAll("'", "'\\''")}'`).join("\n") + "\n", "utf8");
-  await new Promise((resolve, reject) => {
-    const child = spawn(FFMPEG, ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", output], { stdio: "ignore" });
-    child.once("error", reject); child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg 拼接失败：${code}`)));
-  });
-  await fsp.rm(list, { force: true });
+  const outputDir = path.dirname(output);
+  const clipNames = clips.map((file) => path.basename(file));
+  if (clips.some((file, index) => path.dirname(file) !== outputDir
+    || !/^clip-[0-9]{2}\.mp4$/.test(clipNames[index]))) {
+    throw new Error("视频片段路径不符合固定拼接契约");
+  }
+  const listPath = await createPrivateConcatList(outputDir, clipNames);
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(FFMPEG, [
+        "-y", "-f", "concat", "-safe", "1", "-i", listPath, "-c", "copy", output,
+      ], { cwd: outputDir, stdio: "ignore" });
+      child.once("error", reject); child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg 拼接失败：${code}`)));
+    });
+  } finally {
+    await fsp.unlink(listPath).catch(() => {});
+  }
   return output;
 }
 
@@ -2137,12 +2321,17 @@ async function generateLocalMotionVisual({
     }) : null;
   if (!visual || manifest.visualVideo.sha256 !== visual.sha256
     || Number(manifest.visualVideo.sizeBytes) !== visual.sizeBytes) {
-    const listPath = path.join(outputDir, `.local-motion-concat-${process.pid}-${Date.now()}.txt`);
     const temporary = `${visualPath}.local-motion-${process.pid}-${Date.now()}.tmp.mp4`;
-    const concatText = `${segmentPaths.map((file) => `file '${file.replaceAll("'", "'\\''")}'`).join("\n")}\n`;
+    const expectedSegmentPaths = LOCAL_MOTION_CLIP_NAMES.map((name) => path.join(outputDir, name));
+    if (canonicalJson(segmentPaths) !== canonicalJson(expectedSegmentPaths)) {
+      throw new Error("本地动画拼接只接受固定的三个片段");
+    }
+    const listPath = await createPrivateConcatList(outputDir, LOCAL_MOTION_CLIP_NAMES);
     try {
-      await fsp.writeFile(listPath, concatText, "utf8");
-      await runCommandImpl(ffmpegPath, localMotionConcatArgs({ listPath, outputPath: temporary }), { timeoutMs: 300_000 });
+      await runCommandImpl(ffmpegPath, localMotionConcatArgs({ listPath, outputPath: temporary }), {
+        timeoutMs: 300_000,
+        cwd: outputDir,
+      });
       visual = await inspectLocalMotionArtifact(temporary, {
         expectedFrames: LOCAL_MOTION_TOTAL_FRAMES,
         expectedDurationMs: LOCAL_MOTION_DURATION_MS,
@@ -2154,7 +2343,7 @@ async function generateLocalMotionVisual({
       await fsp.rm(temporary, { force: true }).catch(() => {});
       throw error;
     } finally {
-      await fsp.rm(listPath, { force: true }).catch(() => {});
+      await fsp.unlink(listPath).catch(() => {});
     }
   }
   manifest.visualVideo = {
@@ -2598,17 +2787,40 @@ function createCreativeRunner({ openStudio, waitForStudio = waitForLoad }) {
   async function run(jobId, assetId, accountIds = ["account-1"]) {
     if (inFlight) return { ok: false, status: "busy", error: "已有生成任务正在运行" };
     inFlight = (async () => {
+      let safeJobId;
+      let safeAssetId;
+      try {
+        safeJobId = path.basename(requireSafeScopeId(jobId, "jobId"));
+        safeAssetId = path.basename(requireSafeScopeId(assetId, "assetId"));
+        if (safeJobId !== jobId || safeAssetId !== assetId) throw new Error("scope_id_changed");
+      } catch {
+        return { ok: false, status: "invalid_scope", error: "任务或素材 ID 不符合安全边界" };
+      }
       const detail = await fetchJson(`${AGENT}/api/v1/kb/videos/${encodeURIComponent(assetId)}`);
       if (detail?.asset?.category !== "素材") return { ok: false, status: "not_material", error: "只有“素材”分类可以一键复刻" };
       const readiness = generationReadiness(detail);
       if (!readiness.ready) return { ok: false, status: readiness.status, error: readiness.error };
       const shots = shotPrompts(detail);
       if (!shots.length) return { ok: false, status: "needs_analysis", error: "这条素材还没有完整的 GPT/Seedance 分镜提示词，请先重新分析" };
-      const outputDir = path.join(OUTPUT_ROOT, sanitizeId(jobId));
-      await fsp.mkdir(outputDir, { recursive: true });
+      const outputDir = path.join(OUTPUT_ROOT, safeJobId);
+      await fsp.mkdir(outputDir, { recursive: true, mode: 0o700 });
+      const outputDirectoryStat = await fsp.lstat(outputDir);
+      if (!outputDirectoryStat.isDirectory() || outputDirectoryStat.isSymbolicLink()) {
+        throw new Error("任务输出目录不安全，已停止生成");
+      }
+      await fsp.chmod(outputDir, 0o700);
       const checkpointPath = path.join(outputDir, "run-state.json");
       let checkpoint = null;
-      try { checkpoint = JSON.parse(await fsp.readFile(checkpointPath, "utf8")); } catch { /* 首次运行 */ }
+      try {
+        const saved = await readStableRegularFile(checkpointPath, {
+          minimumBytes: 1,
+          maximumBytes: RUN_CHECKPOINT_MAX_BYTES,
+        });
+        const parsed = saved ? JSON.parse(saved.bytes.toString("utf8")) : null;
+        if (parsed && (parsed.schemaVersion === undefined
+          || parsed.schemaVersion === RUN_CHECKPOINT_SCHEMA_VERSION)
+          && parsed.jobId === jobId && parsed.assetId === assetId) checkpoint = parsed;
+      } catch { /* 首次运行或不可信旧断点 */ }
 
       const queuePayload = await fetchJson(`${AGENT}/api/v1/creative/jobs`);
       const currentJob = Array.isArray(queuePayload?.jobs) ? queuePayload.jobs.find((job) => job.id === jobId) : null;
@@ -3423,6 +3635,7 @@ module.exports = {
   markDoubaoAttemptOrphaned,
   doubaoClipManifestDecision,
   inspectGeneratedClip,
+  writeRunCheckpoint,
   registerDoubaoClip,
   doubaoResultSnapshot,
   doubaoAttemptSnapshot,

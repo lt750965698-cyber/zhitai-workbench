@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import runner from "../desktop/creative-runner.js";
 
 const {
@@ -42,6 +43,9 @@ const {
   prepareGptConversation,
   ensureGptStoryboards,
   inspectStoryboard,
+  inspectGeneratedClip,
+  inspectLocalMotionArtifact,
+  writeRunCheckpoint,
   effectiveCreativeStatus,
   canonicalJson,
   LOCAL_MOTION_ENGINE,
@@ -82,6 +86,131 @@ test("无人值守执行器只接收同时具备 GPT 与 Seedance 提示词的�
 test("生成目录 id 不允许路径跳转", () => {
   assert.equal(sanitizeId("../../job:1"), ".._.._job_1");
   assert.equal(sanitizeId("素材-01"), "__-01");
+});
+
+test("运行入口严格拒绝而不是替换任务与素材 ID", async () => {
+  const creative = createCreativeRunner({ openStudio: () => ({ ok: false }) });
+  assert.deepEqual(await creative.run("../../job", "asset-1"), {
+    ok: false,
+    status: "invalid_scope",
+    error: "任务或素材 ID 不符合安全边界",
+  });
+  assert.equal((await creative.run("job-1", "../asset")).status, "invalid_scope");
+});
+
+test("断点使用固定 schema、私有权限和大小上限", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "zhitai-checkpoint-security-"));
+  const target = join(directory, "run-state.json");
+  try {
+    await writeRunCheckpoint(target, { jobId: "job-1", assetId: "asset-1", gpt: {} });
+    const saved = JSON.parse(await readFile(target, "utf8"));
+    assert.equal(saved.schemaVersion, 1);
+    assert.equal(saved.jobId, "job-1");
+    if (process.platform !== "win32") {
+      assert.equal((await stat(directory)).mode & 0o777, 0o700);
+      assert.equal((await stat(target)).mode & 0o777, 0o600);
+    }
+    await assert.rejects(
+      () => writeRunCheckpoint(target, { jobId: "../job", assetId: "asset-1" }),
+      /jobId_invalid/,
+    );
+    await assert.rejects(
+      () => writeRunCheckpoint(target, {
+        jobId: "job-1", assetId: "asset-1", padding: "x".repeat(2 * 1024 * 1024),
+      }),
+      /run_checkpoint_too_large/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("成片读取拒绝符号链接并从稳定句柄计算 SHA", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "zhitai-clip-security-"));
+  const originalPath = join(directory, "clip.mp4");
+  const linkPath = join(directory, "linked.mp4");
+  const bytes = Buffer.alloc(2_048, 7);
+  try {
+    await writeFile(originalPath, bytes);
+    const metadata = await inspectGeneratedClip(originalPath);
+    assert.equal(metadata.sizeBytes, bytes.length);
+    assert.equal(metadata.sha256, createHash("sha256").update(bytes).digest("hex"));
+    try {
+      await symlink(originalPath, linkPath);
+    } catch (error) {
+      if (process.platform === "win32" && ["EPERM", "EACCES"].includes(error?.code)) {
+        t.diagnostic("Windows 未授予符号链接权限，跳过链接断言");
+        return;
+      }
+      throw error;
+    }
+    assert.equal(await inspectGeneratedClip(linkPath), null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("本地动画探测使用同目录私有快照且 SHA 绑定同一批字节", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "zhitai-motion-snapshot-"));
+  const sourcePath = join(directory, "final.visual.mp4");
+  const original = Buffer.alloc(2_048, 3);
+  let snapshotPath = "";
+  try {
+    await writeFile(sourcePath, original);
+    const metadata = await inspectLocalMotionArtifact(sourcePath, {
+      expectedFrames: 750,
+      expectedDurationMs: 25_000,
+      probeVideoImpl: async (target) => {
+        snapshotPath = target;
+        assert.notEqual(target, sourcePath);
+        assert.equal(dirname(target), directory);
+        assert.deepEqual(await readFile(target), original);
+        await writeFile(sourcePath, Buffer.alloc(2_048, 9));
+        return {
+          width: 1080, height: 1920, fps: 30, totalFrames: 750, durationMs: 25_000,
+          codec: "h264", pixelFormat: "yuv420p", audioCodec: "", audioDurationMs: 0,
+        };
+      },
+    });
+    assert.equal(metadata.sha256, createHash("sha256").update(original).digest("hex"));
+    await assert.rejects(() => access(snapshotPath));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("分镜 ffprobe 只探测已读字节的私有快照", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "zhitai-storyboard-snapshot-"));
+  const sourcePath = join(directory, "storyboard-01.png");
+  const original = Buffer.alloc(2_048, 5);
+  let snapshotPath = "";
+  try {
+    await writeFile(sourcePath, original);
+    const metadata = await inspectStoryboard(sourcePath, {
+      ffprobePath: "fixture-ffprobe",
+      spawnImpl: (_command, args) => {
+        snapshotPath = args.at(-1);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.kill = () => {};
+        queueMicrotask(() => {
+          readFile(snapshotPath).then((snapshot) => {
+            assert.deepEqual(snapshot, original);
+            child.stdout.emit("data", Buffer.from(JSON.stringify({
+              streams: [{ codec_type: "video", width: 1080, height: 1920 }],
+            })));
+            child.emit("exit", 0);
+          }).catch((error) => child.emit("error", error));
+        });
+        return child;
+      },
+    });
+    assert.equal(metadata.sha256, createHash("sha256").update(original).digest("hex"));
+    assert.equal(metadata.width, 1080);
+    await assert.rejects(() => access(snapshotPath));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("豆包成片保存优先使用唯一明确直链且绝不点击预览或播放", () => {
