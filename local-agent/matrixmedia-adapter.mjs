@@ -345,6 +345,22 @@ export function applyMatrixAuthRecord(account, record = null) {
   };
 }
 
+function hasOfficialSphLoginUrl(text) {
+  const candidates = String(text || "").match(/https?:\/\/[^\s<>"']+/giu) || [];
+  return candidates.some((candidate) => {
+    try {
+      const url = new URL(candidate.replace(/[),;\]}，。；！]+$/u, ""));
+      return url.protocol === "https:"
+        && !url.username
+        && !url.password
+        && url.hostname.toLowerCase() === "channels.weixin.qq.com"
+        && (url.pathname === "/login" || url.pathname === "/login.html");
+    } catch {
+      return false;
+    }
+  });
+}
+
 /**
  * 只识别平台失败输出中的强登录证据。尤其是视频号实际会返回登录页重定向和
  * `[auth] 视频号登录状态已失效`；普通上传错误或内容中偶然出现“登录”不会误伤。
@@ -359,7 +375,7 @@ export function classifyMatrixAuthFailure({ platform, code, out = "", err = "", 
   if (platformCode === "sph") {
     if (/\[auth\][^\n]*(?:视频号)?登录状态已失效/i.test(text)
       || /登录态异常或未登录/i.test(text)
-      || (/channels\.weixin\.qq\.com\/login(?:\.html)?/i.test(text)
+      || (hasOfficialSphLoginUrl(text)
         && /(?:重新登录|未登录|登录状态已失效|\[auth\])/i.test(text))) {
       return { invalid: true, reasonCode: "sph_login_redirect" };
     }

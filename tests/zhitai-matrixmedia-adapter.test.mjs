@@ -194,6 +194,25 @@ test("视频号实际登录页重定向会被识别，普通内容文字不会�
     code: 3,
     err: "上传失败：标题包含‘登录’一词",
   }), null);
+  for (const url of [
+    "https://evilchannels.weixin.qq.com/login.html",
+    "https://channels.weixin.qq.com.evil.example/login.html",
+    "http://channels.weixin.qq.com/login.html",
+    "https://attacker@channels.weixin.qq.com/login.html",
+    "https://channels.weixin.qq.com/login.html.evil",
+    "https://channels.weixin.qq.com/login%2ehtml",
+  ]) {
+    assert.equal(classifyMatrixAuthFailure({
+      platform: "sph",
+      code: 3,
+      err: `上传失败，请重新登录：${url}`,
+    }), null, `非官方精确登录地址不得污染账号状态：${url}`);
+  }
+  assert.deepEqual(classifyMatrixAuthFailure({
+    platform: "sph",
+    code: 3,
+    err: "平台重定向，请重新登录：https://channels.weixin.qq.com/login?from=publish#expired",
+  }), { invalid: true, reasonCode: "sph_login_redirect" });
   assert.equal(classifyMatrixAuthFailure({
     platform: "sph",
     code: 0,
