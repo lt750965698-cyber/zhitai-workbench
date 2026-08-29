@@ -1140,7 +1140,7 @@ export async function ingestOne(db, { receipt, input, input_kind, batchId, ctx =
         }
 
         // ── staging 建包（视频+6 文件写完校验后原子 rename；失败不留 searchable asset） ──
-        const titleGuess = receipt?.title || (input_kind === "file" ? (input.split("/").pop() || "未命名视频") : "未命名视频");
+        const titleGuess = receipt?.title || (input_kind === "file" ? (basename(input) || "未命名视频") : "未命名视频");
         const category = await categorize(titleGuess);
         const { assetId, pkgDir, stagingDir, assetsDir } = await makePackageStaging(category);
 

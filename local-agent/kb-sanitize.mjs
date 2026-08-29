@@ -10,7 +10,8 @@
  * 用法：node kb-sanitize.mjs --kb-root <内容库> --data-dir <dataDir> [--dry-run]
  */
 import { readFile, writeFile, mkdir, readdir, copyFile, rename, chmod } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { sanitizeRawForStorage } from "./downloader-adapter.mjs";
 
 const SENSITIVE = /videoUrl|playableUrl|decodeKey|decryptKey|encfilekey|cookie|token|signature|authorization/i;
@@ -76,10 +77,12 @@ export async function sanitizeLibrary({ kbRoot, dataDir, dryRun = false }) {
 }
 
 // CLI 入口
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop())) {
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  const kbRoot = args.find((a) => a.startsWith("--kb-root="))?.split("=")[1];
-  const dataDir = args.find((a) => a.startsWith("--data-dir="))?.split("=")[1];
+  const kbRootArg = args.find((a) => a.startsWith("--kb-root="));
+  const dataDirArg = args.find((a) => a.startsWith("--data-dir="));
+  const kbRoot = kbRootArg?.slice("--kb-root=".length);
+  const dataDir = dataDirArg?.slice("--data-dir=".length);
   const dryRun = args.includes("--dry-run");
   if (!kbRoot || !dataDir) {
     console.error("用法: node kb-sanitize.mjs --kb-root <内容库> --data-dir <dataDir> [--dry-run]");

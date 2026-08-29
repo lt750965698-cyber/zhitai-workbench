@@ -159,7 +159,10 @@ const creativeRunner = createCreativeRunner({ openStudio: openCreativeStudio });
 const xBookmarkRunner = createXBookmarkRunner({ openStudio: openCreativeStudio });
 yuanbaoRunner = createYuanbaoRunner({ openStudio: openCreativeStudio, runtimeRoot: RUNTIME_ROOT });
 
-const DAILY_CREATIVE_TARGET = 1;
+const configuredDailyCreativeTarget = Number.parseInt(process.env.ZHITAI_DAILY_CREATIVE_TARGET || "1", 10);
+const DAILY_CREATIVE_TARGET = Number.isInteger(configuredDailyCreativeTarget)
+  ? Math.min(10, Math.max(1, configuredDailyCreativeTarget))
+  : 1;
 const DAILY_CREATIVE_MAX_ATTEMPTS = DAILY_CREATIVE_TARGET * 4;
 const MAX_CONSECUTIVE_REVISION_ATTEMPTS = 2;
 const CREATIVE_RETRY_BACKOFF_MS = 4 * 60 * 60_000;

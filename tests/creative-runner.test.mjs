@@ -511,9 +511,9 @@ test("旧版首轮零 identity 超时断点可一次性绑定当前 fingerprint�
       shotIndex: 1,
       accountId: "account-1",
       conversationUrl: "https://www.doubao.com/chat/legacy-attempt",
-      submittedAt: "2026-08-29T04:50:01.240Z",
+      submittedAt: "2030-02-01T00:00:00.000Z",
       baselineIdentities: [],
-      lastWaitTimedOutAt: "2026-08-29T05:22:16.154Z",
+      lastWaitTimedOutAt: "2030-02-01T00:15:00.000Z",
       lastWaitHadNewIdentity: false,
     } } },
   };
@@ -558,18 +558,18 @@ test("旧版首轮零 identity 超时断点可一次性绑定当前 fingerprint�
   }), { action: "recover_orphan" });
 });
 
-test("现场暂停的两轮旧超时断点精确迁移为 count=2，resume 后无需第三轮等待", () => {
+test("显式注入的两轮旧超时 fixture 精确迁移为 count=2，resume 后无需第三轮等待", () => {
   const inputFingerprint = "9".repeat(64);
   const checkpoint = {
-    jobId: "creative_7f038271-129c-47cf-a0d4-f497777fb28e",
-    assetId: "kb_mig_3a49401e",
-    accountId: "account-1",
+    jobId: "creative_11111111-1111-4111-8111-111111111111",
+    assetId: "asset-public-fixture",
+    accountId: "fixture-account",
     shotIndex: 0,
     doubao: { shots: { "1": {
       shotIndex: 1,
-      accountId: "account-1",
-      submittedAt: "2026-08-29T04:50:01.240Z",
-      lastWaitTimedOutAt: "2026-08-29T05:35:17.711Z",
+      accountId: "fixture-account",
+      submittedAt: "2030-01-01T00:00:00.000Z",
+      lastWaitTimedOutAt: "2030-01-01T00:30:00.000Z",
       lastWaitHadNewIdentity: false,
       baselineIdentities: [],
     } } },
@@ -580,9 +580,19 @@ test("现场暂停的两轮旧超时断点精确迁移为 count=2，resume 后�
     assetId: checkpoint.assetId,
     shotIndex: 1,
     shotPosition: 0,
-    accountId: "account-1",
+    accountId: "fixture-account",
   };
-  const migration = trustedLegacyDoubaoTimeoutMigration(scope);
+  const migration = trustedLegacyDoubaoTimeoutMigration(scope, [{
+    migrationId: "public-test-two-safe-timeouts",
+    jobId: checkpoint.jobId,
+    assetId: checkpoint.assetId,
+    shotIndex: 1,
+    shotPosition: 0,
+    accountId: "fixture-account",
+    submittedAt: "2030-01-01T00:00:00.000Z",
+    lastWaitTimedOutAt: "2030-01-01T00:30:00.000Z",
+    timeoutCount: 2,
+  }]);
   assert.equal(migration?.timeoutCount, 2);
   assert.equal(bindLegacyDoubaoAttempt({
     ...scope,
@@ -606,7 +616,7 @@ test("现场暂停的两轮旧超时断点精确迁移为 count=2，resume 后�
   assert.deepEqual(doubaoOrphanRecoveryDecision({
     shot,
     inputFingerprint,
-    accountId: "account-1",
+    accountId: "fixture-account",
     timeoutError: { code: DOUBAO_VIDEO_TIMEOUT_CODE, timeoutEvidence },
     availabilityBefore: { loginRequired: false, quotaExhausted: false },
     availabilityAfter: { loginRequired: false, quotaExhausted: false },

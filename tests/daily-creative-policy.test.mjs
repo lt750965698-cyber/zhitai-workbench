@@ -258,18 +258,18 @@ test("每日目标只计算当日包绑定的已批准 job + asset", async () =>
 test("启动历史复审不能污染当日包，可从唯一当日返工链恢复真实任务", async () => {
   const { policy } = await loadDailyCreativePolicy();
   const today = "2026-08-29";
-  const staleJobId = "creative_c5af432e-622f-4bfc-8abd-23cbaff6ed30";
-  const currentJobId = "creative_7f038271-129c-47cf-a0d4-f497777fb28e";
+  const staleJobId = "creative_22222222-2222-4222-8222-222222222222";
+  const currentJobId = "creative_33333333-3333-4333-8333-333333333333";
   const jobs = [
     {
       id: staleJobId,
-      assetId: "kb_mig_054f6e96",
+      assetId: "asset-stale-fixture",
       status: "completed",
       createdAt: "2026-08-23T12:46:00.753Z",
     },
     {
       id: currentJobId,
-      assetId: "kb_mig_3a49401e",
+      assetId: "asset-current-fixture",
       status: "paused",
       createdAt: "2026-08-29T04:27:21.771Z",
     },
@@ -278,13 +278,13 @@ test("启动历史复审不能污染当日包，可从唯一当日返工链恢�
     {
       date: today,
       jobId: staleJobId,
-      assetId: "kb_mig_054f6e96",
+      assetId: "asset-stale-fixture",
       status: "approved_for_publish",
     },
     {
       date: today,
       jobId: "creative-old-needs-revision",
-      assetId: "kb_mig_3a49401e",
+      assetId: "asset-current-fixture",
       status: "needs_revision",
       revisionTaskId: currentJobId,
     },
@@ -297,7 +297,7 @@ test("启动历史复审不能污染当日包，可从唯一当日返工链恢�
   }, today, jobs, reviews);
   assert.equal(binding.source, "unique_today_revision_recovery");
   assert.equal(binding.jobId, currentJobId);
-  assert.equal(binding.lockedAssetId, "kb_mig_3a49401e");
+  assert.equal(binding.lockedAssetId, "asset-current-fixture");
   assert.equal(policy.qualifiedCreativeReviewCount(reviews, today, {
     jobId: binding.jobId,
     assetId: binding.lockedAssetId,

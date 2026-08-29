@@ -13,7 +13,7 @@ import { adapterKuaidian, adapterLocalFile, redactUrlForStorage, isStableShareUr
 import { mkdir, stat as fsStat } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { createReadStream } from "node:fs";
-import { spawn } from "node:child_process";
+import { openLocalPath } from "./platform-utils.mjs";
 
 let kbDb = null;
 let kbDbPath = null; // P0 共享连接修复：后台异步任务各自 openKbDb(kbDbPath) 开独立连接，绝不复用全局 kbDb
@@ -449,8 +449,7 @@ export async function handleKbRequest({ request, requestUrl, response, sendJson:
     const row = kbDb.prepare("SELECT package_path FROM video_asset WHERE id=?").get(id);
     if (!row?.package_path) { sendJson(response, 404, { error: "package_not_found" }, request); return true; }
     try {
-      const child = spawn("/usr/bin/open", [row.package_path], { detached: true, stdio: "ignore" });
-      child.unref();
+      if (!await openLocalPath(row.package_path)) throw new Error("open_path_unavailable");
       sendJson(response, 200, { ok: true }, request);
     } catch {
       sendJson(response, 500, { error: "open_package_failed" }, request);

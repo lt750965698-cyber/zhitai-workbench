@@ -54,6 +54,14 @@ pnpm licenses list --json
 
 以上清单表示潜在兼容接口，不表示项目维护者认可、担保、托管或分发这些工具。
 
+### xiaohongshu-mcp 可选源码补丁
+
+仓库内的 `patches/xiaohongshu-mcp-ai-declaration.patch` 是对
+`xpzouying/xiaohongshu-mcp` 精确提交
+`6fb866a7db4e3dcce8dc00a0dde07370f3b12946` 的修改，沿用上游
+Apache License 2.0。补丁加入 AI 合成内容声明与发布前失败回执；织台不分发
+应用补丁后的二进制。来源、验证方式和修改范围见 `patches/README.md`。
+
 ## 可选模块更新器
 
 仓库包含由用户在界面中确认后触发的本地更新器。它可能：

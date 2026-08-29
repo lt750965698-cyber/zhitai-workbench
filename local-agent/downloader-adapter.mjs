@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { stat, writeFile, mkdir, rm, open } from "node:fs/promises";
 import { createWriteStream, createReadStream } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -350,7 +350,7 @@ export async function probeLocalMedia(filePath) {
 }
 
 /* ─────────── 流式下载（大小上限 + 超时 + manual redirect 每跳校验 + 清理） ─────────── */
-export async function downloadToTemp(url, { timeoutMs = 60000, maxBytes = 512 * 1024 * 1024, dir = "/tmp" } = {}) {
+export async function downloadToTemp(url, { timeoutMs = 60000, maxBytes = 512 * 1024 * 1024, dir = tmpdir() } = {}) {
   await mkdir(dir, { recursive: true });
   const tmpPath = join(dir, `kb_dl_${Date.now()}_${Math.random().toString(16).slice(2, 6)}.mp4`);
   const controller = new AbortController();

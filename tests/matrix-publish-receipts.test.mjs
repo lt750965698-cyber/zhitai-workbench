@@ -41,7 +41,8 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     out: JSON.stringify({ status: "published", postId: "note-1", url: "https://example.com/note-1" }),
     err: "",
   }, { mode: "public" });
-  assert.equal(published.state, "public");
+  assert.equal(published.state, "submitted");
+  assert.equal(published.adapterReportedState, "public");
   assert.equal(published.postId, "note-1");
   assert.equal(published.resultUrl, "https://example.com/note-1");
 
@@ -50,7 +51,8 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     out: JSON.stringify({ status: "success", data: { publishStatus: "published", id: "post-task-2" } }),
     err: "",
   }, { mode: "public" });
-  assert.equal(nestedPublished.state, "public");
+  assert.equal(nestedPublished.state, "submitted");
+  assert.equal(nestedPublished.adapterReportedState, "public");
   assert.equal(nestedPublished.taskId, "post-task-2");
 
   const scheduled = classifyMatrixPublishResult({
@@ -58,10 +60,10 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     out: JSON.stringify({ status: "success", taskId: "schedule-1" }),
     err: "",
   }, { mode: "scheduled" });
-  assert.equal(scheduled.state, "scheduled");
+  assert.equal(scheduled.state, "submitted");
   assert.equal(scheduled.taskId, "schedule-1");
 
-  assert.equal(classifyMatrixPublishResult({ code: 0, out: "ok", err: "" }, { mode: "draft" }).state, "draft");
+  assert.equal(classifyMatrixPublishResult({ code: 0, out: "ok", err: "" }, { mode: "draft" }).state, "submitted");
   const publicFallback = classifyMatrixPublishResult({ code: 4, out: "saved", err: "" }, { mode: "public" });
   assert.equal(publicFallback.state, "draft");
   assert.equal(publicFallback.accepted, false, "正式发布降级到草稿不能算成功");
@@ -94,7 +96,7 @@ test("真实发布接受会持久验证账号，视频号登录页重定向会�
     authStateStore: authStore,
     run: async () => ({ code: 0, out: JSON.stringify({ status: "saved_draft", message: "草稿已保存" }), err: "" }),
   });
-  assert.equal(accepted.results[0].state, "draft");
+  assert.equal(accepted.results[0].state, "submitted");
   assert.equal((await authStore.get("sph", target)).authState, "verified");
 
   const rejected = await cliPublish(payload, {

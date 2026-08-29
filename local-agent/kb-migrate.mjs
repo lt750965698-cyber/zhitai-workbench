@@ -14,7 +14,7 @@
  */
 import { readFile, readdir, stat as fsStat } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, normalize, sep } from "node:path";
 import { beginImmediateWithRetry, openKbDb, retrySqliteBusy } from "./kb.mjs";
 import { probeLocalMedia } from "./downloader-adapter.mjs";
 import { parseFormattedCount, deriveContentId, canonicalizeSourceUrl } from "./content-metadata.mjs";
@@ -230,7 +230,7 @@ export async function upgradeV2Database({ dataDir }) {
     for (const a of assets) {
       let changed = false;
       if (!a.category && a.package_path) {
-        const seg = String(a.package_path).split("/").filter(Boolean);
+        const seg = normalize(String(a.package_path)).split(sep).filter(Boolean);
         // 内容库/<分类>/<日期>/<包> → 分类 = 倒数第 3 段
         const catIdx = seg.findIndex((s) => s === "内容库");
         const category = catIdx >= 0 && seg[catIdx + 1] ? seg[catIdx + 1] : null;

@@ -9,11 +9,13 @@ import {
 
 const PID = 4242;
 const WINDOW_ID = 9001;
+const TARGET_CHAT = "ClawBot 测试会话";
 const OFFICIAL_WECHAT_EXECUTABLE = "/Applications/WeChat.app/Contents/MacOS/WeChat";
 const BACKUP_WECHAT_EXECUTABLE = "/Applications/WeChat.tampered-backup-20260806.app/Contents/MacOS/WeChat";
 
 function runOpenInterpreterKeepalive(options = {}) {
   return runKeepaliveImplementation({
+    targetChat: TARGET_CHAT,
     resolveProcessExecutable: async (pid) => (
       pid === PID ? OFFICIAL_WECHAT_EXECUTABLE : null
     ),
@@ -22,7 +24,7 @@ function runOpenInterpreterKeepalive(options = {}) {
 }
 
 function tree({
-  title = "微信 ClawBot AI",
+  title = TARGET_CHAT,
   value = "",
   send = true,
   duplicateSend = false,
@@ -37,7 +39,7 @@ function tree({
     "        split group Role: 分割组",
     "            container Role: 组",
     withSearch ? "                21 text field Role: 文本框, Value: " : "",
-    sidebarTarget ? "                22 text Role: 文本, Value: 微信 ClawBot AI" : "",
+    sidebarTarget ? `                22 text Role: 文本, Value: ${TARGET_CHAT}` : "",
     "            container Role: 组",
     "                container Role: 组",
     `                    heading Role: 标题, Value: ${title}`,
@@ -76,8 +78,8 @@ function contactTree({ duplicate = false } = {}) {
     "    standard window Role: 标准窗口 微信",
     "        split group Role: 分割组",
     "            container Role: 组",
-    "                41 row Role: 行 微信 ClawBot AI Secondary Actions: Select",
-    duplicate ? "                42 row Role: 行 微信 ClawBot AI Secondary Actions: Select" : "",
+    `                41 row Role: 行 ${TARGET_CHAT} Secondary Actions: Select`,
+    duplicate ? `                42 row Role: 行 ${TARGET_CHAT} Secondary Actions: Select` : "",
     "            container Role: 组",
     "                container Role: 组",
     "                    text Role: 文本, Value: 其他聊天",
@@ -539,8 +541,8 @@ test("当前是错误群聊时，即使侧栏出现目标名称也绝不写入�
 
 test("搜索框和模糊结果中的目标文字不能充当当前会话标题", async () => {
   const searchResultTree = tree({ title: "其他聊天", withSearch: true, sidebarTarget: true })
-    .replace("21 text field Role: 文本框, Value: ", "21 text field Role: 文本框, Value: 微信 ClawBot AI")
-    .replace("22 text Role: 文本, Value: 微信 ClawBot AI", "22 row Role: 行 微信 ClawBot AI候选 Secondary Actions: Select");
+    .replace("21 text field Role: 文本框, Value: ", `21 text field Role: 文本框, Value: ${TARGET_CHAT}`)
+    .replace(`22 text Role: 文本, Value: ${TARGET_CHAT}`, `22 row Role: 行 ${TARGET_CHAT}候选 Secondary Actions: Select`);
   const harness = createHarness([searchResultTree]);
   const outcome = await runOpenInterpreterKeepalive({ discoverSocket, driverCall: harness.driverCall });
   assert.deepEqual(outcome, { ok: false, code: "target_not_ready" });

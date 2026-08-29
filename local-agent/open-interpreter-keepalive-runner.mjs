@@ -11,7 +11,6 @@ const DRIVER_DEFAULT_SOCKET = join(homedir(), "Library", "Caches", "cua-driver",
 const WECHAT_BUNDLE_ID = "com.tencent.xinWeChat";
 const WECHAT_LAUNCH_PATH = "/Applications/WeChat.app";
 const WECHAT_EXECUTABLE_PATH = `${WECHAT_LAUNCH_PATH}/Contents/MacOS/WeChat`;
-const TARGET_CHAT = "微信 ClawBot AI";
 const KEEPALIVE_TEXT = "ZT_KEEPALIVE";
 const AUTH_MARKERS = Object.freeze(["重新登录", "扫码登录", "进入微信", "安全确认"]);
 const MAX_DRIVER_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -367,9 +366,9 @@ function editorHasValue(node, expected) {
   return isExactText(node.value, expected);
 }
 
-function findChatState(nodes, expectedEditorValue) {
+function findChatState(nodes, expectedEditorValue, targetChat) {
   const titles = nodes.filter((node) => isConversationTitle(node)
-    && nodeHasExactText(node, TARGET_CHAT)
+    && nodeHasExactText(node, targetChat)
     && !hasActionableAncestor(node));
   if (!titles.length) return { ok: false, code: "target_not_ready" };
   const editors = nodes.filter((node) => isComposerEditor(node) && Number.isInteger(node.index));
@@ -383,7 +382,7 @@ function findChatState(nodes, expectedEditorValue) {
       // a broad split-view ancestor that merely contains both the sidebar and
       // the active conversation.
       const paneTitles = nodesWithin(nodes, container, (node) => isConversationTitle(node)
-        && nodeHasExactText(node, TARGET_CHAT)
+        && nodeHasExactText(node, targetChat)
         && !hasActionableAncestor(node));
       const paneEditors = nodesWithin(nodes, container, isEditable);
       const paneNavigation = nodesWithin(nodes, container, (node) => [
@@ -568,9 +567,10 @@ async function clearVerifiedKeepaliveDraft({
   windowId,
   snapshot,
   expectedEditorIndex,
+  targetChat,
 }) {
   if (!snapshot || authMarkerPresent(snapshot.tree_markdown)) return false;
-  const current = findChatState(parseAxTree(snapshot.tree_markdown), KEEPALIVE_TEXT);
+  const current = findChatState(parseAxTree(snapshot.tree_markdown), KEEPALIVE_TEXT, targetChat);
   if (!current.ok || current.editor.index !== expectedEditorIndex) return false;
   const binding = elementBinding(snapshot, expectedEditorIndex);
   if (!binding) return false;
@@ -586,13 +586,14 @@ async function clearVerifiedKeepaliveDraft({
   }
   const clearedSnapshot = await getSnapshot(driverCall, socket, pid, windowId).catch(() => null);
   if (!clearedSnapshot || authMarkerPresent(clearedSnapshot.tree_markdown)) return false;
-  const cleared = findChatState(parseAxTree(clearedSnapshot.tree_markdown), "");
+  const cleared = findChatState(parseAxTree(clearedSnapshot.tree_markdown), "", targetChat);
   return cleared.ok && cleared.editor.index === expectedEditorIndex;
 }
 
 /**
  * Send the single fixed ClawBot keepalive through the maintained CuaDriver.app
- * AX daemon. The recipient and body are deliberately not parameters.
+ * AX daemon. The target must be supplied by private local configuration; public
+ * builds do not embed a user or machine-specific conversation name.
  */
 export async function runOpenInterpreterKeepalive(options = {}) {
   const driverCall = typeof options.driverCall === "function" ? options.driverCall : defaultDriverCall;
@@ -607,6 +608,8 @@ export async function runOpenInterpreterKeepalive(options = {}) {
     ? options.resolveProcessExecutable
     : defaultResolveProcessExecutable;
   const dryRun = options.dryRun === true;
+  const targetChat = normalizeSpace(options.targetChat ?? process.env.ZHITAI_OPEN_INTERPRETER_TARGET_CHAT);
+  if (!targetChat || targetChat.length > 80 || /[\r\n\0]/u.test(targetChat)) return failure("target_not_ready");
 
   let socket;
   try {
@@ -682,14 +685,14 @@ export async function runOpenInterpreterKeepalive(options = {}) {
     if (!snapshot) return failure("ax_incomplete");
     let nodes = parseAxTree(snapshot.tree_markdown);
     if (!nodes.length) return failure("ax_incomplete");
-    if (!nodes.some(isEditable) && !nodes.some((node) => nodeHasExactText(node, TARGET_CHAT))) {
+    if (!nodes.some(isEditable) && !nodes.some((node) => nodeHasExactText(node, targetChat))) {
       const elementCount = Number(snapshot.element_count);
       return failure(Number.isFinite(elementCount) && elementCount <= 30 ? "auth_required" : "ax_incomplete");
     }
 
     // Never navigate from a sidebar/search result.  The current conversation
     // must already be independently proven by its semantic AX heading.
-    let chat = findChatState(nodes, undefined);
+    let chat = findChatState(nodes, undefined, targetChat);
     if (!chat.ok) return failure(chat.code);
 
     const originalDraft = normalizeSpace(chat.editor.value);
@@ -726,6 +729,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
         windowId,
         snapshot: cleanupSnapshot,
         expectedEditorIndex: chat.editor.index,
+        targetChat,
       });
       return cleaned
         ? failure("state_changed")
@@ -742,6 +746,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
         windowId,
         snapshot: retrySnapshot,
         expectedEditorIndex: chat.editor.index,
+        targetChat,
       });
       return cleaned
         ? failure("state_changed")
@@ -751,7 +756,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
       return terminalFailure("auth_required", "draft_cleanup_unconfirmed");
     }
     const typedNodes = parseAxTree(typedSnapshot.tree_markdown);
-    const typedChat = findChatState(typedNodes, KEEPALIVE_TEXT);
+    const typedChat = findChatState(typedNodes, KEEPALIVE_TEXT, targetChat);
     if (!typedChat.ok) {
       const cleaned = await clearVerifiedKeepaliveDraft({
         driverCall,
@@ -760,6 +765,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
         windowId,
         snapshot: typedSnapshot,
         expectedEditorIndex: chat.editor.index,
+        targetChat,
       });
       return cleaned
         ? failure("state_changed")
@@ -774,6 +780,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
         windowId,
         snapshot: typedSnapshot,
         expectedEditorIndex: typedChat.editor.index,
+        targetChat,
       });
       const code = sendButtons.length > 1 ? "target_ambiguous" : "state_changed";
       return cleaned ? failure(code) : terminalFailure(code, "draft_cleanup_unconfirmed");
@@ -787,6 +794,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
         windowId,
         snapshot: typedSnapshot,
         expectedEditorIndex: typedChat.editor.index,
+        targetChat,
       });
       return cleaned
         ? failure("ax_incomplete")
@@ -810,7 +818,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
       return terminalFailure("send_uncertain");
     }
     const sentNodes = parseAxTree(sentSnapshot.tree_markdown);
-    const sentChat = findChatState(sentNodes, "");
+    const sentChat = findChatState(sentNodes, "", targetChat);
     if (!sentChat.ok
       || visibleSentKeepaliveCount(sentNodes, sentChat) <= initialSentKeepaliveCount) {
       return terminalFailure("send_uncertain");
@@ -831,6 +839,7 @@ export async function runOpenInterpreterKeepalive(options = {}) {
         windowId: pendingDraft.windowId,
         snapshot: cleanupSnapshot,
         expectedEditorIndex: pendingDraft.editorIndex,
+        targetChat,
       });
       if (!cleaned) return terminalFailure("driver_unavailable", "draft_cleanup_unconfirmed");
     }
@@ -838,5 +847,4 @@ export async function runOpenInterpreterKeepalive(options = {}) {
   }
 }
 
-export const OPEN_INTERPRETER_KEEPALIVE_TARGET = TARGET_CHAT;
 export const OPEN_INTERPRETER_KEEPALIVE_TEXT = KEEPALIVE_TEXT;

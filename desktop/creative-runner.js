@@ -48,51 +48,11 @@ const LOCAL_MOTION_MOTIONS = Object.freeze([
   }),
 ]);
 
-// 2026-08-28 人工核验过的单次 legacy 断点迁移。这不是通配的“旧图可复用”
-// 开关：任务、素材、镜头、当前提示词与实际文件指纹必须全部精确匹配。
-// 迁移成功后会立即写入 run-state.json，后续走普通 manifest 验证。
-const TRUSTED_LEGACY_STORYBOARD_MIGRATIONS = Object.freeze([
-  Object.freeze({
-    migrationId: "ea6-20260828-shot-01-manual-review",
-    jobId: "creative_ea6ca73c-0efa-4395-b638-83ff9f96abc1",
-    assetId: "kb_mig_2a2c770c",
-    shotIndex: 1,
-    promptHash: "3ebda3fef7985755548757f97b1fc6b921634c1e9d356045fc03c7afead5a373",
-    sha256: "561cb4252bab8e86d3e5884bbbe1f1458e32819f08c8f1f9be7b92ca21cf7460",
-    sizeBytes: 1_729_084,
-    width: 941,
-    height: 1672,
-  }),
-  Object.freeze({
-    migrationId: "ea6-20260828-shot-02-manual-review",
-    jobId: "creative_ea6ca73c-0efa-4395-b638-83ff9f96abc1",
-    assetId: "kb_mig_2a2c770c",
-    shotIndex: 2,
-    promptHash: "7a034218f55bce553575c80e2135e95e1e2e71682d30a2d06e3608496c4f343b",
-    sha256: "77be922b9dc121a5a952b540facb92212f3c9b5e639c2eefdcec6d024efb1c70",
-    sizeBytes: 1_515_364,
-    width: 941,
-    height: 1672,
-  }),
-]);
-
-// 该旧 runner 只覆写 lastWaitTimedOutAt，未保存 timeout 次数。2026-08-29
-// 现场已核对下列精确断点在同一提交上于 13:22、13:35 完成两轮零新
-// identity 超时，并在第二轮后暂停。仅完全匹配这些非秘密字段时迁移为 2；
-// 其余旧断点仍按单轮处理，不能由时间跨度猜测。
-const TRUSTED_LEGACY_DOUBAO_TIMEOUT_MIGRATIONS = Object.freeze([
-  Object.freeze({
-    migrationId: "creative-7f0-shot-01-two-safe-timeouts",
-    jobId: "creative_7f038271-129c-47cf-a0d4-f497777fb28e",
-    assetId: "kb_mig_3a49401e",
-    shotIndex: 1,
-    shotPosition: 0,
-    accountId: "account-1",
-    submittedAt: "2026-08-29T04:50:01.240Z",
-    lastWaitTimedOutAt: "2026-08-29T05:35:17.711Z",
-    timeoutCount: 2,
-  }),
-]);
+// Public builds never embed machine-specific job, asset, account or file
+// fingerprints. A private deployment may inject an explicitly reviewed list at
+// the call boundary; an unknown legacy artifact always fails closed.
+const TRUSTED_LEGACY_STORYBOARD_MIGRATIONS = Object.freeze([]);
+const TRUSTED_LEGACY_DOUBAO_TIMEOUT_MIGRATIONS = Object.freeze([]);
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1187,9 +1147,9 @@ function selectNewDoubaoResult(candidates = [], beforeIdentities = new Set(), ex
   return { status: "waiting" };
 }
 
-function trustedLegacyDoubaoTimeoutMigration({ checkpoint, jobId, assetId, shotIndex, shotPosition, accountId } = {}) {
+function trustedLegacyDoubaoTimeoutMigration({ checkpoint, jobId, assetId, shotIndex, shotPosition, accountId } = {}, migrations = TRUSTED_LEGACY_DOUBAO_TIMEOUT_MIGRATIONS) {
   const shot = checkpoint?.doubao?.shots?.[String(shotIndex)];
-  return TRUSTED_LEGACY_DOUBAO_TIMEOUT_MIGRATIONS.find((entry) => entry.jobId === jobId
+  return (Array.isArray(migrations) ? migrations : []).find((entry) => entry.jobId === jobId
     && entry.assetId === assetId && entry.shotIndex === Number(shotIndex)
     && entry.shotPosition === Number(shotPosition) && entry.accountId === accountId
     && checkpoint?.jobId === jobId && checkpoint?.assetId === assetId
