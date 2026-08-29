@@ -74,10 +74,17 @@ function guardedCrashWorkerFork(modulePath, args, options) {
     normalizedModulePath = resolve(modulePath instanceof URL ? fileURLToPath(modulePath) : String(modulePath));
   } catch { /* invalid module paths remain blocked */ }
   const isCrashWorker = normalizedModulePath === resolve(crashWorkerPath);
+  let importedLockdownPath = "";
+  try {
+    const importSpecifier = normalizedOptions.execArgv?.[1];
+    importedLockdownPath = String(importSpecifier).startsWith("file:")
+      ? fileURLToPath(importSpecifier)
+      : String(importSpecifier);
+  } catch { /* invalid import specifiers remain blocked */ }
   const importsLockdown = Array.isArray(normalizedOptions.execArgv)
     && normalizedOptions.execArgv.length === 2
     && normalizedOptions.execArgv[0] === "--import"
-    && resolve(String(normalizedOptions.execArgv[1])) === resolve(fileURLToPath(new URL("./network-lockdown.mjs", import.meta.url)));
+    && resolve(importedLockdownPath) === resolve(fileURLToPath(new URL("./network-lockdown.mjs", import.meta.url)));
   const environmentKeys = Object.keys(normalizedOptions.env || {});
   const safeEnvironment = normalizedOptions.env?.ZHITAI_E2E_NETWORK_POLICY === "deny_all"
     && normalizedOptions.env?.ZHITAI_E2E_OFFLINE === "1"

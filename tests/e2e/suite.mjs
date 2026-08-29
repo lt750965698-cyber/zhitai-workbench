@@ -7,7 +7,7 @@ import { Agent as HttpAgent, ClientRequest } from "node:http";
 import { Agent as HttpsAgent } from "node:https";
 import net from "node:net";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 import {
@@ -27,6 +27,7 @@ const FIXED_NOW = "2030-01-01T00:00:00.000Z";
 const PLATFORM_NAMES = Object.freeze(["fake-alpha", "fake-beta"]);
 const CRASH_WORKER = fileURLToPath(new URL("./crash-worker.mjs", import.meta.url));
 const NETWORK_LOCKDOWN = fileURLToPath(new URL("./network-lockdown.mjs", import.meta.url));
+const NETWORK_LOCKDOWN_URL = pathToFileURL(NETWORK_LOCKDOWN).href;
 
 const REQUIRED_FAULTS = Object.freeze([
   "DUPLICATE_DELIVERY",
@@ -436,7 +437,7 @@ async function spawnCrashWorker(configuration) {
   const child = fork(CRASH_WORKER, [], {
     cwd: fileURLToPath(new URL("../../", import.meta.url)),
     execPath: process.execPath,
-    execArgv: ["--import", NETWORK_LOCKDOWN],
+    execArgv: ["--import", NETWORK_LOCKDOWN_URL],
     env: {
       HOME: workerHome,
       USERPROFILE: workerHome,
