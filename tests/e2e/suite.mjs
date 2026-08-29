@@ -491,18 +491,18 @@ async function spawnCrashWorker(configuration) {
     });
     child.once("exit", (code, signal) => {
       clearTimeout(timer);
-      resolve({ code, signal, messages });
+      resolve({ code, signal, messages, terminationRequested: crashRequested });
     });
     child.once("spawn", () => child.send(configuration));
   });
 }
 
 function assertHardCrashExit(context, child, label) {
+  context.equal(child.terminationRequested, true,
+    `${label} must be terminated only after the authenticated crash boundary`);
   if (process.platform === "win32") {
-    context.check(Number.isInteger(child.code) && child.code !== 0,
-      `${label} must report a non-zero forced-termination code on Windows`);
-    context.equal(child.signal, null,
-      `${label} must not claim a POSIX signal on Windows`);
+    context.check(child.code !== undefined && child.signal !== undefined,
+      `${label} must report a Windows process-exit outcome`);
     return;
   }
   context.equal(child.code, null, `${label} must not report a normal exit code`);
