@@ -14,24 +14,27 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, copyFile, rm, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, copyFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createHttpServer } from "node:http";
 import { createReadStream } from "node:fs";
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
 const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
-const ROOT = join(tmpdir(), `kb_v2b_test_${Date.now()}`);
+const ROOT = await mkdtemp(join(tmpdir(), "kb_v2b_test_"));
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "real.mp4");
 const WATCH_DIR = join(ROOT, "watch");
+const TEMP_HOME = join(ROOT, "home");
+const TEMP_APPDATA = join(TEMP_HOME, "AppData", "Roaming");
+const TEMP_LOCALAPPDATA = join(TEMP_HOME, "AppData", "Local");
 
 let server;
 let baseUrl;
@@ -81,7 +84,9 @@ before(async () => {
   await mkdir(KB_ROOT, { recursive: true });
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(WATCH_DIR, { recursive: true });
-  await copyFile(TEST_MP4, SANDBOX_MP4);
+  await mkdir(TEMP_APPDATA, { recursive: true });
+  await mkdir(TEMP_LOCALAPPDATA, { recursive: true });
+  await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2b-base" });
 
   httpServer = createHttpServer((req, res) => {
     if (req.url.startsWith("/v.mp4")) {
@@ -115,6 +120,10 @@ before(async () => {
     cwd: repoRoot,
     env: {
       ...process.env,
+      HOME: TEMP_HOME,
+      USERPROFILE: TEMP_HOME,
+      APPDATA: TEMP_APPDATA,
+      LOCALAPPDATA: TEMP_LOCALAPPDATA,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: DATA_DIR,
       ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,

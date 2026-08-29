@@ -11,23 +11,26 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, copyFile, rm, readFile, open as openFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { findPackageDir } from "./helpers.mjs";
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
 const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
-const ROOT = join(tmpdir(), `kb_v2d_test_${Date.now()}`);
+const ROOT = await mkdtemp(join(tmpdir(), "kb_v2d_test_"));
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "sandbox.mp4");
 const WATCH_DIR = join(ROOT, "watch"); // 主 server 的显式隔离 watcher 目录（roots 非空）
+const TEMP_HOME = join(ROOT, "home");
+const TEMP_APPDATA = join(TEMP_HOME, "AppData", "Roaming");
+const TEMP_LOCALAPPDATA = join(TEMP_HOME, "AppData", "Local");
 
 let server;
 let baseUrl;
@@ -75,7 +78,9 @@ before(async () => {
   await mkdir(KB_ROOT, { recursive: true });
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(WATCH_DIR, { recursive: true }); // 显式隔离 watcher 目录（roots 禁止为空，避免回退真实默认目录）
-  await copyFile(TEST_MP4, SANDBOX_MP4);
+  await mkdir(TEMP_APPDATA, { recursive: true });
+  await mkdir(TEMP_LOCALAPPDATA, { recursive: true });
+  await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2d-base" });
   port = await reservePort();
   const config = {
     host: "127.0.0.1",
@@ -95,6 +100,10 @@ before(async () => {
     cwd: repoRoot,
     env: {
       ...process.env,
+      HOME: TEMP_HOME,
+      USERPROFILE: TEMP_HOME,
+      APPDATA: TEMP_APPDATA,
+      LOCALAPPDATA: TEMP_LOCALAPPDATA,
       ZHITAI_CONFIG_PATH: join(ROOT, "config.json"),
       ZHITAI_DATA_DIR: DATA_DIR,
       ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
@@ -169,13 +178,10 @@ test("无预先 /ingest：20 并发同 sourceUrl+localPath → 1 batch/1 item/1 
   assert.ok(itemRow.asset_id, "item 关联 asset_id");
 });
 
-/* ─────────── 工具：生成独立 sha 的 mp4（追加标记字节，避免与 A 用例资产冲突） ─────────── */
+/* ─────────── 工具：用不同 payload marker 生成独立 sha，避免与 A 用例资产冲突 ─────────── */
 async function makeDistinctMp4(name, marker) {
   const p = join(ROOT, name);
-  await copyFile(SANDBOX_MP4, p);
-  const fd = await openFile(p, "a");
-  await fd.write(marker);
-  await fd.close();
+  await writeSyntheticMp4(p, { marker });
   return p;
 }
 
@@ -702,10 +708,7 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
   await writeFile(enrichPath, enrichSrc);
   // 独立媒体字节（区别于本文件所有前序资产）
   const mediaPath = join(c2Root, "c2-bytes.mp4");
-  await copyFile(SANDBOX_MP4, mediaPath);
-  const fd = await openFile(mediaPath, "a");
-  await fd.write("V2D_C2_CROSS_PROCESS_MARKER");
-  await fd.close();
+  await writeSyntheticMp4(mediaPath, { marker: "V2D_C2_CROSS_PROCESS_MARKER" });
   const { createHash } = await import("node:crypto");
   const shaC2 = createHash("sha256").update(await readFile(mediaPath)).digest("hex");
 
@@ -726,14 +729,23 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
   // 各自独立的空 watcher 目录（非空 roots 数组、仅指向自己可见的空目录；roots=[] 会回退真实默认目录，禁止）
   const watcherDir1 = join(c2Root, "watch1");
   const watcherDir2 = join(c2Root, "watch2");
+  const c2Home = join(c2Root, "home");
+  const c2AppData = join(c2Home, "AppData", "Roaming");
+  const c2LocalAppData = join(c2Home, "AppData", "Local");
   await mkdir(watcherDir1, { recursive: true });
   await mkdir(watcherDir2, { recursive: true });
+  await mkdir(c2AppData, { recursive: true });
+  await mkdir(c2LocalAppData, { recursive: true });
   const cfg1 = join(c2Root, "config1.json");
   const cfg2 = join(c2Root, "config2.json");
   await writeFile(cfg1, JSON.stringify({ ...baseCfg, port: port1, watcher: { intervalMs: 5000, maxRetries: 3, roots: [{ dir: watcherDir1, channel: "kuaidian", recursive: true }] } }));
   await writeFile(cfg2, JSON.stringify({ ...baseCfg, port: port2, watcher: { intervalMs: 5000, maxRetries: 3, roots: [{ dir: watcherDir2, channel: "kuaidian", recursive: true }] } }));
   const childEnv = {
     ...process.env,
+    HOME: c2Home,
+    USERPROFILE: c2Home,
+    APPDATA: c2AppData,
+    LOCALAPPDATA: c2LocalAppData,
     ZHITAI_DATA_DIR: c2Data,
     ZHITAI_ENRICH_SCRIPT: enrichPath,
     ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
@@ -844,10 +856,7 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     }
     // 新一轮媒体字节/SHA（区别于第一轮）
     const mediaPath2 = join(c2Root, "c2-fail-bytes.mp4");
-    await copyFile(SANDBOX_MP4, mediaPath2);
-    const fd2 = await openFile(mediaPath2, "a");
-    await fd2.write("V2D_C2_FAIL_TAKEOVER_MARKER");
-    await fd2.close();
+    await writeSyntheticMp4(mediaPath2, { marker: "V2D_C2_FAIL_TAKEOVER_MARKER" });
     const shaC2Fail = createHash("sha256").update(await readFile(mediaPath2)).digest("hex");
     // 隔离 DB 触发器：A（title=C2_FAIL_A）的 success receipt 写入即 RAISE 中止（终态写入故障）；
     // A 写事务的保持由 delayProof getter 负责（insertPlatformPost 内 ~1500ms 忙等，发生在 INSERT video_asset 之后）。

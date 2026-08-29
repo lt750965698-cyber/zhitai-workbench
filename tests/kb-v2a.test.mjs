@@ -22,28 +22,30 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, copyFile, readFile, rm, readdir, stat as fsStat } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, copyFile, readFile, rm, readdir, stat as fsStat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createHttpServer } from "node:http";
 import { createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
-const MOOV_AT_END_MP4 = join(testsDir, "fixtures", "media", "sample-moov-at-end.mp4");
 const WATCHABLE_MP4 = join(testsDir, "fixtures", "media", "sample-watchable.mp4");
 const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
-const ROOT = join(tmpdir(), `kb_v2a_test_${Date.now()}`);
+const ROOT = await mkdtemp(join(tmpdir(), "kb_v2a_test_"));
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "real.mp4");
 const WATCH_DIR = join(ROOT, "watch-kuaidian");
 const WATCH_DIR2 = join(ROOT, "watch-mandian");
+const TEMP_HOME = join(ROOT, "home");
+const TEMP_APPDATA = join(TEMP_HOME, "AppData", "Roaming");
+const TEMP_LOCALAPPDATA = join(TEMP_HOME, "AppData", "Local");
 
 let server;
 let baseUrl;
@@ -86,7 +88,10 @@ before(async () => {
   await mkdir(DATA_DIR, { recursive: true });
   await mkdir(WATCH_DIR, { recursive: true });
   await mkdir(WATCH_DIR2, { recursive: true });
-  await copyFile(TEST_MP4, SANDBOX_MP4);
+  await mkdir(TEMP_APPDATA, { recursive: true });
+  await mkdir(TEMP_LOCALAPPDATA, { recursive: true });
+  // watcher ignores files below 100 KiB; keep this fixture just above that product threshold.
+  await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2a-base", payloadBytes: 128 * 1024 });
 
   // 本地 HTTP 直链服务（供 downloadUrl 下载测试；签名参数测试也用它）
   httpServer = createHttpServer((req, res) => {
@@ -126,6 +131,10 @@ before(async () => {
     cwd: repoRoot,
     env: {
       ...process.env,
+      HOME: TEMP_HOME,
+      USERPROFILE: TEMP_HOME,
+      APPDATA: TEMP_APPDATA,
+      LOCALAPPDATA: TEMP_LOCALAPPDATA,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: DATA_DIR,
       ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
@@ -322,7 +331,7 @@ test("metadata.files 使用实际 videoName/ext：stat 存在且 size/sha 一致
 /* ─────────── ⑥ 合法 mdat→moov 合成夹具 → ok ─────────── */
 test("非 fast-start（ftyp→mdat→moov）合成视频被 probeLocalMedia 判 ok", async () => {
   const out = join(ROOT, "no-faststart.m4v");
-  await copyFile(MOOV_AT_END_MP4, out);
+  await writeSyntheticMp4(out, { mdatBeforeMoov: true, marker: "kb-v2a-mdat-before-moov" });
   const { probeLocalMedia } = await import("../local-agent/downloader-adapter.mjs");
   const media = await probeLocalMedia(out);
   assert.equal(media.mediaValidation, "ok", `合法 mdat→moov 必须 ok，实际 ${media.mediaValidation}`);
@@ -622,11 +631,7 @@ test("迁移幂等：无 capturedAt 包用 metadata 文件 mtime 稳定回退；
   const files = [];
   for (let i = 0; i < 6; i++) {
     const f = join(migDir, `src_${i}.mp4`);
-    await copyFile(TEST_MP4, f);
-    const { open } = await import("node:fs/promises");
-    const fd = await open(f, "a");
-    await fd.write(`MARKER_${i}`);
-    await fd.close();
+    await writeSyntheticMp4(f, { marker: `kb-v2a-migration-${i}` });
     files.push(f);
   }
   for (let i = 0; i < 10; i++) {

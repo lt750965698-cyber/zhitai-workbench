@@ -97,10 +97,11 @@ curl http://127.0.0.1:17890/health
 ~~~bash
 pnpm lint
 pnpm test:backup
+pnpm run test:offline-e2e
 pnpm test
 ~~~
 
-pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集成不应在默认测试中访问真实账号或真实内容。
+pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集成不应在默认测试中访问真实账号或真实内容。`test:offline-e2e` 使用全网络拒绝、临时 HOME/SQLite、合成媒体和假平台回执验证整链故障恢复，并在 `.artifacts/offline-e2e/` 生成机器可读 JSON。
 
 ## 可验证备份、恢复与迁移
 
@@ -203,6 +204,7 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 - [可验证备份、恢复与迁移](docs/BACKUP_RESTORE.md)
 - [安全模型](docs/SECURITY_MODEL.md)
 - [内容与授权政策](docs/CONTENT_POLICY.md)
+- [离线整链 E2E 与故障注入](docs/OFFLINE_E2E.md)
 - [路线图](ROADMAP.md)
 - [变更记录](CHANGELOG.md)
 - [支持](SUPPORT.md)

@@ -1,10 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import {
   getVideoDetail,
   localMotionGenerationProvenanceSha256,
@@ -16,9 +15,7 @@ import {
   strictWorkflowSha256,
   validateLocalMotionManifestBundle,
 } from "../local-agent/kb.mjs";
-
-const testsDir = dirname(fileURLToPath(import.meta.url));
-const TEST_MP4 = join(testsDir, "fixtures", "media", "sample-faststart.mp4");
+import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 test("MoneyPrinterTurbo 成片会复制回原内容包并出现在视频详情", async () => {
   const root = await mkdtemp(join(tmpdir(), "zhitai-remake-"));
@@ -28,7 +25,10 @@ test("MoneyPrinterTurbo 成片会复制回原内容包并出现在视频详情",
   const previousRoot = process.env.ZHITAI_MPT_ROOT;
   await mkdir(join(engineRoot, "storage", "tasks", taskId), { recursive: true });
   await mkdir(packagePath, { recursive: true });
-  await copyFile(TEST_MP4, join(engineRoot, "storage", "tasks", taskId, "final-1.mp4"));
+  await writeSyntheticMp4(join(engineRoot, "storage", "tasks", taskId, "final-1.mp4"), {
+    marker: "moneyprinter-generation",
+    payloadBytes: 128 * 1024,
+  });
   process.env.ZHITAI_MPT_ROOT = engineRoot;
   const db = openKbDb(join(root, "kb.sqlite"));
   try {
@@ -79,7 +79,7 @@ test("织台 Seedance 成片登记回原内容包并可供发布", async () => {
   await mkdir(join(generationRoot, jobId), { recursive: true });
   await mkdir(packagePath, { recursive: true });
   const finalPath = join(generationRoot, jobId, "final.mp4");
-  await copyFile(TEST_MP4, finalPath);
+  await writeSyntheticMp4(finalPath, { marker: "zhitai-seedance-generation", payloadBytes: 128 * 1024 });
   await writeFile(join(generationRoot, jobId, "storyboard-01.png"), Buffer.alloc(2048, 7));
   await writeFile(join(generationRoot, jobId, "run-state.json"), JSON.stringify({ shotIndex: 0 }));
   const finalBytes = await readFile(finalPath);
@@ -124,7 +124,10 @@ test("织台 Seedance 成片缺少可听音频质检时不得登记", async () =
   const previousRoot = process.env.ZHITAI_GENERATION_ROOT;
   await mkdir(join(generationRoot, jobId), { recursive: true });
   await mkdir(packagePath, { recursive: true });
-  await copyFile(TEST_MP4, join(generationRoot, jobId, "final.mp4"));
+  await writeSyntheticMp4(join(generationRoot, jobId, "final.mp4"), {
+    marker: "zhitai-seedance-audio-gate",
+    payloadBytes: 128 * 1024,
+  });
   process.env.ZHITAI_GENERATION_ROOT = generationRoot;
   const db = openKbDb(join(root, "kb.sqlite"));
   try {
@@ -185,7 +188,7 @@ test("LocalMotion 只能从通过哈希、分镜、片段、帧率和旁白完�
   await mkdir(outputDir, { recursive: true });
   await mkdir(packagePath, { recursive: true });
   const finalPath = join(outputDir, "final.mp4");
-  await copyFile(TEST_MP4, finalPath);
+  await writeSyntheticMp4(finalPath, { marker: "local-motion-generation", payloadBytes: 128 * 1024 });
   await writeFile(join(outputDir, "final.visual.mp4"), Buffer.alloc(4_096, 6));
   const finalBytes = await readFile(finalPath);
   const finalSha256 = createHash("sha256").update(finalBytes).digest("hex");

@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { syntheticMp4Buffer } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(testsDir);
@@ -14,16 +15,17 @@ const agentEntry = join(repositoryRoot, "local-agent", "server.mjs");
 const inboxClientEntry = join(repositoryRoot, "local-agent", "inbox-submit.mjs");
 const ingestFixture = join(testsDir, "fixtures", "command-ingest-adapter.mjs");
 const serviceFixture = join(testsDir, "fixtures", "managed-service.mjs");
-const mediaFixture = join(testsDir, "fixtures", "media", "sample-moov-at-end.mp4");
-let fixtureBytes;
+const fixtureBytes = syntheticMp4Buffer({ mdatBeforeMoov: true, marker: "local-agent-integration" });
 const webhookSecret = "fixture-webhook-secret";
 
 test("local agent integrates content packages, approval gates, and exclusive services", async (t) => {
   const sandbox = await mkdtemp(join(tmpdir(), "zhitai-local-agent-test-"));
-  // 仓库内确定性合成 MP4；不调用系统转码器，也不读取用户媒体库。
-  fixtureBytes = await readFile(mediaFixture);
   const dataDir = join(sandbox, "data");
   const knowledgeBase = join(sandbox, "knowledge-base");
+  const watcherRoot = join(sandbox, "watch");
+  const temporaryHome = join(sandbox, "home");
+  const temporaryAppData = join(temporaryHome, "AppData", "Roaming");
+  const temporaryLocalAppData = join(temporaryHome, "AppData", "Local");
   const publicKnowledgeBase = `…/${basename(knowledgeBase)}`;
   const sourceAsset = join(sandbox, "source-video.mp4");
   const publishAsset = join(knowledgeBase, "publish-video.mp4");
@@ -71,6 +73,11 @@ test("local agent integrates content packages, approval gates, and exclusive ser
   const knownServicePids = new Set();
   let agent;
 
+  await Promise.all([
+    mkdir(watcherRoot, { recursive: true }),
+    mkdir(temporaryAppData, { recursive: true }),
+    mkdir(temporaryLocalAppData, { recursive: true }),
+  ]);
   await writeFile(sourceAsset, fixtureBytes);
   await writeFile(publishAsset, Buffer.from("publish fixture\n", "utf8"), { flag: "w" }).catch(async (error) => {
     if (error?.code !== "ENOENT") throw error;
@@ -84,6 +91,7 @@ test("local agent integrates content packages, approval gates, and exclusive ser
     knowledgeBase,
     allowedOrigins: ["http://localhost:3000"],
     polling: { intervalMs: 250, timeoutMs: 5_000 },
+    watcher: { intervalMs: 5_000, maxRetries: 3, roots: [{ dir: watcherRoot, channel: "kuaidian", recursive: true }] },
     analysis: { yuanbaoChat: false },
     adapters: {
       douyin: {
@@ -172,6 +180,10 @@ test("local agent integrates content packages, approval gates, and exclusive ser
     cwd: repositoryRoot,
     env: {
       ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      APPDATA: temporaryAppData,
+      LOCALAPPDATA: temporaryLocalAppData,
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: dataDir,
       ZHITAI_PORT: String(port),

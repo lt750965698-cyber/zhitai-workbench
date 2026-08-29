@@ -37,6 +37,7 @@
     "test:agent": "node --test tests/local-agent.integration.test.mjs",
     "test:ops": "node --test tests/operations-experiment-review.test.mjs tests/operations-metrics-contract.test.mjs tests/operations-report.test.mjs tests/operations-schema-validation.test.mjs",
     "report:ops:synthetic": "node scripts/operations-report.mjs --synthetic --format markdown",
+    "test:offline-e2e": "node --import ./tests/e2e/network-lockdown.mjs scripts/run-offline-e2e.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },
