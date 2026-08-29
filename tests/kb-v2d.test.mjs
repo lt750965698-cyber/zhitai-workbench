@@ -673,7 +673,7 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     '  await atomicTouch("arrival-" + pid, new Date().toISOString());',
     "  await waitForRelease(); // 只等父进程 release；双方都已在 INSERT 前完成查重",
     '  const url = String(sourceUrl || "");',
-    "  const m = url.match(/post=([A-Za-z0-9_]+)/);",
+    "  const m = url.match(/\\/([A-Za-z0-9_]+)\\/?$/);",
     '  const marker = m ? m[1] : "default";',
     '  if (marker === "c2failb") await waitMs(100); // 第二轮：仅 c2failb 在 release 后再等小延迟，确保 c2faila 先进入 OWNER_TX',
     '  const raw = { feedInfo: { description: "C2帖子-" + marker, author: "作者" } };',
@@ -776,12 +776,12 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     const [resp1, resp2] = await Promise.all([
       fetch(`http://127.0.0.1:${port1}/api/v1/kuaidian`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ localPath: mediaPath, sourceUrl: "https://weixin.qq.com/sph/c2_fact_a?post=c2a", deliveryId: "msg_c2_a", title: "C2A" }),
+        body: JSON.stringify({ localPath: mediaPath, sourceUrl: "https://weixin.qq.com/sph/c2a", deliveryId: "msg_c2_a", title: "C2A" }),
         signal: AbortSignal.timeout(15000),
       }),
       fetch(`http://127.0.0.1:${port2}/api/v1/kuaidian`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ localPath: mediaPath, sourceUrl: "https://weixin.qq.com/sph/c2_fact_b?post=c2b", deliveryId: "msg_c2_b", title: "C2B" }),
+        body: JSON.stringify({ localPath: mediaPath, sourceUrl: "https://weixin.qq.com/sph/c2b", deliveryId: "msg_c2_b", title: "C2B" }),
         signal: AbortSignal.timeout(15000),
       }),
     ]);
@@ -858,14 +858,14 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     const mediaPath2 = join(c2Root, "c2-fail-bytes.mp4");
     await writeSyntheticMp4(mediaPath2, { marker: "V2D_C2_FAIL_TAKEOVER_MARKER" });
     const shaC2Fail = createHash("sha256").update(await readFile(mediaPath2)).digest("hex");
-    // 隔离 DB 触发器：A（title=C2_FAIL_A）的 success receipt 写入即 RAISE 中止（终态写入故障）；
+    // 隔离 DB 触发器：按规范 source_url 匹配 A 的 success receipt，写入即 RAISE 中止（终态写入故障）；
     // A 写事务的保持由 delayProof getter 负责（insertPlatformPost 内 ~1500ms 忙等，发生在 INSERT video_asset 之后）。
-    // B 的 title=C2_FAIL_B 不受影响。
+    // B 的规范 source_url 不匹配触发器，不受影响。
     {
       const tdb = new DatabaseSync(join(c2Data, "kb.sqlite"));
       tdb.exec("PRAGMA busy_timeout = 5000");
       tdb.exec(`CREATE TRIGGER trg_fail_c2fail_a BEFORE INSERT ON download_receipt
-        WHEN NEW.outcome = 'success' AND NEW.title = 'C2_FAIL_A'
+        WHEN NEW.outcome = 'success' AND NEW.source_url = 'https://weixin.qq.com/sph/c2faila'
         BEGIN
           SELECT RAISE(ABORT, 'forced_owner_terminal_failure');
         END`);
@@ -875,12 +875,12 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     const [r2a, r2b] = await Promise.all([
       fetch(`http://127.0.0.1:${port1}/api/v1/kuaidian`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ localPath: mediaPath2, sourceUrl: "https://weixin.qq.com/sph/c2_fail_a?post=c2faila", deliveryId: "msg_c2_fail_a", title: "C2_FAIL_A" }),
+        body: JSON.stringify({ localPath: mediaPath2, sourceUrl: "https://weixin.qq.com/sph/c2faila", deliveryId: "msg_c2_fail_a", title: "C2_FAIL_A" }),
         signal: AbortSignal.timeout(15000),
       }),
       fetch(`http://127.0.0.1:${port2}/api/v1/kuaidian`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ localPath: mediaPath2, sourceUrl: "https://weixin.qq.com/sph/c2_fail_b?post=c2failb", deliveryId: "msg_c2_fail_b", title: "C2_FAIL_B" }),
+        body: JSON.stringify({ localPath: mediaPath2, sourceUrl: "https://weixin.qq.com/sph/c2failb", deliveryId: "msg_c2_fail_b", title: "C2_FAIL_B" }),
         signal: AbortSignal.timeout(15000),
       }),
     ]);
@@ -913,7 +913,7 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     const items2 = db2.prepare("SELECT id, status, asset_id, error FROM import_item WHERE delivery_id LIKE 'msg_c2_fail_%' ORDER BY delivery_id").all();
     const batchCount2 = db2.prepare("SELECT COUNT(DISTINCT i.batch_id) c FROM import_item i WHERE i.delivery_id LIKE 'msg_c2_fail_%'").get().c;
     const itemCount2 = db2.prepare("SELECT COUNT(*) c FROM import_item WHERE delivery_id LIKE 'msg_c2_fail_%'").get().c;
-    const receiptRows2 = db2.prepare("SELECT asset_id, outcome, title FROM download_receipt WHERE sha256=?").all(shaC2Fail);
+    const receiptRows2 = db2.prepare("SELECT asset_id, outcome, source_url, content_id FROM download_receipt WHERE sha256=?").all(shaC2Fail);
     const assetRows2 = db2.prepare("SELECT id FROM video_asset WHERE sha256=?").all(shaC2Fail);
     db2.close();
     assert.equal(batchCount2, 2, "round2 严格 2 batch");
@@ -931,10 +931,11 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
     assert.equal(items2.filter((i) => i.status === "duplicate" || i.status === "linked").length, 0, "round2 零 duplicate/linked");
     assert.equal(items2.filter((i) => i.status === "failed").length, 1, "round2 恰 1 个 failed（A）");
     // receipt：A failed 且 asset_id=null；B success 且指向 winner
-    const receiptA2 = receiptRows2.find((r) => String(r.title) === "C2_FAIL_A");
-    const receiptB2 = receiptRows2.find((r) => String(r.title) === "C2_FAIL_B");
+    const receiptA2 = receiptRows2.find((r) => r.source_url === "https://weixin.qq.com/sph/c2faila" && r.content_id === "wechat_channels:sph:c2faila");
+    const receiptB2 = receiptRows2.find((r) => r.source_url === "https://weixin.qq.com/sph/c2failb" && r.content_id === "wechat_channels:sph:c2failb");
     assert.ok(receiptA2 && String(receiptA2.outcome || "").includes("failed"), "A receipt 为 failed");
     assert.equal(receiptA2.asset_id, null, "A failed receipt asset_id=null");
+    assert.equal(receiptA2.content_id, "wechat_channels:sph:c2faila", "A failed receipt 保留由规范 source_url 推导的 content_id");
     assert.ok(receiptB2 && String(receiptB2.outcome || "").includes("success"), "B receipt 为 success");
     assert.equal(receiptB2.asset_id, winner2, "B success receipt 指向 B winner");
     // 所有非空 asset_id 必须真实存在

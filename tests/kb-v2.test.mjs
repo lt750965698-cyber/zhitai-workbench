@@ -9,15 +9,16 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, writeFile, copyFile, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { writeSyntheticMp4 } from "./fixtures/synthetic-mp4.mjs";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(testsDir);
 const AGENT_ENTRY = join(repoRoot, "local-agent", "server.mjs");
-const MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
+const BASE_MOCK_ENRICH = join(testsDir, "fixtures", "mock-enrich.mjs");
 
 const ROOT = await mkdtemp(join(tmpdir(), "kb_v3_test_"));
+const MOCK_ENRICH = join(ROOT, "mock-enrich-pathname.mjs");
 const DATA_DIR = join(ROOT, "data");
 const KB_ROOT = join(ROOT, "kbroot");
 const SANDBOX_MP4 = join(ROOT, "real.mp4");
@@ -68,6 +69,15 @@ before(async () => {
     mkdir(WATCH_DIR, { recursive: true }),
   ]);
   await writeSyntheticMp4(SANDBOX_MP4, { marker: "kb-v2-base" });
+  // 分享链接的查询参数会在隐私边界被全部移除；测试桩改从稳定 pathname 读取帖子标记。
+  await writeFile(MOCK_ENRICH, [
+    `import baseEnrich from ${JSON.stringify(pathToFileURL(BASE_MOCK_ENRICH).href)};`,
+    "export default function pathnameEnrich(sourceUrl) {",
+    "  const url = new URL(String(sourceUrl || 'https://invalid.local/'));",
+    "  const marker = url.pathname.match(/\\/mock-([A-Za-z0-9_]+)\\/?$/)?.[1];",
+    "  return baseEnrich(marker ? `${url.origin}${url.pathname}?post=${encodeURIComponent(marker)}` : sourceUrl);",
+    "}",
+  ].join("\n"));
   port = await reservePort();
   const config = {
     host: "127.0.0.1",
@@ -160,10 +170,10 @@ test("enrich 映射：作者=作者、likes=12000、contentId=media.postId；6 �
 
 /* ─────────── 用例 2：一资产两帖子 ─────────── */
 test("一资产两帖子：list 1 条；platform 筛选 200；detail 两帖子", async () => {
-  // 同 localPath（同 sha），第二个 sourceUrl（post=2 → 不同 contentId）
+  // 同 localPath（同 sha），第二个 sourceUrl 用稳定 pathname 标记不同帖子。
   const r2 = await request("/api/v1/kuaidian", {
     method: "POST",
-    body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock?post=2", title: "第二帖子" },
+    body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock-2", title: "第二帖子" },
   });
   assert.equal(r2.status, 202);
   await new Promise((r) => setTimeout(r, 1200));
@@ -347,7 +357,7 @@ test("同 SHA 再经 kuaidian 导入：不复制文件，但 download_receipt �
   const shaBefore = before.prepare("SELECT sha256 FROM video_asset WHERE channel='kuaidian' LIMIT 1").get()?.sha256;
   before.close();
 
-  const r = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock?post=repeat", title: "重复导入" } });
+  const r = await request("/api/v1/kuaidian", { method: "POST", body: { localPath: SANDBOX_MP4, sourceUrl: "https://weixin.qq.com/sph/mock-repeat", title: "重复导入" } });
   assert.equal(r.status, 202);
   await new Promise((r) => setTimeout(r, 1200));
 
