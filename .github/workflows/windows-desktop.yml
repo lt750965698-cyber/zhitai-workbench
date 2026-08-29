@@ -32,7 +32,6 @@ jobs:
         with:
           runtime: node@22.13.0
           cache: true
-          require-lockfile: true
 
       - name: Verify tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
