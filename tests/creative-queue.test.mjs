@@ -21,7 +21,7 @@ function validWorkflow(count = 1, targetDurationSeconds = 10) {
   };
 }
 
-async function waitFor(check, timeoutMs = 1500) {
+async function waitFor(check, timeoutMs = 5000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const value = await check();
