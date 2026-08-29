@@ -21,6 +21,27 @@ function waitForParentCrash(message) {
   });
 }
 
+function sendMessage(message) {
+  return new Promise((resolve, reject) => {
+    if (typeof process.send !== "function") {
+      reject(new Error("parent_ipc_unavailable"));
+      return;
+    }
+    process.send(message, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function waitForParentContinue() {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("parent_continue_timeout")), 5_000);
+    process.once("message", (message) => {
+      clearTimeout(timer);
+      if (message?.type === "worker_continue") resolve();
+      else reject(new Error("parent_continue_invalid"));
+    });
+  });
+}
+
 if (globalThis.__ZHITAI_E2E_NETWORK_LOCKDOWN__ !== true
   || process.env.ZHITAI_E2E_NETWORK_POLICY !== "deny_all") {
   sendAndExit({ type: "worker_bootstrap_failed", code: "offline_network_lockdown_not_preloaded" }, 2);
@@ -61,9 +82,8 @@ if (globalThis.__ZHITAI_E2E_NETWORK_LOCKDOWN__ !== true
       });
       const received = await harness.receive(input);
       const correlationId = received.correlationId;
-      if (typeof process.send === "function") {
-        process.send({ type: "worker_armed", correlationId, faultPoint, mode });
-      }
+      await sendMessage({ type: "worker_armed", correlationId, faultPoint, mode });
+      await waitForParentContinue();
       if (mode === "publish") {
         await harness.runUntilReview(correlationId);
         await harness.review(correlationId, { approved: true, reviewer: "offline-crash-worker" });

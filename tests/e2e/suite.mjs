@@ -459,13 +459,24 @@ async function spawnCrashWorker(configuration) {
   const messages = [];
   return new Promise((resolve, reject) => {
     let crashRequested = false;
+    const expectedCrashMessage = configuration.mode === "publish"
+      ? "worker_publishing_crashed"
+      : "worker_crashed";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("crash worker timed out"));
     }, 10_000);
     child.on("message", (message) => {
       messages.push(message);
-      if (!crashRequested && ["worker_crashed", "worker_publishing_crashed"].includes(message?.type)) {
+      if (message?.type === "worker_armed") {
+        child.send({ type: "worker_continue" }, (error) => {
+          if (error) {
+            clearTimeout(timer);
+            reject(new Error("crash worker handshake failed"));
+          }
+        });
+      }
+      if (!crashRequested && message?.type === expectedCrashMessage) {
         crashRequested = true;
         if (!child.kill("SIGKILL")) {
           clearTimeout(timer);
