@@ -563,21 +563,42 @@ function auditContentBuffer(buffer, mode) {
 
 async function auditPayloadFile(path, mode) {
   if (mode === "unsupported") fail("unsupported_payload_file_type");
-  const info = await stat(path);
-  if (mode === "binary_asset" || mode === "sqlite_snapshot") {
-    let handle;
-    try {
-      handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
-      const header = Buffer.alloc(Math.min(64, info.size));
+  let handle;
+  try {
+    // Keep every byte read bound to one descriptor. O_NOFOLLOW is zero on
+    // Windows, so the descriptor is also matched against lstat before and
+    // after the read instead of relying on the open flag alone.
+    handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const openedInfo = await handle.stat();
+    const pathInfo = await lstat(path);
+    if (!openedInfo.isFile() || !pathInfo.isFile() || pathInfo.isSymbolicLink()
+      || openedInfo.dev !== pathInfo.dev || openedInfo.ino !== pathInfo.ino) {
+      fail("payload_file_not_regular");
+    }
+
+    if (mode === "binary_asset" || mode === "sqlite_snapshot") {
+      const header = Buffer.alloc(Math.min(64, openedInfo.size));
       const { bytesRead } = await handle.read(header, 0, header.length, 0);
       validatePayloadHeader(path, header.subarray(0, bytesRead), mode);
-      return;
-    } finally {
-      try { await handle?.close(); } catch { /* preserve the original validation error */ }
+    } else {
+      if (openedInfo.size > MAX_AUDITED_TEXT_BYTES) fail("audited_text_too_large");
+      const bytes = await handle.readFile();
+      if (bytes.length !== openedInfo.size) fail("payload_file_changed_during_audit");
+      auditContentBuffer(bytes, mode);
     }
+
+    const afterRead = await handle.stat();
+    const afterPath = await lstat(path);
+    if (!afterRead.isFile() || !afterPath.isFile() || afterPath.isSymbolicLink()
+      || afterRead.dev !== openedInfo.dev || afterRead.ino !== openedInfo.ino
+      || afterRead.size !== openedInfo.size || afterRead.mtimeMs !== openedInfo.mtimeMs
+      || afterPath.dev !== openedInfo.dev || afterPath.ino !== openedInfo.ino
+      || afterPath.size !== openedInfo.size || afterPath.mtimeMs !== openedInfo.mtimeMs) {
+      fail("payload_file_changed_during_audit");
+    }
+  } finally {
+    try { await handle?.close(); } catch { /* preserve the original validation error */ }
   }
-  if (info.size > MAX_AUDITED_TEXT_BYTES) fail("audited_text_too_large");
-  auditContentBuffer(await readFile(path), mode);
 }
 
 function quoteIdentifier(value) {

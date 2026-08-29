@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 const STATE_VERSION = 1;
@@ -412,17 +413,44 @@ export class ClawbotKeepaliveSupervisor {
     if (!this.stateLoad) {
       this.stateLoad = (async () => {
         await secureStateDirectory(this.statePath);
+        let handle;
         try {
-          const info = await lstat(this.statePath);
-          if (!info.isFile() || info.isSymbolicLink()) throw new Error("clawbot_keepalive_state_file_unsafe");
-          await chmod(this.statePath, 0o600);
+          handle = await open(this.statePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
         } catch (error) {
           if (error?.code === "ENOENT") return defaultState();
-          throw error;
+          throw new Error("clawbot_keepalive_state_unavailable");
         }
         let raw;
-        try { raw = await readFile(this.statePath, "utf8"); }
-        catch { throw new Error("clawbot_keepalive_state_unavailable"); }
+        try {
+          const openedInfo = await handle.stat();
+          const pathInfo = await lstat(this.statePath);
+          if (!openedInfo.isFile() || !pathInfo.isFile() || pathInfo.isSymbolicLink()
+            || openedInfo.dev !== pathInfo.dev || openedInfo.ino !== pathInfo.ino) {
+            throw new Error("clawbot_keepalive_state_file_unsafe");
+          }
+
+          // chmod the opened file, never a path that can be swapped between
+          // validation and use. Establish the stable-read baseline afterwards
+          // because chmod itself legitimately changes metadata.
+          await handle.chmod(0o600);
+          const beforeRead = await handle.stat();
+          raw = await handle.readFile("utf8");
+          const afterRead = await handle.stat();
+          const afterPath = await lstat(this.statePath);
+          if (!afterRead.isFile() || !afterPath.isFile() || afterPath.isSymbolicLink()
+            || afterRead.dev !== beforeRead.dev || afterRead.ino !== beforeRead.ino
+            || afterRead.size !== beforeRead.size || afterRead.mtimeMs !== beforeRead.mtimeMs
+            || afterPath.dev !== beforeRead.dev || afterPath.ino !== beforeRead.ino
+            || afterPath.size !== beforeRead.size || afterPath.mtimeMs !== beforeRead.mtimeMs) {
+            throw new Error("clawbot_keepalive_state_unavailable");
+          }
+        } catch (error) {
+          if (error?.message === "clawbot_keepalive_state_file_unsafe"
+            || error?.message === "clawbot_keepalive_state_unavailable") throw error;
+          throw new Error("clawbot_keepalive_state_unavailable");
+        } finally {
+          try { await handle?.close(); } catch { /* preserve the original validation error */ }
+        }
         try { return sanitizeState(JSON.parse(raw)); }
         catch (error) {
           if (error?.message === "clawbot_keepalive_state_invalid") throw error;

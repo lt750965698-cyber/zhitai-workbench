@@ -169,18 +169,37 @@ function cleanBundleName(value, pattern) {
 
 async function inspectBoundFile(bundleDir, name, expected = {}) {
   const filePath = join(bundleDir, name);
-  const before = await stat(filePath);
-  if (!before.isFile() || before.size <= 0) throw new Error(`local_motion_file_invalid:${name}`);
-  const bytes = await readFile(filePath);
-  const after = await stat(filePath);
-  if (!after.isFile() || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
-    throw new Error(`local_motion_file_changed:${name}`);
+  let handle;
+  try {
+    handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const openedInfo = await handle.stat();
+    const pathInfo = await lstat(filePath);
+    if (!openedInfo.isFile() || openedInfo.size <= 0
+      || !pathInfo.isFile() || pathInfo.isSymbolicLink()
+      || openedInfo.dev !== pathInfo.dev || openedInfo.ino !== pathInfo.ino) {
+      throw new Error(`local_motion_file_invalid:${name}`);
+    }
+
+    const bytes = await handle.readFile();
+    const afterRead = await handle.stat();
+    const afterPath = await lstat(filePath);
+    if (bytes.length !== openedInfo.size
+      || !afterRead.isFile() || !afterPath.isFile() || afterPath.isSymbolicLink()
+      || afterRead.dev !== openedInfo.dev || afterRead.ino !== openedInfo.ino
+      || afterRead.size !== openedInfo.size || afterRead.mtimeMs !== openedInfo.mtimeMs
+      || afterPath.dev !== openedInfo.dev || afterPath.ino !== openedInfo.ino
+      || afterPath.size !== openedInfo.size || afterPath.mtimeMs !== openedInfo.mtimeMs) {
+      throw new Error(`local_motion_file_changed:${name}`);
+    }
+
+    const sha256 = sha256Buffer(bytes);
+    if (Number(expected.sizeBytes) !== openedInfo.size || String(expected.sha256 || "").toLowerCase() !== sha256) {
+      throw new Error(`local_motion_file_binding_mismatch:${name}`);
+    }
+    return { name, sizeBytes: openedInfo.size, sha256, bytes };
+  } finally {
+    try { await handle?.close(); } catch { /* preserve the original validation error */ }
   }
-  const sha256 = sha256Buffer(bytes);
-  if (Number(expected.sizeBytes) !== before.size || String(expected.sha256 || "").toLowerCase() !== sha256) {
-    throw new Error(`local_motion_file_binding_mismatch:${name}`);
-  }
-  return { name, sizeBytes: before.size, sha256, bytes };
 }
 
 /**
@@ -1387,8 +1406,12 @@ export async function ingestOne(db, { receipt, input, input_kind, batchId, ctx =
     return { status: "failed", error: sanitizeFailureText(String((e && e.message) || e)).slice(0, 500) };
   } finally {
     // 临时文件统一清理（success 已复制 / duplicate / partial / 异常）
-    if (receipt?.temporary && localPath) {
-      await rm(localPath, { force: true }).catch(() => {});
+    if (receipt?.temporary) {
+      if (receipt?.temporaryRoot) {
+        await rm(receipt.temporaryRoot, { recursive: true, force: true }).catch(() => {});
+      } else if (localPath) {
+        await rm(localPath, { force: true }).catch(() => {});
+      }
     }
   }
 }
