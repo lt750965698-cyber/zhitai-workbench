@@ -1,0 +1,66 @@
+name: Windows Desktop
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  make:
+    name: Build Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PNPM_CONFIG_NODE_LINKER: hoisted
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js and pnpm
+        uses: pnpm/setup@v2
+        with:
+          runtime: node@22.13.0
+          cache: true
+          require-lockfile: true
+
+      - name: Verify source
+        run: pnpm lint
+
+      - name: Build application
+        run: pnpm build
+
+      - name: Test portable contracts
+        run: pnpm test:node
+
+      - name: Make Windows installer and portable ZIP
+        run: pnpm make:windows
+
+      - name: Write SHA-256 checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem out/make -Recurse -File | Where-Object { $_.Name -ne "RELEASES" }
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLowerInvariant()
+            $relative = [IO.Path]::GetRelativePath((Resolve-Path "out/make"), $file.FullName).Replace("\\", "/")
+            "$hash  $relative"
+          }
+          $lines | Sort-Object | Set-Content -Encoding utf8NoBOM out/make/SHA256SUMS.txt
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: zhitai-windows-x64-${{ github.sha }}
+          path: out/make/**
+          if-no-files-found: error
+          retention-days: 14
