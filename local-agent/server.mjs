@@ -3,6 +3,7 @@ import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto
 import { constants as fsConstants, createReadStream } from "node:fs";
 import {
   access,
+  chmod,
   cp,
   mkdir,
   readFile,
@@ -40,6 +41,7 @@ import {
 import { isStableShareUrl, canonicalizeSourceUrl, probeLocalMedia, redactUrlForStorage } from "./downloader-adapter.mjs";
 import { downloadSafeImage } from "./safe-image-download.mjs";
 import * as matrix from "./matrixmedia-adapter.mjs";
+import { createPlatformReceipts, persistPlatformReceipts, redactPlatformReceiptText } from "./platform-receipts.mjs";
 import * as xhsPublisher from "./xiaohongshu-publisher.mjs";
 import * as wechatOfficial from "./wechat-official-publisher.mjs";
 import { CreativeQueue } from "./creative-queue.mjs";
@@ -96,6 +98,7 @@ const tasksPath = join(dataDir, "tasks.json");
 const eventsPath = join(dataDir, "events.json");
 const webhookNoncesPath = join(dataDir, "webhook-nonces.json");
 const publishDir = join(dataDir, "publish-jobs");
+const platformReceiptsDir = join(dataDir, "platform-receipts");
 const creativeJobsPath = join(dataDir, "creative-jobs.json");
 const creativeReviewsPath = join(dataDir, "creative-reviews.json");
 const analysisJobsPath = join(dataDir, "analysis-jobs.json");
@@ -1006,8 +1009,10 @@ const platformTargets = {
 await Promise.all([
   mkdir(dataDir, { recursive: true }),
   mkdir(publishDir, { recursive: true }),
+  mkdir(platformReceiptsDir, { recursive: true, mode: 0o700 }),
   mkdir(knowledgeBase, { recursive: true }),
 ]);
+await chmod(platformReceiptsDir, 0o700);
 
 // 先启动且等待唯一的启动迁移，再恢复创作队列。迁移预处理阶段不持锁，
 // 提交阶段与后续手动刷新/自主复审又共用 serializeLibraryDbWork。
@@ -4418,6 +4423,25 @@ async function fileExists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
+async function recordPlatformReceipts(input, taskId = null) {
+  try {
+    const receipts = createPlatformReceipts(input);
+    const paths = await persistPlatformReceipts(platformReceiptsDir, receipts);
+    return { status: "stored", count: paths.length };
+  } catch (error) {
+    // 发布请求可能已到达平台。回执落盘失败只能生成本地审计事件，
+    // 不能把任务伪装成可安全自动重试的普通发布失败。
+    await recordEvent(
+      "error",
+      "PUBLISH_RECEIPT",
+      `平台回执持久化失败：${safeErrorCode(redactPlatformReceiptText(error?.message || error))}`,
+      taskId,
+    ).catch(() => {});
+    const count = Number.isSafeInteger(error?.writtenCount) && error.writtenCount > 0 ? error.writtenCount : 0;
+    return { status: count > 0 ? "partial" : "failed", count };
+  }
+}
+
 function assertPublishWorkflowReady(plan, title) {
   const workflow = plan?.seedanceWorkflow;
   if (!workflow) throw httpError(409, "publish_generation_readiness_missing");
@@ -4724,6 +4748,25 @@ async function prepareMatrixPublish(json, {
 async function executeMatrixPublish(json, preparationOptions = {}) {
   const immediate = withoutPublishTime(json);
   const prepared = await prepareMatrixPublish(immediate, preparationOptions);
+  const operationId = `pub_${randomUUID()}`;
+  const intentPersistence = await recordPlatformReceipts({
+    operationId,
+    videoId: String(immediate.videoId || ""),
+    source: "matrixmedia_cli",
+    mode: prepared.payload.draft ? "draft" : "publish",
+    scheduledAt: null,
+    platforms: prepared.payload.platforms,
+    results: prepared.payload.platforms.map(({ platform }) => ({
+      platform,
+      success: null,
+      status: "unknown",
+      message: "publish_intent_recorded",
+    })),
+  });
+  if (intentPersistence.status !== "stored") {
+    await recordEvent("warning", "PUBLISH", `发布意图回执未完整落盘（${operationId}），未调用发布器`).catch(() => {});
+    throw httpError(503, `publish_intent_not_persisted：${operationId}`);
+  }
   try {
     const body = await matrix.publishWithReceipts({
       payload: prepared.payload,
@@ -4738,16 +4781,49 @@ async function executeMatrixPublish(json, preparationOptions = {}) {
       `发布后账号恢复检查失败：${safeMessage(error?.message || error)}`,
     ));
     const results = Array.isArray(body?.results) ? body.results.map((r) => ({ ...r })) : [];
+    const receiptPersistence = await recordPlatformReceipts({
+      operationId,
+      videoId: String(immediate.videoId || ""),
+      source: "matrixmedia_cli",
+      mode: prepared.payload.draft ? "draft" : "publish",
+      scheduledAt: null,
+      platforms: prepared.payload.platforms,
+      results: results.map((result) => ({
+        platform: result?.platform,
+        success: typeof result?.success === "boolean" ? result.success : null,
+        status: result?.status || result?.state || "unknown",
+        message: "publisher_response_received",
+      })),
+    });
     await recordEvent("info", "PUBLISH", `MatrixMedia 立即发布提交：${prepared.payload.platforms.length} 平台（${immediate.videoId}${immediate.useLatestRemake === true ? "，生成成片" : "，原素材"}）`);
     return {
       submitted: body?.success !== false,
       results,
       total: typeof body?.total === "number" ? body.total : prepared.payload.platforms.length,
-      detail: { status: body?.success === false ? "partial_failed" : "submitted", message: body?.message, quality: prepared.publishQuality },
+      detail: {
+        status: body?.success === false ? "partial_failed" : "submitted",
+        message: body?.message,
+        quality: prepared.publishQuality,
+        receiptPersistence,
+      },
     };
-  } catch (e) {
-    await recordEvent("warning", "PUBLISH", `MatrixMedia 发布失败：${safeMessage(e.message)}`);
-    throw httpError(502, "matrixmedia_publish_failed：" + safeMessage(e.message));
+  } catch {
+    await recordPlatformReceipts({
+      operationId,
+      videoId: String(immediate.videoId || ""),
+      source: "matrixmedia_cli",
+      mode: prepared.payload.draft ? "draft" : "publish",
+      scheduledAt: null,
+      platforms: prepared.payload.platforms,
+      results: prepared.payload.platforms.map(({ platform }) => ({
+        platform,
+        success: null,
+        status: "unknown",
+        message: "publisher_outcome_not_observed",
+      })),
+    });
+    await recordEvent("warning", "PUBLISH", `MatrixMedia 返回前连接中断，平台结果未知，禁止自动重试（${operationId}）`);
+    throw httpError(502, `matrixmedia_publish_outcome_unknown：${operationId}`);
   }
 }
 
@@ -5539,12 +5615,36 @@ async function deactivateLegacyScheduledTasks() {
 
 async function runPublishTask(task) {
   const adapter = config.adapters.publisher;
+  let publisherStarted = false;
+  let publisherReturned = false;
+  let preflightErrorCode = null;
+  const requestedPlatforms = (Array.isArray(task.targets) ? task.targets : [])
+    .map((target) => platformTargets[target])
+    .filter(Boolean);
   try {
     await updateTask(task.id, { status: "running", progress: 10 });
     const currentAssetPath = await realpath(task.assetPath);
     const currentAssetInfo = await stat(currentAssetPath);
     if (currentAssetPath !== task.assetPath || currentAssetInfo.size !== task.assetSizeBytes || await sha256File(currentAssetPath) !== task.assetSha256) {
       throw new Error("asset_changed_since_approval");
+    }
+    const intentPersistence = await recordPlatformReceipts({
+      operationId: task.id,
+      taskId: task.id,
+      source: "publisher_task",
+      mode: task.mode === "publish" ? "publish" : "platform_draft",
+      scheduledAt: task.scheduledAt,
+      platforms: requestedPlatforms,
+      results: requestedPlatforms.map((platform) => ({
+        platform,
+        success: null,
+        status: "unknown",
+        message: "publish_intent_recorded",
+      })),
+    }, task.id);
+    if (intentPersistence.status !== "stored") {
+      preflightErrorCode = "publish_intent_not_persisted";
+      throw new Error(preflightErrorCode);
     }
     const type = adapter.type || (adapter.command ? "command" : "");
     let result;
@@ -5574,7 +5674,8 @@ async function runPublishTask(task) {
           ...(account.partition ? { partition: account.partition } : {}),
         });
       }
-      result = platforms.length
+      publisherStarted = platforms.length > 0;
+      result = publisherStarted
         ? await matrix.publishWithReceipts({
           payload: {
             platforms,
@@ -5591,6 +5692,21 @@ async function runPublishTask(task) {
           jobId: task.id,
         })
         : { success: false, total: 0, results: [] };
+      publisherReturned = publisherStarted;
+      await recordPlatformReceipts({
+        operationId: task.id,
+        taskId: task.id,
+        source: "publisher_task",
+        mode: task.mode === "publish" ? "publish" : "platform_draft",
+        scheduledAt: task.scheduledAt,
+        platforms: requestedPlatforms,
+        results: (Array.isArray(result?.results) ? result.results : []).map((row) => ({
+          platform: row?.platform,
+          success: typeof row?.success === "boolean" ? row.success : null,
+          status: row?.status || row?.state || "unknown",
+          message: "publisher_response_received",
+        })),
+      }, task.id);
       const failedTargets = (Array.isArray(result?.results) ? result.results : [])
         .filter((row) => row?.success !== true)
         .map((row) => String(row?.platform || "unknown"));
@@ -5608,25 +5724,61 @@ async function runPublishTask(task) {
     } else if (type === "command") {
       const jobFile = join(publishDir, `${task.id}.json`);
       const args = (adapter.args || []).map((value) => String(value).replace(/\{jobFile\}/g, jobFile));
+      publisherStarted = true;
       await spawnAndWait(adapter.command, args, {
         cwd: adapter.cwd ? expandHome(adapter.cwd) : agentRoot,
         env: safeChildEnv({ ZHITAI_KNOWLEDGE_BASE: knowledgeBase }, adapter.env),
         timeoutMs: Number(adapter.timeoutMs || config.polling.timeoutMs),
       });
+      publisherReturned = true;
       result = { accepted: true };
     } else {
       throw new Error("unsupported_publisher_type");
     }
     const status = task.mode === "publish" ? "submitted" : "platform_draft";
+    if (type === "command") {
+      await recordPlatformReceipts({
+        operationId: task.id,
+        taskId: task.id,
+        source: "publisher_task",
+        mode: task.mode === "publish" ? "publish" : "platform_draft",
+        scheduledAt: task.scheduledAt,
+        platforms: requestedPlatforms,
+        results: requestedPlatforms.map((platform) => ({
+          platform,
+          success: true,
+          status,
+          message: "publisher_response_received",
+        })),
+      }, task.id);
+    }
     await updateTask(task.id, { status, progress: 100, result: sanitizeResult(result) });
     await recordEvent("info", "PUBLISH", `发布器已接收任务，状态 ${status}`, task.id);
   } catch (error) {
-    const code = safeErrorCode(error);
-    const status = code === "adapter_exit_4" || /account|login|cookie|session/i.test(code)
-      ? "needs_attention"
-      : "failed";
+    const code = publisherReturned
+      ? "local_finalize_after_publisher_returned"
+      : publisherStarted
+        ? "publisher_outcome_not_observed"
+        : (preflightErrorCode || safeErrorCode(error));
+    const status = "needs_attention";
+    if (publisherStarted && !publisherReturned) {
+      await recordPlatformReceipts({
+        operationId: task.id,
+        taskId: task.id,
+        source: "publisher_task",
+        mode: task.mode === "publish" ? "publish" : "platform_draft",
+        scheduledAt: task.scheduledAt,
+        platforms: requestedPlatforms,
+        results: requestedPlatforms.map((platform) => ({
+          platform,
+          success: null,
+          status: "unknown",
+          message: "publisher_outcome_not_observed",
+        })),
+      }, task.id);
+    }
     await updateTask(task.id, { status, progress: 0, errorCode: code });
-    await recordEvent(status === "needs_attention" ? "warning" : "error", "PUBLISH", `发布失败：${code}`, task.id);
+    await recordEvent("warning", "PUBLISH", `发布结果需人工核对：${code}`, task.id);
   }
 }
 
@@ -6746,6 +6898,13 @@ function safeMessage(value) {
 
 function sanitizeResult(result) {
   if (!result || typeof result !== "object") return { accepted: true };
-  const allowed = ["success", "accepted", "message", "taskId", "job_id", "status"];
-  return Object.fromEntries(allowed.filter((key) => key in result).map((key) => [key, result[key]]));
+  const sanitized = {};
+  if (typeof result.success === "boolean") sanitized.success = result.success;
+  if (typeof result.accepted === "boolean") sanitized.accepted = result.accepted;
+  const status = String(result.status || "").toLowerCase();
+  if (["accepted", "draft", "failed", "needs_attention", "platform_draft", "submitted", "success", "unknown"].includes(status)) {
+    sanitized.status = status;
+  }
+  // 任意上游消息和任务标识可能包含账号、路径或凭据；第一方平台回执只保留固定码。
+  return Object.keys(sanitized).length ? sanitized : { accepted: true };
 }

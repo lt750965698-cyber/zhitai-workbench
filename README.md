@@ -18,6 +18,7 @@
 - 仅绑定回环地址的本地节点；
 - SQLite 索引、内容包、任务队列、事件与状态接口；
 - 知识库搜索、筛选、媒体预览、导入记录、修正历史和导出契约；
+- BagIt 1.0 兼容的可验证备份、隔离恢复、新根迁移与可恢复回滚；
 - 固定命令的服务管理、来源白名单、路径边界、可配置且配置后强制的 HMAC 校验，以及公开发布和部分服务控制的确认门；
 - 面向外置采集、分析、生成、通知和发布引擎的适配层。
 
@@ -95,10 +96,28 @@ curl http://127.0.0.1:17890/health
 
 ~~~bash
 pnpm lint
+pnpm test:backup
 pnpm test
 ~~~
 
 pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集成不应在默认测试中访问真实账号或真实内容。
+
+## 可验证备份、恢复与迁移
+
+织台提供 BagIt 1.0 兼容的目录型备份，使用 SQLite Online Backup API（旧版 Node 自动回退到 `VACUUM INTO`）生成包含已提交 WAL 的一致性单文件快照，并为内容包、队列、审计、生成、排期和脱敏平台回执生成逐文件 SHA-256。恢复始终先进入新建临时隔离目录；迁移只允许写入不存在的新根，且会暂停生成队列并把可执行发布排期改为待人工重新确认。
+
+~~~bash
+pnpm backup create --data-dir <dataDir> --knowledge-root <内容库> --output <新备份目录>
+pnpm backup verify --backup <备份目录>
+pnpm backup restore --backup <备份目录>
+pnpm backup preview --backup <备份目录> --target-root <新迁移根>
+pnpm backup migrate --backup <备份目录> --target-root <不存在的新迁移根>
+pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
+~~~
+
+创建和验证还会核对 BagIt `Payload-Oxum`、允许路径、敏感字段、SQLite 完整性、资产引用及业务计数。迁移会冻结发布排期、分析、生成和活动导入队列；无法解析的活动路径会阻止启用，失败副本与回滚副本都只做可恢复隔离改名，不删除当前用户数据。
+
+完整命令、范围、排除策略、迁移/回滚和 RPO/RTO 见 [备份与恢复指南](docs/BACKUP_RESTORE.md)。
 
 ## 架构
 
@@ -168,6 +187,7 @@ pnpm test 会先执行生产构建，再运行 Node.js 测试。外置平台集�
 - [架构与信任边界](docs/ARCHITECTURE.md)
 - [第三方集成指南](docs/INTEGRATION.md)
 - [知识库字段契约](docs/VIDEO_KNOWLEDGE_SCHEMA.md)
+- [可验证备份、恢复与迁移](docs/BACKUP_RESTORE.md)
 - [安全模型](docs/SECURITY_MODEL.md)
 - [内容与授权政策](docs/CONTENT_POLICY.md)
 - [路线图](ROADMAP.md)
