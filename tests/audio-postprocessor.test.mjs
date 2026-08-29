@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import audio from "../desktop/audio-postprocessor.js";
 
-const { cleanSpokenText, isUsableNarration, narrationQualityBlocker, parseVolume, selectNarration, truncateForDuration } = audio;
+const {
+  cleanSpokenText,
+  isUsableNarration,
+  narrationQualityBlocker,
+  narrationTimingDecision,
+  parseVolume,
+  selectNarration,
+  truncateForDuration,
+} = audio;
 
 test("配音文案会去掉链接、标签和分析尾句", () => {
   assert.equal(
@@ -72,4 +80,39 @@ test("配音语义门拒绝分析术语和拍摄占位描述", () => {
   assert.match(narrationQualityBlocker("视频前3秒用听觉钩子抓取注意力"), /分析术语/);
   assert.match(narrationQualityBlocker("想让拍摄对象站着并说话更清楚耐看"), /拍摄占位描述/);
   assert.equal(narrationQualityBlocker("厨房改造先统一动线、收纳和光线。"), null);
+});
+
+test("旁白必须完整落入 25 秒，超长或视频时长不符均失败关闭", () => {
+  assert.deepEqual(narrationTimingDecision({
+    videoDurationSeconds: 25,
+    narrationDurationSeconds: 17.25,
+    expectedVideoDurationSeconds: 25,
+  }), {
+    passed: true,
+    reason: null,
+    videoDurationMs: 25_000,
+    narrationDurationMs: 17_250,
+    remainingTailMs: 7_750,
+  });
+  assert.equal(narrationTimingDecision({
+    videoDurationSeconds: 25,
+    narrationDurationSeconds: 24.98,
+    expectedVideoDurationSeconds: 25,
+  }).reason, "narration_exceeds_video");
+  assert.equal(narrationTimingDecision({
+    videoDurationSeconds: 24.7,
+    narrationDurationSeconds: 12,
+    expectedVideoDurationSeconds: 25,
+  }).reason, "video_duration_mismatch");
+});
+
+test("音频后期不用 -t 截断旁白，并写入可复算的完整性证据", async () => {
+  const source = await readFile(new URL("../desktop/audio-postprocessor.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /"-t",\s*media\.durationSeconds/);
+  assert.match(source, /"-shortest"/);
+  assert.match(source, /narrationComplete:/);
+  assert.match(source, /narrationSha256:/);
+  assert.match(source, /narrationDurationMs:/);
+  assert.match(source, /finalDurationMs:/);
+  assert.match(source, /timingVerified:/);
 });

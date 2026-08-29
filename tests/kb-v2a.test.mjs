@@ -129,6 +129,8 @@ before(async () => {
       ZHITAI_CONFIG_PATH: configPath,
       ZHITAI_DATA_DIR: DATA_DIR,
       ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(DATA_DIR, "matrix-partitions"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

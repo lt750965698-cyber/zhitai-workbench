@@ -101,6 +101,31 @@ function truncateForDuration(value, durationSeconds) {
   return /[。！？]$/u.test(result) ? result : `${result}。`;
 }
 
+function narrationTimingDecision({
+  videoDurationSeconds,
+  narrationDurationSeconds,
+  expectedVideoDurationSeconds = null,
+  toleranceSeconds = 0.08,
+  tailMarginSeconds = 0.05,
+} = {}) {
+  const video = Number(videoDurationSeconds);
+  const narration = Number(narrationDurationSeconds);
+  const expected = expectedVideoDurationSeconds === null ? null : Number(expectedVideoDurationSeconds);
+  if (!Number.isFinite(video) || video <= 0) return { passed: false, reason: "video_duration_invalid" };
+  if (expected !== null && (!Number.isFinite(expected) || Math.abs(video - expected) > toleranceSeconds)) {
+    return { passed: false, reason: "video_duration_mismatch" };
+  }
+  if (!Number.isFinite(narration) || narration <= 0) return { passed: false, reason: "narration_duration_invalid" };
+  if (narration > video - tailMarginSeconds) return { passed: false, reason: "narration_exceeds_video" };
+  return {
+    passed: true,
+    reason: null,
+    videoDurationMs: Math.round(video * 1_000),
+    narrationDurationMs: Math.round(narration * 1_000),
+    remainingTailMs: Math.round((video - narration) * 1_000),
+  };
+}
+
 function selectNarration(detail, shots = [], durationSeconds = 10) {
   const plan = detail?.remake_plan?.plan || {};
   const copy = plan.copywriting || {};
@@ -135,15 +160,21 @@ function parseVolume(value) {
 
 async function probeMedia(filePath) {
   const { out } = await run(FFPROBE, [
-    "-v", "error", "-show_entries", "format=duration:stream=index,codec_type,codec_name",
+    "-v", "error", "-show_entries", "format=duration:stream=index,codec_type,codec_name,duration",
     "-of", "json", filePath,
   ], { timeoutMs: 30_000 });
   const payload = JSON.parse(out || "{}");
   const streams = Array.isArray(payload.streams) ? payload.streams : [];
+  const durationSeconds = Math.max(0.1, Number(payload?.format?.duration) || 0);
+  const video = streams.find((stream) => stream.codec_type === "video");
+  const audio = streams.find((stream) => stream.codec_type === "audio");
   return {
-    durationSeconds: Math.max(0.1, Number(payload?.format?.duration) || 0),
-    hasVideo: streams.some((stream) => stream.codec_type === "video"),
-    hasAudio: streams.some((stream) => stream.codec_type === "audio"),
+    durationSeconds,
+    videoDurationSeconds: video ? Math.max(0.1, Number(video.duration) || durationSeconds) : 0,
+    audioDurationSeconds: audio ? Math.max(0.1, Number(audio.duration) || durationSeconds) : 0,
+    audioCodec: String(audio?.codec_name || ""),
+    hasVideo: Boolean(video),
+    hasAudio: Boolean(audio),
   };
 }
 
@@ -173,9 +204,13 @@ async function synthesizeNarration(text, outputDir, durationSeconds) {
   return { mediaPath, subtitlePath, voice: DEFAULT_VOICE, rate };
 }
 
-async function postprocessAudio({ input, output, detail, shots = [] }) {
+async function postprocessAudio({ input, output, detail, shots = [], expectedDurationSeconds = null }) {
   const media = await probeMedia(input);
   if (!media.hasVideo) throw new Error("待后期文件没有可用视频轨");
+  if (expectedDurationSeconds !== null
+    && Math.abs(media.videoDurationSeconds - Number(expectedDurationSeconds)) > 0.08) {
+    throw new Error(`待后期视频时长不是要求的 ${Number(expectedDurationSeconds).toFixed(3)} 秒`);
+  }
   await fsp.mkdir(path.dirname(output), { recursive: true });
   // 新一轮开始前先撤销旧质检凭据。即使后期失败并留下旧 final.mp4，
   // 持久化门也不能把上一次的报告错认成本轮已通过。
@@ -194,32 +229,52 @@ async function postprocessAudio({ input, output, detail, shots = [] }) {
   const tts = narration.text ? await synthesizeNarration(narration.text, path.dirname(output), media.durationSeconds) : null;
   if (discardInputAudio && !tts) throw new Error("完全原创补救缺少原创配音文案，不能回退来源音轨");
   if (!tts && !media.hasAudio) throw new Error("成片既没有原音轨，也没有可用配音文案，已停止交付");
+  const ttsMedia = tts ? await probeMedia(tts.mediaPath) : null;
+  const narrationTiming = tts ? narrationTimingDecision({
+    videoDurationSeconds: media.videoDurationSeconds,
+    narrationDurationSeconds: ttsMedia.audioDurationSeconds || ttsMedia.durationSeconds,
+    expectedVideoDurationSeconds: expectedDurationSeconds,
+  }) : null;
+  if (narrationTiming && !narrationTiming.passed) {
+    throw new Error(`原创旁白无法完整落入视频时长（${narrationTiming.reason}），未使用 -t 截断`);
+  }
 
   const temporary = `${output}.audio-${process.pid}-${Date.now()}.tmp.mp4`;
   const args = ["-hide_banner", "-loglevel", "error", "-y", "-i", input];
   if (tts) args.push("-i", tts.mediaPath);
+  const wholeDuration = media.videoDurationSeconds.toFixed(3);
 
   let filter;
   if (tts && media.hasAudio && !discardInputAudio) {
     filter = [
-      "[0:a:0]volume=0.18,highpass=f=60,lowpass=f=12000,apad[ambient]",
-      "[1:a:0]loudnorm=I=-16:LRA=7:TP=-1.5,apad[voice]",
-      "[ambient][voice]amix=inputs=2:duration=first:dropout_transition=0,loudnorm=I=-16:LRA=7:TP=-1.5[aout]",
+      `[0:a:0]volume=0.18,highpass=f=60,lowpass=f=12000,apad=whole_dur=${wholeDuration}[ambient]`,
+      `[1:a:0]loudnorm=I=-16:LRA=7:TP=-1.5,apad=whole_dur=${wholeDuration}[voice]`,
+      "[ambient][voice]amix=inputs=2:duration=longest:dropout_transition=0,loudnorm=I=-16:LRA=7:TP=-1.5[aout]",
     ].join(";");
   } else if (tts) {
-    filter = "[1:a:0]loudnorm=I=-16:LRA=7:TP=-1.5,apad[aout]";
+    filter = `[1:a:0]loudnorm=I=-16:LRA=7:TP=-1.5,apad=whole_dur=${wholeDuration}[aout]`;
   } else {
-    filter = "[0:a:0]loudnorm=I=-16:LRA=7:TP=-1.5[aout]";
+    filter = `[0:a:0]loudnorm=I=-16:LRA=7:TP=-1.5,apad=whole_dur=${wholeDuration}[aout]`;
   }
   args.push(
     "-filter_complex", filter,
     "-map", "0:v:0", "-map", "[aout]", "-map_metadata", "0",
     "-c:v", "copy", "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "160k",
-    "-ar", "44100", "-ac", "2", "-t", media.durationSeconds.toFixed(3),
+    "-ar", "44100", "-ac", "2", "-shortest",
     "-movflags", "+faststart", temporary,
   );
   try {
     await run(FFMPEG, args, { timeoutMs: 300_000 });
+    const outputMedia = await probeMedia(temporary);
+    const durationTarget = expectedDurationSeconds === null
+      ? media.videoDurationSeconds : Number(expectedDurationSeconds);
+    const finalTimingPassed = outputMedia.hasVideo && outputMedia.hasAudio && outputMedia.audioCodec === "aac"
+      && Math.abs(outputMedia.videoDurationSeconds - durationTarget) <= 0.08
+      && Math.abs(outputMedia.durationSeconds - durationTarget) <= 0.08
+      && outputMedia.audioDurationSeconds >= durationTarget - 0.12
+      && (!narrationTiming
+        || outputMedia.audioDurationSeconds + 0.05 >= narrationTiming.narrationDurationMs / 1_000);
+    if (!finalTimingPassed) throw new Error("最终 AAC 音轨或旁白完整时长验证失败");
     const quality = await detectVolume(temporary);
     const audible = Number.isFinite(quality.meanVolumeDb) && Number.isFinite(quality.maxVolumeDb)
       && quality.meanVolumeDb >= -34 && quality.maxVolumeDb >= -18;
@@ -238,6 +293,12 @@ async function postprocessAudio({ input, output, detail, shots = [] }) {
       rate: tts?.rate || null,
       narrationSource: narration.source,
       narration: narration.text || null,
+      narrationSha256: createHash("sha256").update(narration.text || "").digest("hex"),
+      narrationComplete: Boolean(tts && narrationTiming?.passed && finalTimingPassed),
+      narrationDurationMs: narrationTiming?.narrationDurationMs || null,
+      finalDurationMs: Math.round(durationTarget * 1_000),
+      outputDurationMs: Math.round(outputMedia.durationSeconds * 1_000),
+      timingVerified: finalTimingPassed,
       inputHadAudio: media.hasAudio,
       inputAudioDiscarded: discardInputAudio,
       originalityPolicy: originality.policy || null,
@@ -247,7 +308,10 @@ async function postprocessAudio({ input, output, detail, shots = [] }) {
       ...quality,
       checkedAt: new Date().toISOString(),
     };
-    await fsp.writeFile(path.join(path.dirname(output), "audio-quality.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    const reportPath = path.join(path.dirname(output), "audio-quality.json");
+    const reportTemporary = `${reportPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(reportTemporary, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    await fsp.rename(reportTemporary, reportPath);
     return output;
   } catch (error) {
     await fsp.rm(temporary, { force: true }).catch(() => {});
@@ -261,6 +325,7 @@ module.exports = {
   isGenericTitle,
   isUsableNarration,
   narrationQualityBlocker,
+  narrationTimingDecision,
   parseVolume,
   postprocessAudio,
   probeMedia,

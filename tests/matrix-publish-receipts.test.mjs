@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   classifyMatrixPublishResult,
+  cliPublish,
+  createMatrixAuthStateStore,
   createPublishReceiptStore,
   publishAccountFingerprint,
   publishModeFor,
@@ -70,6 +72,47 @@ test("MatrixMedia 回执不会把普通退出码 0 当成已经公开", () => {
     classifyMatrixPublishResult({ code: 3, out: "", err: "account 13800138000 expired" }, { mode: "public" }).platformMessage,
     "account [account] expired",
   );
+});
+
+test("真实发布接受会持久验证账号，视频号登录页重定向会立即使账号失效", async (t) => {
+  const sandbox = await mkdtemp(join(tmpdir(), "zhitai-matrix-publish-auth-"));
+  t.after(() => rm(sandbox, { recursive: true, force: true }));
+  const authStore = createMatrixAuthStateStore({ path: join(sandbox, "auth.json") });
+  const target = {
+    platform: "sph",
+    phone: "13800138000",
+    partition: "persist:13800138000视频号",
+  };
+  const payload = {
+    platforms: [target],
+    file: "/private/fixture.mp4",
+    title: "小户型卫生间四区动线",
+    draft: true,
+  };
+
+  const accepted = await cliPublish(payload, {
+    authStateStore: authStore,
+    run: async () => ({ code: 0, out: JSON.stringify({ status: "saved_draft", message: "草稿已保存" }), err: "" }),
+  });
+  assert.equal(accepted.results[0].state, "draft");
+  assert.equal((await authStore.get("sph", target)).authState, "verified");
+
+  const rejected = await cliPublish(payload, {
+    authStateStore: authStore,
+    run: async () => ({
+      code: 3,
+      out: "",
+      err: "[auth] 视频号登录状态已失效，请重新登录后再试: https://channels.weixin.qq.com/login.html\n登录态异常或未登录",
+    }),
+  });
+  assert.equal(rejected.results[0].state, "failed");
+  const invalid = await authStore.get("sph", target);
+  assert.equal(invalid.authState, "invalid");
+  assert.equal(invalid.reasonCode, "sph_login_redirect");
+
+  const disk = await readFile(join(sandbox, "auth.json"), "utf8");
+  assert.equal(disk.includes("13800138000"), false);
+  assert.equal(disk.includes("channels.weixin.qq.com"), false, "平台原始失败消息不得进入认证账本");
 });
 
 test("发布回执按平台、账号、媒体 SHA、模式和排期时间持久幂等", async (t) => {

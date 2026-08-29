@@ -211,16 +211,38 @@ type UpdateModule = {
   publishedAt: string | null;
 };
 
+type CreativeJobStatus =
+  | "queued"
+  | "preparing"
+  | "retry_wait"
+  | "transient_wait"
+  | "paused"
+  | "needs_attention"
+  | "ready_for_images"
+  | "ready_for_seedance"
+  | "ready_for_assembly"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+type CreativeResumeStatus = "queued" | "ready_for_images" | "ready_for_seedance" | "ready_for_assembly";
+
 type CreativeJob = {
   id: string;
   assetId: string;
   title: string;
-  status: "queued" | "preparing" | "paused" | "ready_for_images" | "ready_for_seedance" | "ready_for_assembly" | "completed" | "failed" | "cancelled" | string;
+  status: CreativeJobStatus;
   stage: string;
   progress: number;
   targetDurationSeconds: number | null;
   shotCount: number | null;
   error: string | null;
+  retryAt?: string | null;
+  nextRetryAt?: string | null;
+  resumeStatus?: CreativeResumeStatus | null;
+  attentionAt?: string | null;
+  attentionTransient?: boolean;
+  transientRetryCount?: number;
   autoCreated: boolean;
   generationId?: string | null;
   outputMediaUrl?: string | null;
@@ -228,6 +250,94 @@ type CreativeJob = {
   createdAt: string;
   updatedAt: string;
 };
+
+const CREATIVE_RUNNABLE_STATUSES = new Set<CreativeJobStatus>(["ready_for_images", "ready_for_seedance"]);
+const CREATIVE_BATCH_STARTABLE_STATUSES = new Set<CreativeJobStatus>(["queued", "preparing", "retry_wait", ...CREATIVE_RUNNABLE_STATUSES]);
+const CREATIVE_PREPARING_STATUSES = new Set<CreativeJobStatus>(["queued", "preparing", "retry_wait"]);
+const CREATIVE_ACTIVE_STATUSES = new Set<CreativeJobStatus>([...CREATIVE_PREPARING_STATUSES, "transient_wait"]);
+const CREATIVE_POLL_STOP_STATUSES = new Set<CreativeJobStatus>([
+  "transient_wait", "needs_attention", "paused", "failed", "cancelled", "completed",
+  "ready_for_images", "ready_for_seedance", "ready_for_assembly",
+]);
+const CREATIVE_MANUAL_ATTENTION_STATUSES = new Set<CreativeJobStatus>(["failed", "paused", "ready_for_assembly", "needs_attention"]);
+const CREATIVE_NO_DUPLICATE_START_STATUSES = new Set<CreativeJobStatus>(["transient_wait", "needs_attention", "failed"]);
+
+function creativeJobStatusText(job: Pick<CreativeJob, "status">): string {
+  return ({
+    queued: "排队中",
+    preparing: "本机准备中",
+    retry_wait: "分析短暂等待，自动重试",
+    transient_wait: "短暂等待，自动重试",
+    paused: "已暂停",
+    needs_attention: "需处理",
+    ready_for_images: "待 GPT 生图",
+    ready_for_seedance: "待豆包生成",
+    ready_for_assembly: "待拼接验收",
+    completed: "已完成",
+    failed: "需重试",
+    cancelled: "已取消",
+  } satisfies Record<CreativeJobStatus, string>)[job.status] || "状态待核实";
+}
+
+function formatCreativeBeijingTime(value: string | null | undefined): string | null {
+  const timestamp = Date.parse(String(value || ""));
+  if (!Number.isFinite(timestamp)) return null;
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(timestamp));
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value || "";
+  return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function creativeJobRetryText(job: Pick<CreativeJob, "status" | "nextRetryAt">): string | null {
+  if (job.status !== "transient_wait") return null;
+  const retryAt = formatCreativeBeijingTime(job.nextRetryAt);
+  return retryAt
+    ? `下一次自动重试：北京时间 ${retryAt}`
+    : "下一次自动重试：等待本地节点回传时间";
+}
+
+function creativeJobResumeText(job: Pick<CreativeJob, "status" | "resumeStatus">): string | null {
+  if (!["transient_wait", "needs_attention"].includes(job.status)) return null;
+  const stage = ({
+    queued: "素材分析",
+    ready_for_images: "GPT 生图",
+    ready_for_seedance: "豆包生成",
+    ready_for_assembly: "本机拼接",
+  } satisfies Record<CreativeResumeStatus, string>)[job.resumeStatus || "queued"];
+  return `恢复后从${stage}原断点继续，不会新建任务`;
+}
+
+function creativeJobErrorLabel(status: CreativeJobStatus): string {
+  if (status === "transient_wait") return "等待原因";
+  if (status === "needs_attention") return "处理原因";
+  return status === "failed" ? "失败原因" : "提示";
+}
+
+function isCreativeRunnableStatus(status: CreativeJobStatus): boolean { return CREATIVE_RUNNABLE_STATUSES.has(status); }
+function isCreativeBatchStartableStatus(status: CreativeJobStatus): boolean { return CREATIVE_BATCH_STARTABLE_STATUSES.has(status); }
+function isCreativePreparingStatus(status: CreativeJobStatus): boolean { return CREATIVE_PREPARING_STATUSES.has(status); }
+function isCreativeActiveStatus(status: CreativeJobStatus): boolean { return CREATIVE_ACTIVE_STATUSES.has(status); }
+function isCreativePollStopStatus(status: CreativeJobStatus): boolean { return CREATIVE_POLL_STOP_STATUSES.has(status); }
+function isCreativeManualAttentionStatus(status: CreativeJobStatus): boolean { return CREATIVE_MANUAL_ATTENTION_STATUSES.has(status); }
+function isCreativeNoDuplicateStartStatus(status: CreativeJobStatus): boolean { return CREATIVE_NO_DUPLICATE_START_STATUSES.has(status); }
+function isCreativeOperationWindowOpen(value: Date | string | number = new Date()): boolean {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  const hour = Number(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).format(date));
+  return hour >= 8 && hour < 19;
+}
 
 const LOCAL_AGENT_URL = "http://127.0.0.1:17890";
 
@@ -1295,7 +1405,7 @@ function RuntimeConditionsPanel({
 
           <div className="runtime-scope-row">
             <strong>一次检查</strong>
-            <span>微信收件 · GPT · 豆包 {doubaoAccountCount} 个账号 · 抖音 · 视频号 · 小红书 · 公众号</span>
+            <span>微信收件 · 视频号解析页 · GPT · 豆包 {doubaoAccountCount} 个账号 · 抖音 · 视频号草稿 · 小红书 · 公众号</span>
           </div>
 
           {data ? (
@@ -3147,7 +3257,7 @@ type RemoteAuditItem = {
 };
 
 type NotificationSettingsState = {
-  ntfy: { enabled: boolean; server: string; topic: string; hasAccessToken: boolean; subscriptionUrl: string | null };
+  ntfy: { enabled: boolean; server: string; topic: string; hasAccessToken: boolean; subscriptionUrl: string | null; operational?: boolean; deliveryState?: string; lastSuccessAt?: string | null };
   schedules: {
     learning: { enabled: boolean; time: string; lastRunDate: string | null };
     ingest: { enabled: boolean; time: string; lastRunDate: string | null };
@@ -3155,7 +3265,15 @@ type NotificationSettingsState = {
   events: { creative: boolean; publishFailure: boolean; downloadFailure: boolean; filehelperOffline: boolean };
 };
 
-type ClawBotNotificationState = { ready: boolean; pairedCount: number; reason: string | null };
+type ClawBotNotificationState = {
+  ready: boolean;
+  operational?: boolean;
+  transportReady?: boolean;
+  pairedCount: number;
+  deliveryState?: string;
+  cooldownUntil?: string | null;
+  reason: string | null;
+};
 
 type NotificationDelivery = {
   id: string;
@@ -3331,9 +3449,9 @@ function MessageCenter({
       </article>
 
       <article className="panel phone-push-panel">
-        <div className="panel-heading"><div><span>CLAWBOT 优先 · NTFY 备用</span><h3>可靠手机通知</h3></div><strong>{clawBotNotifications?.ready ? "ClawBot 已就绪" : notificationSettings?.ntfy.enabled && notificationSettings.ntfy.topic ? "ntfy 备用已配置" : "待绑定"}</strong></div>
+        <div className="panel-heading"><div><span>CLAWBOT 入站 · NTFY 可靠出站</span><h3>可靠手机通知</h3></div><strong>{clawBotNotifications?.ready ? "ClawBot 已验证" : notificationSettings?.ntfy.operational ? "ntfy 已接管" : notificationSettings?.ntfy.enabled && notificationSettings.ntfy.topic ? "ntfy 已配置" : "待绑定"}</strong></div>
         {notificationSettings ? <>
-          <p className="message-explain">{clawBotNotifications?.ready ? `主动提醒会直接发给已绑定的 ${clawBotNotifications.pairedCount} 个 ClawBot 控制账号；ClawBot 发送失败时自动改走 ntfy。` : `ClawBot 主动发送暂不可用：${clawBotNotifications?.reason || "等待绑定"}。当前可使用 ntfy 备用通知。`}</p>
+          <p className="message-explain">{clawBotNotifications?.ready ? `ClawBot 主动提醒已通过真实投递验证，可发给已绑定的 ${clawBotNotifications.pairedCount} 个控制账号；失败时自动改走 ntfy。` : `ClawBot 入站遥控与主动出站分开判断：${clawBotNotifications?.reason || "等待绑定"}。${notificationSettings.ntfy.operational ? "当前通知已由 ntfy 可靠承接。" : "请先确认 ntfy 已订阅并通过测试。"}`}</p>
           <label><span>推送服务器</span><input value={notificationSettings.ntfy.server} onChange={(event) => setNotificationSettings({ ...notificationSettings, ntfy: { ...notificationSettings.ntfy, server: event.target.value } })} /></label>
           <label><span>专属主题</span><input value={notificationSettings.ntfy.topic} onChange={(event) => setNotificationSettings({ ...notificationSettings, ntfy: { ...notificationSettings.ntfy, topic: event.target.value } })} placeholder="点击下方自动生成" /></label>
           <label><span>访问令牌（可选）</span><input type="password" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder={notificationSettings.ntfy.hasAccessToken ? "已保存；留空保持不变" : "自建/账号主题需要时填写"} /></label>
@@ -3441,9 +3559,11 @@ function CreativeStudio({
   const [queueLoading, setQueueLoading] = useState(true);
   const [autoRunningId, setAutoRunningId] = useState<string | null>(null);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [updatingJobId, setUpdatingJobId] = useState<string | null>(null);
   const materialItems = useMemo(() => libraryItems.filter((item) => item.category === "素材"), [libraryItems]);
   const materialIds = useMemo(() => new Set(materialItems.map((item) => item.id)), [materialItems]);
   const visibleJobs = useMemo(() => jobs.filter((job) => materialIds.has(job.assetId) && job.status !== "cancelled"), [jobs, materialIds]);
+  const selectedJob = useMemo(() => visibleJobs.find((job) => job.assetId === selectedId) || null, [selectedId, visibleJobs]);
 
   useEffect(() => {
     try {
@@ -3514,6 +3634,18 @@ function CreativeStudio({
 
   async function addToCreativeQueue() {
     if (!selectedId) return;
+    if (selectedJob?.status === "transient_wait") {
+      setMessage(`${creativeJobStatusText(selectedJob)}。${creativeJobRetryText(selectedJob) || "系统会从原断点继续"}；无需重复加入队列。`);
+      return;
+    }
+    if (selectedJob?.status === "needs_attention") {
+      setMessage("这条原任务需要处理；请在任务卡点击“重试原断点”，无需重新加入队列。");
+      return;
+    }
+    if (selectedJob?.status === "failed") {
+      setMessage("这条原任务执行失败；请在任务卡点击“重试原任务”，无需创建替代任务。");
+      return;
+    }
     setPreparing(true);
     setMessage(null);
     try {
@@ -3538,9 +3670,20 @@ function CreativeStudio({
     setMessage("织台正在依次执行 GPT 生图、豆包视频和本机拼接；窗口可放到后台，但不要退出织台。");
     try {
       const result = await runCreativeJob(job.id, job.assetId, doubaoAccounts.map((account) => account.id));
-      if (!result.ok) throw new Error(result.error || result.status || "一键生成中断");
+      const latestJobs = await loadJobs();
+      const latestJob = latestJobs.find((item) => item.id === job.id) || job;
+      if (!result.ok) {
+        if (latestJob.status === "transient_wait" || result.status === "transient_ui_busy") {
+          setMessage(`${creativeJobStatusText({ status: "transient_wait" })}。${creativeJobRetryText(latestJob) || "系统会从原断点继续"}；本次不会重复启动任务。`);
+          return false;
+        }
+        if (latestJob.status === "needs_attention" || result.status === "needs_attention") {
+          setMessage(`需处理：${latestJob.error || result.error || "网页生成无法继续"}。可在任务卡点击“重试原断点”，不会新建任务。`);
+          return false;
+        }
+        throw new Error(result.error || result.status || "一键生成中断");
+      }
       setMessage("一键生成完成：GPT 分镜图、豆包片段和最终成片已登记回该素材内容包。");
-      await loadJobs();
       if (openPublishAfter) onPublish(job.assetId);
       return true;
     } catch (cause) {
@@ -3556,26 +3699,41 @@ function CreativeStudio({
     setBatchRunning(true);
     setMessage("正在执行素材生成队列：织台会等待本机分析，再串行使用 GPT 和豆包账号池。");
     let completed = 0;
+    const deferredJobIds = new Set(visibleJobs.filter((job) => job.status === "transient_wait").map((job) => job.id));
     const waitDeadline = Date.now() + 15 * 60_000;
     try {
       while (true) {
         const latest = (await loadJobs()).filter((job) => materialIds.has(job.assetId) && job.status !== "cancelled");
-        const ready = latest.find((job) => ["ready_for_images", "ready_for_seedance"].includes(job.status));
+        latest.filter((job) => job.status === "transient_wait").forEach((job) => deferredJobIds.add(job.id));
+        const ready = latest.find((job) => isCreativeRunnableStatus(job.status) && !deferredJobIds.has(job.id));
         if (ready) {
           setAutoRunningId(ready.id);
           const result = await runCreativeJob(ready.id, ready.assetId, doubaoAccounts.map((account) => account.id));
           setAutoRunningId(null);
-          if (!result.ok) throw new Error(`${ready.title}：${result.error || result.status || "生成中断"}`);
+          if (!result.ok) {
+            const refreshed = await loadJobs();
+            const interrupted = refreshed.find((job) => job.id === ready.id);
+            if (interrupted?.status === "transient_wait" || result.status === "transient_ui_busy") {
+              deferredJobIds.add(ready.id);
+              continue;
+            }
+            if (interrupted?.status === "needs_attention" || result.status === "needs_attention") {
+              deferredJobIds.add(ready.id);
+              continue;
+            }
+            throw new Error(`${ready.title}：${result.error || result.status || "生成中断"}`);
+          }
           completed += 1;
           continue;
         }
-        const stillPreparing = latest.some((job) => ["queued", "preparing"].includes(job.status));
+        const stillPreparing = latest.some((job) => isCreativePreparingStatus(job.status));
         if (stillPreparing && Date.now() < waitDeadline) {
           await new Promise((resolve) => window.setTimeout(resolve, 2000));
           continue;
         }
-        const needsManual = latest.filter((job) => ["failed", "paused", "ready_for_assembly"].includes(job.status)).length;
-        setMessage(`队列执行完成：本次新生成 ${completed} 条${needsManual ? `，${needsManual} 条需要你复核或重试` : ""}。`);
+        const autoWaiting = latest.filter((job) => job.status === "transient_wait").length;
+        const needsManual = latest.filter((job) => isCreativeManualAttentionStatus(job.status)).length;
+        setMessage(`队列本轮执行完成：新生成 ${completed} 条${autoWaiting ? `，${autoWaiting} 条短暂等待并将自动从原断点重试` : ""}${needsManual ? `，${needsManual} 条需处理` : ""}。`);
         break;
       }
     } catch (cause) {
@@ -3589,6 +3747,18 @@ function CreativeStudio({
 
   async function startSelectedUnattended() {
     if (!selectedId) return;
+    if (selectedJob?.status === "transient_wait") {
+      setMessage(`${creativeJobStatusText(selectedJob)}。${creativeJobRetryText(selectedJob) || "系统会从原断点继续"}；无需再次点击生成。`);
+      return;
+    }
+    if (selectedJob?.status === "needs_attention") {
+      setMessage("这条原任务需要处理；请在任务卡点击“重试原断点”，不会新建任务。");
+      return;
+    }
+    if (selectedJob?.status === "failed") {
+      setMessage("这条原任务执行失败；请在任务卡点击“重试原任务”，不会新建任务。");
+      return;
+    }
     setPreparing(true);
     setMessage(null);
     try {
@@ -3599,14 +3769,22 @@ function CreativeStudio({
       if (!response.ok || !payload?.ok || !payload?.job) throw new Error(payload?.error || payload?.message || `HTTP ${response.status}`);
       let job = payload.job as CreativeJob;
       const started = Date.now();
-      while (!["ready_for_images", "ready_for_seedance", "ready_for_assembly", "failed", "cancelled"].includes(job.status) && Date.now() - started < 15 * 60_000) {
+      while (!isCreativePollStopStatus(job.status) && Date.now() - started < 15 * 60_000) {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
         const listResponse = await fetch(`${LOCAL_AGENT_URL}/api/v1/creative/jobs`);
         const listPayload = await listResponse.json().catch(() => null);
         job = (Array.isArray(listPayload?.jobs) ? listPayload.jobs.find((item: CreativeJob) => item.id === job.id) : null) || job;
       }
-      if (!["ready_for_images", "ready_for_seedance", "ready_for_assembly"].includes(job.status)) throw new Error(job.error || "本机复刻包尚未准备完成");
       await loadJobs();
+      if (job.status === "transient_wait") {
+        setMessage(`${creativeJobStatusText(job)}。${creativeJobRetryText(job) || "系统会从原断点继续"}；无需再次点击生成。`);
+        return;
+      }
+      if (job.status === "needs_attention") {
+        setMessage(`需处理：${job.error || "网页生成无法继续"}。可在任务卡点击“重试原断点”，不会新建任务。`);
+        return;
+      }
+      if (!["ready_for_images", "ready_for_seedance", "ready_for_assembly"].includes(job.status)) throw new Error(job.error || "本机复刻包尚未准备完成");
       await runUnattended(job, false);
     } catch (cause) {
       setMessage(`一键生成暂停：${cause instanceof Error ? cause.message : "本地节点无响应"}`);
@@ -3616,6 +3794,8 @@ function CreativeStudio({
   }
 
   async function updateJob(job: CreativeJob, action: "pause" | "resume" | "retry" | "cancel" | "advance", step?: string) {
+    if (updatingJobId !== null) return;
+    setUpdatingJobId(job.id);
     setMessage(null);
     try {
       const response = await fetch(`${LOCAL_AGENT_URL}/api/v1/creative/jobs/${encodeURIComponent(job.id)}/${action}`, {
@@ -3628,6 +3808,41 @@ function CreativeStudio({
       await loadJobs();
     } catch (cause) {
       setMessage(`队列操作失败：${cause instanceof Error ? cause.message : "本地节点无响应"}`);
+    } finally {
+      setUpdatingJobId(null);
+    }
+  }
+
+  async function retryOriginalJob(job: CreativeJob) {
+    if (updatingJobId !== null || autoRunningId !== null || batchRunning) return;
+    setUpdatingJobId(job.id);
+    setMessage(null);
+    try {
+      const action = job.status === "failed" ? "retry" : "resume";
+      const response = await fetch(`${LOCAL_AGENT_URL}/api/v1/creative/jobs/${encodeURIComponent(job.id)}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.ok || !payload?.job) throw new Error(payload?.error || payload?.message || `HTTP ${response.status}`);
+      const resumed = payload.job as CreativeJob;
+      await loadJobs();
+      const executable = ["ready_for_images", "ready_for_seedance", "ready_for_assembly"].includes(resumed.status);
+      if (!executable) {
+        setMessage("已恢复原任务，正在重新准备分析；准备完成后织台会继续同一任务，不会新建任务。");
+        return;
+      }
+      if (resumed.status !== "ready_for_assembly" && !isCreativeOperationWindowOpen()) {
+        setMessage(`${creativeJobResumeText(job) || "已恢复原断点"}；当前不在 08:00–19:00 创作窗口，次日白天自动续跑，不会深夜打开 GPT 或豆包。`);
+        return;
+      }
+      setUpdatingJobId(null);
+      await runUnattended(resumed, false);
+    } catch (cause) {
+      setMessage(`原任务重试失败：${cause instanceof Error ? cause.message : "本地节点无响应"}`);
+    } finally {
+      setUpdatingJobId(null);
     }
   }
 
@@ -3635,18 +3850,6 @@ function CreativeStudio({
     await updateJob(job, "advance", step);
     if (provider) await openStudio(provider);
   }
-
-  const statusText = (job: CreativeJob) => ({
-    queued: "排队中",
-    preparing: "本机准备中",
-    paused: "已暂停",
-    ready_for_images: "待 GPT 生图",
-    ready_for_seedance: "待豆包生成",
-    ready_for_assembly: "待拼接验收",
-    completed: "已完成",
-    failed: "需重试",
-    cancelled: "已取消",
-  }[job.status] || job.status);
 
   return (
     <>
@@ -3660,7 +3863,7 @@ function CreativeStudio({
               {!materialItems.length && <option value="">素材分类暂无视频</option>}
               {materialItems.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
             </select>
-            <div className="creative-start-buttons"><button className="primary-button" type="button" onClick={() => void startSelectedUnattended()} disabled={preparing || !selectedId || agentState !== "online"}>{preparing ? "正在执行…" : "一键生成备用成片"}</button><button className="secondary-button" type="button" onClick={() => void addToCreativeQueue()} disabled={preparing || !selectedId || agentState !== "online"}>只加入队列</button></div>
+            <div className="creative-start-buttons"><button className="primary-button" type="button" onClick={() => void startSelectedUnattended()} disabled={preparing || !selectedId || agentState !== "online" || isCreativeNoDuplicateStartStatus(selectedJob?.status || "queued")}>{preparing ? "正在执行…" : selectedJob?.status === "transient_wait" ? "等待自动重试" : selectedJob?.status === "needs_attention" ? "请从原断点重试" : selectedJob?.status === "failed" ? "请重试原任务" : "一键生成备用成片"}</button><button className="secondary-button" type="button" onClick={() => void addToCreativeQueue()} disabled={preparing || !selectedId || agentState !== "online" || isCreativeNoDuplicateStartStatus(selectedJob?.status || "queued")}>只加入队列</button></div>
           </div>
           <div className="creative-home-actions">
             <button className="primary-button" type="button" onClick={() => void openStudio("seedance", doubaoAccounts[0]?.id)} disabled={opening !== null}>
@@ -3684,19 +3887,22 @@ function CreativeStudio({
         </ol>
       </section>
       <section className="panel creative-queue-panel">
-        <div className="panel-heading"><div><span>每日生成</span><h3>织台生成队列</h3></div><div className="creative-queue-heading-actions"><em>{visibleJobs.filter((job) => ["queued", "preparing"].includes(job.status)).length} 个正在准备 · {visibleJobs.filter((job) => job.status === "completed").length} 个已完成</em><button type="button" onClick={() => void runReadyQueue()} disabled={batchRunning || autoRunningId !== null || !visibleJobs.some((job) => ["queued", "preparing", "ready_for_images", "ready_for_seedance"].includes(job.status))}>{batchRunning ? "队列执行中…" : "一键执行已就绪队列"}</button></div></div>
+        <div className="panel-heading"><div><span>每日生成</span><h3>织台生成队列</h3></div><div className="creative-queue-heading-actions"><em>{visibleJobs.filter((job) => isCreativeActiveStatus(job.status)).length} 个正在准备或自动等待 · {visibleJobs.filter((job) => job.status === "completed").length} 个已完成</em><button type="button" onClick={() => void runReadyQueue()} disabled={batchRunning || autoRunningId !== null || !visibleJobs.some((job) => isCreativeBatchStartableStatus(job.status))}>{batchRunning ? "队列执行中…" : "一键执行已就绪队列"}</button></div></div>
         <p className="creative-queue-intro">只有“素材”会自动排队。技能和其他内容进入每日学习，不消耗 GPT/豆包次数。网页自动执行遇到登录、验证码或免费次数耗尽会暂停并提示，不会假报完成。</p>
         <div className="creative-queue-list">
-          {visibleJobs.slice(0, 30).map((job) => <article className={`creative-job status-${job.status}`} key={job.id}>
+          {visibleJobs.slice(0, 30).map((job) => <article className={`creative-job status-${job.status}${job.status === "needs_attention" ? " status-failed" : ""}`} key={job.id}>
             <div className="creative-job-progress"><i style={{ width: `${Math.max(0, Math.min(100, job.progress || 0))}%` }} /></div>
-            <header><div><span>{job.autoCreated ? "下载后自动加入" : "手动加入"}</span><h4>{job.title}</h4></div><strong>{statusText(job)}</strong></header>
+            <header><div><span>{job.autoCreated ? "下载后自动加入" : "手动加入"}</span><h4>{job.title}</h4></div><strong>{creativeJobStatusText(job)}</strong></header>
             <p>{job.targetDurationSeconds ? `建议成片 ${job.targetDurationSeconds} 秒` : "成片时长由原视频和完播数据决定"}{job.shotCount ? ` · ${job.shotCount} 个镜头` : ""}</p>
-            {job.error && <small>失败原因：{job.error}</small>}
+            {job.error && <small>{creativeJobErrorLabel(job.status)}：{job.error}</small>}
+            {creativeJobRetryText(job) && <small>{creativeJobRetryText(job)}</small>}
+            {creativeJobResumeText(job) && <small>{creativeJobResumeText(job)}</small>}
             {!!job.qualityWarnings?.length && <small>生成提示：{job.qualityWarnings.join("；")}</small>}
             <div className="creative-job-actions">
               {["queued", "preparing"].includes(job.status) && <button type="button" onClick={() => void updateJob(job, "pause")}>暂停</button>}
               {job.status === "paused" && <button type="button" onClick={() => void updateJob(job, "resume")}>继续准备</button>}
-              {job.status === "failed" && <button type="button" onClick={() => void updateJob(job, "retry")}>重试</button>}
+              {job.status === "failed" && <button type="button" className="primary" disabled={updatingJobId !== null || autoRunningId !== null || batchRunning} onClick={() => void retryOriginalJob(job)}>{updatingJobId === job.id ? "正在恢复…" : "重试原任务"}</button>}
+              {job.status === "needs_attention" && <button type="button" className="primary" disabled={updatingJobId !== null || autoRunningId !== null || batchRunning} onClick={() => void retryOriginalJob(job)}>{updatingJobId === job.id ? "正在恢复…" : "重试原断点"}</button>}
               {job.status === "ready_for_images" && <><button type="button" className="primary" onClick={() => void openStudio("gpt")}>打开 GPT 生图</button><button type="button" onClick={() => void advanceAndOpen(job, "images_ready", "seedance")}>图片已做好 → 豆包</button></>}
               {job.status === "ready_for_images" && <button type="button" className="primary unattended" onClick={() => void runUnattended(job)} disabled={autoRunningId !== null || batchRunning}>{autoRunningId === job.id ? "备用成片生成中…" : "一键生成备用成片"}</button>}
               {job.status === "ready_for_seedance" && <><button type="button" className="primary" onClick={() => void openStudio("seedance")}>打开豆包生成</button><button type="button" className="primary unattended" onClick={() => void runUnattended(job)} disabled={autoRunningId !== null || batchRunning}>{autoRunningId === job.id ? "正在继续生成…" : "继续生成备用成片"}</button><button type="button" onClick={() => void advanceAndOpen(job, "seedance_ready")}>片段已下载 → 待拼接</button></>}

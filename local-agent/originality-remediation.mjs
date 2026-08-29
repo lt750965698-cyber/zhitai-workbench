@@ -8,6 +8,7 @@ const REASON_LABELS = {
 };
 
 const GENERIC_PRESENTATION_SUBJECT = /拍摄对象|站着并说话|人物.{0,10}(?:说话|站立)|对应的主体|画面中的主体|这个主题/iu;
+const LEGACY_GENERIC_NARRATION = /更清楚耐看|突出(?:一个)?核心细节|效果才更完整/iu;
 
 function text(value, fallback = "") {
   const cleaned = String(value ?? "").replace(/[\u200b-\u200d\ufeff]/g, "").replace(/\s+/g, " ").trim();
@@ -66,10 +67,16 @@ export function assessOriginalityRisks(workflow = {}, { title = "", sourceRights
     const originalTitle = text(workflow?.originality?.originalTitle);
     const genericOriginal = GENERIC_PRESENTATION_SUBJECT.test(originalTitle)
       || GENERIC_PRESENTATION_SUBJECT.test(text(workflow?.originality?.originalVoiceover))
+      || LEGACY_GENERIC_NARRATION.test(originalTitle)
+      || LEGACY_GENERIC_NARRATION.test(text(workflow?.originality?.originalVoiceover))
       || originalTitle.length > 32
       || /我家|硬是|塞进|赞不绝口|美到窒息|年度必入|[+#]/iu.test(originalTitle)
-      || (Array.isArray(workflow?.shots) && workflow.shots.some((shot) => GENERIC_PRESENTATION_SUBJECT.test(text(shot?.narration))));
-    if (genericOriginal) {
+      || (Array.isArray(workflow?.shots) && workflow.shots.some((shot) => (
+        GENERIC_PRESENTATION_SUBJECT.test(text(shot?.narration))
+        || LEGACY_GENERIC_NARRATION.test(text(shot?.narration))
+      )));
+    const topicDrift = hasRemediatedTopicDrift(workflow, title);
+    if (genericOriginal || topicDrift) {
       return {
         requiresRecovery: true,
         rightsStatus: text(workflow.originality.sourceRightsStatus, "unverified"),
@@ -118,17 +125,37 @@ export function assessOriginalityRisks(workflow = {}, { title = "", sourceRights
 function titleTopic(value) {
   const title = text(value).replace(/#[^#\s]+/gu, " ").replace(/\s+/g, " ").trim();
   const rules = [
+    // 全屋/户型信号优先于房间词；“开放式厨房”可以只是小户型改造的一项手段。
+    [/两房变三房|老破小|小户型(?:空间|全屋|户型)?改造|全屋.{0,8}改造|户型改造/iu, "小户型空间改造"],
     [/PU\s*线条|法式.{0,12}(?:墙|装修|装饰)|墙面装饰板/iu, "法式墙面装饰板"],
     [/儿童房/iu, "儿童房空间设计"],
     [/卫生间.{0,12}干区|干区.{0,12}隔断/iu, "卫生间干区收纳隔断"],
     [/卫生间|浴室|淋浴|马桶|洗漱/iu, "小户型卫生间布局"],
     [/厨房|橱柜|灶台|台面/iu, "厨房改造"],
     [/飘窗/iu, "小户型飘窗一体化设计"],
-    [/两房变三房|小户型.{0,12}改造|老破小/iu, "小户型空间改造"],
+    [/小户型.{0,12}改造/iu, "小户型空间改造"],
     [/地下室|半架空|宅基地|自建房/iu, "自建房架空层设计"],
     [/阳台/iu, "阳台空间改造"],
   ];
   return rules.find(([pattern]) => pattern.test(title))?.[1] || "";
+}
+
+function remediatedTopicCandidates(workflow) {
+  const shots = Array.isArray(workflow?.shots) ? workflow.shots : [];
+  return unique([
+    workflow?.originality?.originalTitle,
+    ...shots.flatMap((shot) => [
+      shot?.originalDesignReference?.subject,
+      shot?.observedReference?.subject,
+    ]),
+  ].map((value) => titleTopic(value)).filter(Boolean));
+}
+
+function hasRemediatedTopicDrift(workflow, sourceTitle) {
+  const expected = titleTopic(sourceTitle);
+  if (!expected) return false;
+  const candidates = remediatedTopicCandidates(workflow);
+  return candidates.length > 0 && candidates.some((candidate) => candidate !== expected);
 }
 
 function safeSubject(workflow, title) {
@@ -177,14 +204,83 @@ function fitNarration(value, durationSeconds) {
   return /[。！？]$/u.test(shortened) ? shortened : `${shortened}。`;
 }
 
+function narrationSequence(subject) {
+  const topic = titleTopic(subject);
+  const sequences = {
+    小户型空间改造: [
+      "小户型空间改造先理顺动线和功能分区，再用沿墙收纳减少遮挡、保住采光。",
+      "收纳沿墙集中，开放区减少遮挡，让走道顺畅、自然光能进入室内。",
+      "最后用通透隔断和统一材质连接各区，面积不变也能住得宽松顺手。",
+    ],
+    小户型卫生间布局: [
+      "小户型卫生间先排好洗漱、马桶、淋浴、泡澡四区动线，再用壁龛和侧柜收纳。",
+      "壁龛收沐浴用品，洗手台侧柜收日常杂物，尽量把地面空间留出来。",
+      "再用玻璃隔断控制水汽，干湿分开后，四个功能用起来都更顺手。",
+    ],
+    卫生间干区收纳隔断: [
+      "卫生间干区先留出洗漱通道，再决定隔断位置，开门和通行互不打架。",
+      "镜柜收小件，侧柜放囤货，台面只留常用品，洗漱区就不容易凌乱。",
+      "半墙加玻璃既挡水汽又保留采光，干区独立后早晚使用也更从容。",
+    ],
+    厨房改造: [
+      "厨房改造先按取、洗、切、炒的顺序安排台面，做饭少走冤枉路。",
+      "常用厨具留在操作区，吊柜放低频物品，转角用抽拉收纳减少死角。",
+      "照明补到水槽和备餐台，柜门与台面统一后，厨房更好清洁和使用。",
+    ],
+    儿童房空间设计: [
+      "儿童房先按睡眠、学习和收纳分区，把中间活动空间完整留出来。",
+      "床下做抽屉，书桌靠近自然光，常用物品放在孩子够得到的位置。",
+      "家具贴墙并固定高柜，通道更宽，孩子长大后布局也容易调整。",
+    ],
+    法式墙面装饰板: [
+      "法式墙面装饰板先定中心线和分格比例，让门窗两侧保持均衡。",
+      "线条粗细只保留两档，转角和收口对齐，墙面层次才不会显乱。",
+      "暖白墙面配柔和侧光，让线条有层次，同时避免装饰堆得太满。",
+    ],
+    小户型飘窗一体化设计: [
+      "飘窗先和书桌或收纳柜连成一体，把窗边零散位置真正利用起来。",
+      "抽屉放低频物品，开放格留给常用书，坐卧区保持足够的伸腿空间。",
+      "台面高度和窗扇开启范围提前校准，采光、收纳和使用互不冲突。",
+    ],
+    阳台空间改造: [
+      "阳台先确定晾晒、清洁和休闲的使用顺序，再安排水电与柜体。",
+      "洗衣机和清洁用品集中一侧，另一侧留空，日常通行不会被打断。",
+      "柜体避开窗户并选耐晒材质，采光保留下来，杂物也有固定去处。",
+    ],
+    自建房架空层设计: [
+      "架空层先区分停车、储物和活动动线，避免不同功能互相占道。",
+      "沿承重边界集中收纳，主要通道保持连续，雨天进出也更方便。",
+      "再补足排水、通风和照明，半室外空间才能长期稳定使用。",
+    ],
+  };
+  return sequences[topic] || [
+    `${subject}先理顺使用顺序和主要动线，再决定各部分的位置。`,
+    "常用功能放在顺手的位置，收纳集中到边角，减少来回绕行。",
+    "最后统一材质和照明，让每个区域直接对应日常使用需求。",
+  ];
+}
+
 function originalNarration(index, count, role, subject, setting, durationSeconds) {
-  if (index === 0) {
-    return fitNarration(`想让${subject}更清楚耐看，先统一重点、比例和光线。`, durationSeconds);
-  }
-  if (index === count - 1) {
-    return fitNarration(`${subject}不只看单个细节，色彩、尺度和光线协调，效果才更完整。`, durationSeconds);
-  }
-  return fitNarration(`不用堆满元素，围绕${subject}突出一个核心细节，信息会更清楚。`, durationSeconds);
+  const sequence = narrationSequence(subject);
+  const position = index === 0 ? 0 : index === count - 1 ? 2 : 1;
+  return fitNarration(sequence[position], durationSeconds);
+}
+
+function originalTitle(subject) {
+  const topic = titleTopic(subject);
+  const titles = {
+    小户型空间改造: "小户型空间改造：动线、采光与收纳布局",
+    小户型卫生间布局: "小户型卫生间布局：四区动线与收纳",
+    卫生间干区收纳隔断: "卫生间干区收纳隔断：动线与采光",
+    厨房改造: "厨房改造：动线与收纳",
+    儿童房空间设计: "儿童房空间设计：分区与成长型收纳",
+    法式墙面装饰板: "法式墙面装饰板：分格与光线设计",
+    小户型飘窗一体化设计: "小户型飘窗一体化设计：布局与收纳",
+    阳台空间改造: "阳台空间改造：家务动线与收纳",
+    自建房架空层设计: "自建房架空层设计：功能与动线",
+  };
+  if (subject === "这个主题") return "从使用顺序出发安排空间";
+  return titles[topic] || `${subject}的布局与使用细节`;
 }
 
 function originalImagePrompt({ index, role, subject, setting, narration }) {
@@ -271,7 +367,7 @@ export function remediateToOriginalWorkflow(workflow = {}, { title = "", sourceR
     sourceMusicAllowed: false,
     originalVisualsRequired: true,
     originalVoiceoverRequired: true,
-    originalTitle: subject === "这个主题" ? "把重点、比例和光线统一起来" : `${subject}怎么做得更清楚耐看？`,
+    originalTitle: originalTitle(subject),
     originalVoiceover: rewritten.map((shot) => shot.narration).filter(Boolean).join(" "),
   };
   next.manualBoundary = "原创补救已自动完成；只有账号登录、平台素材授权弹窗或生成额度等外部条件需要用户处理。不得为绕过授权弹窗而复用来源媒体。";

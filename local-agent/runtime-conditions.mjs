@@ -3,15 +3,30 @@ function text(value, fallback = "状态未返回") {
 }
 
 function accountLoggedIn(account) {
+  if (account?.ready === true || account?.authState === "verified" || account?.loggedIn === true) return true;
+  if (account?.ready === false || account?.loggedIn === false
+    || ["invalid", "unverified", "candidate"].includes(String(account?.authState || "").toLowerCase())) return false;
   const state = `${account?.loginStatus || ""} ${account?.status || ""}`.toLowerCase();
   return /已登录|online|logged.?in|success|valid/.test(state) && !/未登录|offline|expired|invalid|failed/.test(state);
 }
 
-function platformAccount(accounts, aliases) {
+function platformAccount(accounts, aliases, { requireReady = true } = {}) {
   return (Array.isArray(accounts) ? accounts : []).find((account) => {
     const value = `${account?.platform || ""} ${account?.code || ""}`.toLowerCase();
-    return aliases.some((alias) => value.includes(alias)) && accountLoggedIn(account);
+    return aliases.some((alias) => value.includes(alias)) && (!requireReady || accountLoggedIn(account));
   }) || null;
+}
+
+function platformAccountReason(account, missing) {
+  if (!account) return missing;
+  const authState = String(account?.authState || "").toLowerCase();
+  if (authState === "invalid" || account?.ready === false && /失效|过期|invalid|expired/i.test(`${account?.loginStatus || ""} ${account?.error || ""}`)) {
+    return "平台发布页认证已失效，需要重新登录";
+  }
+  if (["unverified", "candidate"].includes(authState) || account?.ready !== true) {
+    return "仅发现本地会话，尚未通过平台发布页鉴权验证";
+  }
+  return account?.reason || account?.error || account?.loginStatus || missing;
 }
 
 function condition(id, label, state, reason, checkedAt, actionView, optional = false, ingressRole = null) {
@@ -43,6 +58,7 @@ export function buildRuntimeConditions({
   remote = {},
   notifications = {},
   filehelper = {},
+  channelsCard = {},
   creative = null,
   publisherAccounts = null,
   publisherError = null,
@@ -74,10 +90,29 @@ export function buildRuntimeConditions({
     "primary",
   )];
 
+  const channelsCardKnown = Boolean(channelsCard?.checkedAt);
+  const channelsCardOnline = channelsCard?.online === true;
+  const channelsCardReady = channelsCardOnline && channelsCard?.available === true;
+  conditions.push(condition(
+    "wx_channels_card",
+    "视频号卡片解析页",
+    channelsCardReady ? "ready" : channelsCardKnown ? "attention" : "unknown",
+    channelsCardReady
+      ? "解析引擎与桌面微信视频号页面已连接，可解析转发卡片"
+      : !channelsCardKnown
+        ? "视频号卡片解析状态尚未检查"
+        : channelsCardOnline
+          ? "解析引擎在线，但桌面微信视频号页面未连接；织台正在等待自动重连"
+          : "视频号卡片解析引擎离线；织台正在尝试自动恢复",
+    channelsCard?.checkedAt || null,
+    "inbox",
+  ));
+
   const clawbot = service("openclaw_weixin");
   const clawbotInboundReady = clawbot?.business?.ready === true && remote?.paired === true;
   const proactiveState = String(notifications?.clawbot?.deliveryState || "unverified");
   const proactiveReady = notifications?.clawbot?.operational === true && proactiveState === "ready";
+  const ntfyReady = notifications?.ntfy?.operational === true;
   conditions.push(condition(
     "clawbot",
     "ClawBot 入站遥控与备用通知",
@@ -86,7 +121,9 @@ export function buildRuntimeConditions({
       ? proactiveReady
         ? "入站遥控已配对，主动文字通知最近一次实投已受理"
         : proactiveState === "session_refresh_required"
-          ? "入站遥控已配对；主动通知会话需由用户发一条新消息刷新，期间自动回退手机推送"
+          ? ntfyReady
+            ? "入站遥控已配对；ClawBot 主动会话待下一条真实私聊刷新，ntfy 已自动承接通知"
+            : "入站遥控已配对；ClawBot 主动会话待下一条真实私聊刷新，手机备用通知尚未就绪"
           : "入站遥控已配对；主动通知尚未通过真实投递验证，以消息中心结果为准"
       : `${clawbot?.business?.reason || (remote?.paired === false ? "尚未绑定 ClawBot 控制微信" : "ClawBot 备用通道未就绪")}；不阻断文件传输助手主入口`,
     checkedAt,
@@ -127,9 +164,11 @@ export function buildRuntimeConditions({
   const publisherKnown = Array.isArray(publisherAccounts);
   const douyin = platformAccount(publisherAccounts, ["dy", "抖音", "douyin"]);
   const channels = platformAccount(publisherAccounts, ["sph", "视频号", "channels"]);
+  const douyinCandidate = platformAccount(publisherAccounts, ["dy", "抖音", "douyin"], { requireReady: false });
+  const channelsCandidate = platformAccount(publisherAccounts, ["sph", "视频号", "channels"], { requireReady: false });
   const xhsVideo = platformAccount(publisherAccounts, ["xhs", "小红书", "xiaohongshu"]);
-  conditions.push(condition("douyin", "抖音草稿账号", douyin ? "ready" : publisherKnown ? "attention" : "unknown", douyin ? "账号登录有效" : publisherKnown ? "未发现已登录抖音账号" : publisherError || "账号状态尚未检查", checkedAt, "publish"));
-  conditions.push(condition("wechat_channels", "视频号草稿账号", channels ? "ready" : publisherKnown ? "attention" : "unknown", channels ? "账号登录有效" : publisherKnown ? "未发现已登录视频号账号" : publisherError || "账号状态尚未检查", checkedAt, "publish"));
+  conditions.push(condition("douyin", "抖音草稿账号", douyin ? "ready" : publisherKnown ? "attention" : "unknown", douyin ? "平台发布鉴权已验证" : publisherKnown ? platformAccountReason(douyinCandidate, "未发现已登录抖音账号") : publisherError || "账号状态尚未检查", checkedAt, "publish"));
+  conditions.push(condition("wechat_channels", "视频号草稿账号", channels ? "ready" : publisherKnown ? "attention" : "unknown", channels ? "平台发布鉴权已验证" : publisherKnown ? platformAccountReason(channelsCandidate, "未发现已登录视频号账号") : publisherError || "账号状态尚未检查", checkedAt, "publish"));
   const xhsReady = Boolean(xhsVideo || xiaohongshu?.loggedIn === true);
   const xhsKnown = publisherKnown || typeof xiaohongshu?.loggedIn === "boolean";
   conditions.push(condition("xiaohongshu", "小红书账号", xhsReady ? "ready" : xhsKnown ? "attention" : "unknown", xhsReady ? "账号登录有效" : xhsKnown ? xiaohongshu?.reason || "需扫码登录小红书" : "账号状态尚未检查", checkedAt, "publish"));

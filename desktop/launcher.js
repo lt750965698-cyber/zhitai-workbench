@@ -31,6 +31,23 @@ const NODE_BIN = [
 const WEB_MARKERS = ["织台 · 内容自动化工作台", "workbench-shell"];
 const xhsStartLockDbs = new Map();
 
+function electronRunAsNodeEnv(nodeBin) {
+  let resolvedNodeBin = String(nodeBin || "");
+  try { resolvedNodeBin = fs.realpathSync(resolvedNodeBin); } catch (_) { /* 按原路径继续判定 */ }
+
+  // 开发版的 runtime/bin/node 可能是指向另一份 Electron 的符号链接，
+  // 因此不能只和当前打包应用的 process.execPath 比较。
+  const resolvedName = path.basename(resolvedNodeBin).replace(/\.exe$/i, "");
+  if (/^electron$/i.test(resolvedName)) return { ELECTRON_RUN_AS_NODE: "1" };
+
+  if (process.versions.electron) {
+    let electronExecPath = process.execPath;
+    try { electronExecPath = fs.realpathSync(electronExecPath); } catch (_) { /* 按原路径比较 */ }
+    if (resolvedNodeBin === electronExecPath) return { ELECTRON_RUN_AS_NODE: "1" };
+  }
+  return {};
+}
+
 let ctx = {
   projectDir: path.resolve(__dirname, ".."),
   runtimeScript: path.join(HOME, ".local/share/zhitai-runtime/scripts/run-local-agent.command"),
@@ -363,7 +380,7 @@ function spawnWeb() {
     env: {
       ...process.env,
       PATH: path.dirname(ctx.nodeBin) + (process.env.PATH ? path.delimiter + process.env.PATH : ""),
-      ...(ctx.nodeBin === process.execPath && process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+      ...electronRunAsNodeEnv(ctx.nodeBin),
       NO_PROXY: [
         ...new Set([
           "localhost",

@@ -37,6 +37,7 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@electron/asar": "4.3.0",
     "drizzle-orm": "0.45.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"

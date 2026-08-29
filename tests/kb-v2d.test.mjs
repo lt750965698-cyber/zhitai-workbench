@@ -93,7 +93,14 @@ before(async () => {
   await writeFile(join(ROOT, "config.json"), JSON.stringify(config));
   server = spawn(process.execPath, [AGENT_ENTRY], {
     cwd: repoRoot,
-    env: { ...process.env, ZHITAI_CONFIG_PATH: join(ROOT, "config.json"), ZHITAI_DATA_DIR: DATA_DIR, ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH },
+    env: {
+      ...process.env,
+      ZHITAI_CONFIG_PATH: join(ROOT, "config.json"),
+      ZHITAI_DATA_DIR: DATA_DIR,
+      ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(DATA_DIR, "matrix-partitions"),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.unref();
@@ -725,7 +732,14 @@ test("C2：双进程并发同字节（不同 sourceUrl+deliveryId）→ 1 winner
   const cfg2 = join(c2Root, "config2.json");
   await writeFile(cfg1, JSON.stringify({ ...baseCfg, port: port1, watcher: { intervalMs: 5000, maxRetries: 3, roots: [{ dir: watcherDir1, channel: "kuaidian", recursive: true }] } }));
   await writeFile(cfg2, JSON.stringify({ ...baseCfg, port: port2, watcher: { intervalMs: 5000, maxRetries: 3, roots: [{ dir: watcherDir2, channel: "kuaidian", recursive: true }] } }));
-  const childEnv = { ...process.env, ZHITAI_DATA_DIR: c2Data, ZHITAI_ENRICH_SCRIPT: enrichPath, C2_BARRIER_DIR: barrierDir };
+  const childEnv = {
+    ...process.env,
+    ZHITAI_DATA_DIR: c2Data,
+    ZHITAI_ENRICH_SCRIPT: enrichPath,
+    ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+    ZHITAI_MATRIX_PARTITIONS_DIR: join(c2Data, "matrix-partitions"),
+    C2_BARRIER_DIR: barrierDir,
+  };
   // 串行启动：先 server1 并等健康（完成 schema 迁移），再 server2 —— 避免两个进程在全新库上并发跑迁移
   const s1 = spawn(process.execPath, [AGENT_ENTRY], { cwd: repoRoot, env: { ...childEnv, ZHITAI_CONFIG_PATH: cfg1 }, stdio: ["ignore", "ignore", "pipe"] });
   let s2 = null;

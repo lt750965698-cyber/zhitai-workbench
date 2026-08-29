@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { originalChannelsVideoUrl, parseChannelsCard } from "../local-agent/channels-card.mjs";
+import { getChannelsCardEngineStatus, originalChannelsVideoUrl, parseChannelsCard } from "../local-agent/channels-card.mjs";
 import { downloadChannelsVideo } from "../local-agent/channels-yuanbao.mjs";
 
 async function withServer(handler, run) {
@@ -200,6 +200,41 @@ test("微信视频号页面未连接时返回明确错误", async () => {
     await assert.rejects(
       parseChannelsCard({ objectId: "1234567890123456789", nonceId: "nonce_1" }, { baseUrl }),
       /channels_card_wechat_page_not_connected/,
+    );
+  });
+});
+
+test("视频号引擎状态严格区分 HTTP 在线与页面可用", async () => {
+  let available = false;
+  await withServer((_req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ code: 0, data: { available } }));
+  }, async (baseUrl) => {
+    assert.deepEqual(await getChannelsCardEngineStatus({ baseUrl }), { online: true, available: false });
+    available = true;
+    assert.deepEqual(await getChannelsCardEngineStatus({ baseUrl }), { online: true, available: true });
+  });
+});
+
+test("状态端点启动中的 503 或非 JSON 响应统一标记为可恢复", async () => {
+  let invalidJson = false;
+  await withServer((_req, res) => {
+    if (invalidJson) {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("starting");
+      return;
+    }
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ code: 1, msg: "starting" }));
+  }, async (baseUrl) => {
+    await assert.rejects(
+      getChannelsCardEngineStatus({ baseUrl }),
+      /channels_card_engine_starting/,
+    );
+    invalidJson = true;
+    await assert.rejects(
+      getChannelsCardEngineStatus({ baseUrl }),
+      /channels_card_engine_starting/,
     );
   });
 });

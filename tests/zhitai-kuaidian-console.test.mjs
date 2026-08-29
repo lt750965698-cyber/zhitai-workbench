@@ -144,6 +144,8 @@ test.before(async () => {
       ZHITAI_DATA_DIR: dataDir,
       ZHITAI_PORT: String(port),
       ZHITAI_KUAIDIAN_TTL_MS: "400",
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(dataDir, "matrix-partitions"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -401,4 +403,6 @@ test("前端/Edge：控制台状态卡/过滤器/详情/重试按钮；显式 Mi
   assert.ok(sv.includes('"-a"') || sv.includes('"-a",'), "兜底 open -a 显式 Edge 应用");
   assert.ok(sv.includes("filehelper.weixin.qq.com"), "打开 filehelper URL");
   assert.ok(sv.includes("const legacyRetryMatch") && sv.includes('retryMode: "legacy_retry"'), "server 暴露受控的 legacy 卡片重试端点");
+  assert.ok(sv.includes("watcherScanInFlight") && sv.includes("scanWatcherLibsSingleFlight"), "目录扫描必须单飞，避免卡住时耗尽线程池");
+  assert.doesNotMatch(sv, /setInterval\(\(\) => scanWatcherLibs\(\)/, "定时器不得叠加目录扫描");
 });

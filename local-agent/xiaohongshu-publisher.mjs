@@ -13,10 +13,24 @@ import {
 } from "./xiaohongshu-accounts.mjs";
 
 export const XHS_PUBLISHER_URL = `http://127.0.0.1:${Number(process.env.ZHITAI_XHS_DEFAULT_PORT || 18_060)}`;
+export const XHS_AI_DECLARATION_BLOCKED = "blocked_ai_declaration";
 const publishTails = new Map();
 
 function safeMessage(value) {
   return String(value || "未知错误").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+}
+
+function blockedAIContentDeclaration(message, {
+  beforeExternalCall = false,
+  externalCallStarted = !beforeExternalCall,
+} = {}) {
+  const error = new Error(safeMessage(message || "小红书 AI 合成内容声明未通过平台控件回读"));
+  error.code = XHS_AI_DECLARATION_BLOCKED;
+  error.status = XHS_AI_DECLARATION_BLOCKED;
+  error.beforeExternalCall = beforeExternalCall === true;
+  error.retryableBeforeExternalCall = beforeExternalCall === true;
+  error.externalCallStarted = externalCallStarted === true;
+  return error;
 }
 
 async function request(accountId, path, { method = "GET", body, timeoutMs = 30_000 } = {}) {
@@ -33,7 +47,25 @@ async function request(accountId, path, { method = "GET", body, timeoutMs = 30_0
   }
   const payload = await response.json().catch(() => null);
   if (!response.ok || payload?.success === false) {
-    throw new Error(safeMessage(payload?.error || payload?.message || `HTTP ${response.status}`));
+    const detailMessage = payload?.details && typeof payload.details === "object"
+      ? payload.details.message
+      : null;
+    const blockedAI = payload?.code === "BLOCKED_AI_DECLARATION"
+      || payload?.details?.status === XHS_AI_DECLARATION_BLOCKED
+      || payload?.details?.reason === XHS_AI_DECLARATION_BLOCKED;
+    const beforeExternalCall = payload?.details?.before_external_call === true;
+    const error = blockedAI
+      ? blockedAIContentDeclaration(
+        detailMessage || payload?.error || payload?.message || `HTTP ${response.status}`,
+        { beforeExternalCall, externalCallStarted: !beforeExternalCall },
+      )
+      : new Error(safeMessage(detailMessage || payload?.error || payload?.message || `HTTP ${response.status}`));
+    if (beforeExternalCall) {
+      error.beforeExternalCall = true;
+      error.retryableBeforeExternalCall = true;
+      error.externalCallStarted = false;
+    }
+    throw error;
   }
   return payload;
 }
@@ -119,10 +151,15 @@ export async function publishImageText({
   images,
   tags = [],
   scheduleAt = null,
-  isOriginal = true,
+  isOriginal = false,
+  creativeStatement = null,
 }) {
   const account = resolveAccount(accountId);
   if (!Array.isArray(images) || !images.length) throw new Error("小红书图文至少需要 1 张图片");
+  if (![null, "ai_generated"].includes(creativeStatement)) {
+    throw new Error("小红书图文内容声明不受支持");
+  }
+  const containsAI = creativeStatement === "ai_generated";
   const payload = await serializeAccountPublish(account.accountId, () => request(account.accountId, "/api/v1/publish", {
     method: "POST",
     timeoutMs: 8 * 60_000,
@@ -133,9 +170,24 @@ export async function publishImageText({
       tags: tags.map(String).slice(0, 10),
       ...(scheduleAt ? { schedule_at: new Date(scheduleAt).toISOString() } : {}),
       is_original: isOriginal === true,
+      contains_ai: containsAI,
     },
   }));
-  return { ...payload, accountId: account.accountId };
+  if (containsAI && payload?.data?.ai_content_declared !== true) {
+    // 引擎声称发布完成却没有声明回执时，不能把它当成可安全重试的发布前
+    // 失败：平台可能已经收到内容，自动重试会造成重复公开笔记。
+    throw blockedAIContentDeclaration("小红书未回执 AI 合成内容声明，已停止认定发布成功", {
+      beforeExternalCall: false,
+      externalCallStarted: true,
+    });
+  }
+  return {
+    ...payload,
+    accountId: account.accountId,
+    creativeStatement,
+    aiDeclarationVerified: containsAI ? true : null,
+    status: payload?.data?.status === "发布完成" ? "published" : "submitted",
+  };
 }
 
 export { DEFAULT_XHS_ACCOUNT_ID, ensureAccountEngine, xhsAccountRuntimeSummary };

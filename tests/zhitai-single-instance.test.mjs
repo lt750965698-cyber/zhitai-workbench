@@ -58,3 +58,11 @@ test("所有后台创作窗口默认静音并移除媒体自动播放与循环",
   assert.match(src, /keepCreativeStudioQuiet\(existing\)/);
   assert.match(src, /keepCreativeStudioQuiet\(child\)/);
 });
+
+test("主窗口进入后台时立即静音并暂停媒体，回到前台不自动续播", () => {
+  assert.match(src, /function stopWindowMediaWhenBackgrounded\(child\)/);
+  assert.match(src, /child\.on\("blur", pauseMedia\)/);
+  assert.match(src, /child\.on\("minimize", pauseMedia\)/);
+  assert.match(src, /media\.pause\(\)/);
+  assert.match(src, /stopWindowMediaWhenBackgrounded\(mainWindow\)/);
+});

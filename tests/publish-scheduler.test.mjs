@@ -76,7 +76,10 @@ async function fixture(t, options = {}) {
     clearTimeout: clock.clearTimeout,
     preflight: options.preflight || (async () => ({ ok: true })),
     executeTarget: options.executeTarget || (async () => ({ status: "public" })),
+    onEvent: options.onEvent || (async () => {}),
     gracePeriodMs: options.gracePeriodMs || 20 * 60_000,
+    retryBaseDelayMs: options.retryBaseDelayMs,
+    retryMaxDelayMs: options.retryMaxDelayMs,
   });
   await scheduler.init();
   t.after(() => scheduler.stop());
@@ -234,7 +237,7 @@ test("a newer generation or changed storyboard is rejected before every external
 
 test("server persists and rechecks strict media bindings on preflight and execution", () => {
   assert.match(serverSource, /persistent_schedule_requires_strict_generated_media/);
-  assert.match(serverSource, /persistent_schedule_requires_zhitai_seedance_generation/);
+  assert.match(serverSource, /persistent_schedule_requires_strict_zhitai_generation/);
   assert.match(serverSource, /persistent_schedule_generation_task_binding_missing/);
   assert.match(serverSource, /audioQualitySha256:\s*String\(audioQualitySha256/);
   assert.match(serverSource, /mediaSizeBytes:\s*Number\(publishMedia\.size_bytes/);
@@ -242,7 +245,10 @@ test("server persists and rechecks strict media bindings on preflight and execut
   assert.match(serverSource, /binding:\s*prepared\.scheduleBinding/);
   assert.match(serverSource, /requireExpectedBinding:\s*true,\s*\n\s*expectedBinding:\s*payload\.binding/);
   assert.match(serverSource, /storyboards,\s*\n\s*storyboardFingerprint/);
-  assert.match(serverSource, /sha256:\s*await sha256File\(imagePath\)/);
+  assert.match(serverSource, /STRICT_ZHITAI_GENERATION_ENGINES\.includes\(bundle\.assetBinding\.generationEngine\)/);
+  assert.match(serverSource, /creativeStatement,\s*\n\s*publishTextSha256/);
+  assert.match(serverSource, /aiDeclarationVerified !== true/);
+  assert.match(serverSource, /inspectStrictGenerationEvidence\(\{/);
   assert.match(serverSource, /if \(!\/\\baac\\b\/i\.test\(String\(publishMedia\.codec_audio \|\| ""\)\)\)/);
 });
 
@@ -450,6 +456,215 @@ test("partial failure records every platform and retry executes only the failed 
   assert.deepEqual(calls, ["xhs", "wechat", "wechat"]);
   assert.equal(task.targets[0].attempts, 1);
   assert.equal(task.targets[1].attempts, 2);
+});
+
+test("an explicitly pre-external transient failure enters retry_wait with exponential backoff", async (t) => {
+  let calls = 0;
+  const events = [];
+  const { clock, scheduler } = await fixture(t, {
+    retryBaseDelayMs: 1_000,
+    retryMaxDelayMs: 8_000,
+    executeTarget: async () => {
+      calls += 1;
+      if (calls <= 2) {
+        const error = new Error(calls === 1 ? "EPERM: account store temporarily unreadable" : "matrixmedia_cli_timeout");
+        error.beforeExternalCall = true;
+        throw error;
+      }
+      return { status: "public", postId: "after-safe-retries" };
+    },
+    onEvent: async (task) => events.push(task.status),
+  });
+  await scheduler.schedule({
+    id: "pre-external-backoff",
+    scheduledAt: "2026-08-27T00:00:00.000Z",
+    expiresAt: "2026-08-27T00:01:00.000Z",
+    targets: [{ id: "douyin" }],
+  });
+
+  assert.equal(clock.fireDue(), 1);
+  await scheduler.waitForIdle();
+  let task = await scheduler.get("pre-external-backoff");
+  assert.equal(task.status, "retry_wait");
+  assert.equal(task.nextAttemptAt, "2026-08-27T00:00:01.000Z");
+  assert.equal(task.targets[0].status, "pending");
+  assert.equal(task.targets[0].attempts, 1);
+  assert.equal(clock.timerCount(), 1);
+
+  clock.advance(999);
+  assert.equal(clock.fireDue(), 0);
+  clock.advance(1);
+  assert.equal(clock.fireDue(), 1);
+  await scheduler.waitForIdle();
+  task = await scheduler.get("pre-external-backoff");
+  assert.equal(task.status, "retry_wait");
+  assert.equal(task.nextAttemptAt, "2026-08-27T00:00:03.000Z");
+  assert.equal(task.targets[0].attempts, 2);
+
+  clock.advance(1_999);
+  assert.equal(clock.fireDue(), 0);
+  clock.advance(1);
+  assert.equal(clock.fireDue(), 1);
+  await scheduler.waitForIdle();
+  task = await scheduler.get("pre-external-backoff");
+  assert.equal(task.status, "public");
+  assert.equal(task.nextAttemptAt, null);
+  assert.equal(task.targets[0].attempts, 3);
+  assert.equal(task.targets[0].receipt.postId, "after-safe-retries");
+  assert.equal(calls, 3);
+  assert.deepEqual(events, ["retry_wait", "retry_wait", "public"]);
+});
+
+test("scheduler completion callback receives a persisted terminal failure for durable notification", async (t) => {
+  const events = [];
+  const { clock, scheduler } = await fixture(t, {
+    executeTarget: async () => { throw new Error("platform login expired"); },
+    onEvent: async (task) => events.push({ status: task.status, error: task.targets[0].error }),
+  });
+  await scheduler.schedule({
+    id: "notify-terminal-failure",
+    scheduledAt: "2026-08-27T00:00:00.000Z",
+    expiresAt: "2026-08-27T00:01:00.000Z",
+    targets: [{ id: "xhs" }],
+  });
+  clock.fireDue();
+  await scheduler.waitForIdle();
+  assert.deepEqual(events, [{ status: "needs_attention", error: "platform login expired" }]);
+});
+
+test("retry_wait survives restart and repeats only the target without an external receipt", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "zhitai-publish-retry-restart-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filePath = join(directory, "publish-schedule.json");
+  const clock = fakeClock();
+  const calls = [];
+  let wechatReady = false;
+  const create = () => new PublishScheduler({
+    filePath,
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    retryBaseDelayMs: 1_000,
+    executeTarget: async ({ targetId }) => {
+      calls.push(targetId);
+      if (targetId === "wechat" && !wechatReady) {
+        const error = new Error("account history temporarily unavailable");
+        error.retryableBeforeExternalCall = true;
+        throw error;
+      }
+      return { status: "public", postId: `${targetId}-post` };
+    },
+  });
+  const first = create();
+  await first.init();
+  await first.schedule({
+    id: "retry-restart",
+    scheduledAt: "2026-08-27T00:00:00.000Z",
+    expiresAt: "2026-08-27T00:01:00.000Z",
+    targets: [{ id: "douyin" }, { id: "wechat" }],
+  });
+  clock.fireDue();
+  await first.waitForIdle();
+  assert.equal((await first.get("retry-restart")).status, "retry_wait");
+  assert.deepEqual(calls, ["douyin", "wechat"]);
+  first.stop();
+
+  wechatReady = true;
+  const restarted = create();
+  t.after(() => restarted.stop());
+  await restarted.init();
+  clock.advance(1_000);
+  assert.equal(clock.fireDue(), 1);
+  await restarted.waitForIdle();
+  const task = await restarted.get("retry-restart");
+  assert.equal(task.status, "public");
+  assert.deepEqual(calls, ["douyin", "wechat", "wechat"]);
+  assert.deepEqual(task.targets.map((target) => target.attempts), [1, 2]);
+});
+
+test("a bare CLI timeout is not auto-retried because its external-call phase is ambiguous", async (t) => {
+  let calls = 0;
+  const { clock, scheduler } = await fixture(t, {
+    retryBaseDelayMs: 1_000,
+    executeTarget: async () => {
+      calls += 1;
+      throw new Error("matrixmedia_cli_timeout");
+    },
+  });
+  await scheduler.schedule({
+    id: "ambiguous-timeout",
+    scheduledAt: "2026-08-27T00:00:00.000Z",
+    expiresAt: "2026-08-27T00:01:00.000Z",
+    targets: [{ id: "douyin" }],
+  });
+  clock.fireDue();
+  await scheduler.waitForIdle();
+  const task = await scheduler.get("ambiguous-timeout");
+  assert.equal(task.status, "needs_attention");
+  assert.equal(task.targets[0].status, "failed");
+  assert.equal(task.nextAttemptAt, null);
+  assert.equal(clock.timerCount(), 0);
+  clock.advance(30_000);
+  assert.equal(clock.fireDue(), 0);
+  assert.equal(calls, 1);
+});
+
+test("an external receipt marker overrides a contradictory pre-external retry hint", async (t) => {
+  const { clock, scheduler } = await fixture(t, {
+    retryBaseDelayMs: 1_000,
+    executeTarget: async () => {
+      const error = new Error("receipt persistence failed after platform response");
+      error.beforeExternalCall = true;
+      error.externalReceipt = true;
+      error.status = "failed";
+      throw error;
+    },
+  });
+  await scheduler.schedule({
+    id: "receipt-wins",
+    scheduledAt: "2026-08-27T00:00:00.000Z",
+    expiresAt: "2026-08-27T00:01:00.000Z",
+    targets: [{ id: "douyin" }],
+  });
+  clock.fireDue();
+  await scheduler.waitForIdle();
+  const task = await scheduler.get("receipt-wins");
+  assert.equal(task.status, "needs_attention");
+  assert.equal(task.targets[0].status, "failed");
+  assert.ok(task.targets[0].externalReceiptAt);
+  assert.equal(clock.timerCount(), 0);
+  await assert.rejects(
+    scheduler.retry("receipt-wins"),
+    (error) => error.code === "publish_task_no_retryable_targets",
+  );
+});
+
+test("pre-external retries stop at expiresAt instead of creating a late platform call", async (t) => {
+  let calls = 0;
+  const { clock, scheduler } = await fixture(t, {
+    retryBaseDelayMs: 5_000,
+    executeTarget: async () => {
+      calls += 1;
+      const error = new Error("EPERM");
+      error.beforeExternalCall = true;
+      throw error;
+    },
+  });
+  await scheduler.schedule({
+    id: "retry-window-exhausted",
+    scheduledAt: "2026-08-27T00:00:00.000Z",
+    expiresAt: "2026-08-27T00:00:04.000Z",
+    targets: [{ id: "douyin" }],
+  });
+  clock.fireDue();
+  await scheduler.waitForIdle();
+  const task = await scheduler.get("retry-window-exhausted");
+  assert.equal(task.status, "needs_attention");
+  assert.equal(task.error, "retry_window_exhausted");
+  assert.equal(task.targets[0].status, "failed");
+  assert.equal(task.nextAttemptAt, null);
+  assert.equal(clock.timerCount(), 0);
+  assert.equal(calls, 1);
 });
 
 test("unknown, submitted, public, and draft receipts are never auto-retried after restart", async (t) => {

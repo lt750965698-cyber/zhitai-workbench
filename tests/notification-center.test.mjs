@@ -7,6 +7,66 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { NotificationCenter } from "../local-agent/notification-center.mjs";
 
+function fakeSquarePng(size = 256) {
+  const png = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+  Buffer.from("IHDR").copy(png, 12);
+  png.writeUInt32BE(size, 16);
+  png.writeUInt32BE(size, 20);
+  return png;
+}
+
+test("sensitive login QR uses a private temporary file and never falls back as an ntfy attachment", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-sensitive-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  globalThis.fetch = async (url, options) => {
+    fetchCalls.push({ url: String(url), options });
+    return new Response("{}", { status: 200 });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  let temporaryPath = null;
+  const accepted = new NotificationCenter({
+    dataDir,
+    buildDigest: async () => "摘要",
+    clawbot: {
+      status: async () => ({ ready: true, paired: true, pairedCount: 1 }),
+      sendMedia: async (_title, _message, filePath) => {
+        temporaryPath = filePath;
+        assert.equal((await stat(filePath)).mode & 0o777, 0o600);
+        assert.deepEqual(await readFile(filePath), fakeSquarePng());
+        return { ok: true, accepted: 1 };
+      },
+    },
+  });
+  await accepted.init();
+  const sent = await accepted.sendSensitiveMedia("登录二维码", "请扫码", fakeSquarePng());
+  assert.equal(sent.ok, true);
+  await assert.rejects(stat(temporaryPath), /ENOENT/);
+  assert.equal(fetchCalls.length, 0);
+  assert.doesNotMatch(JSON.stringify(await accepted.deliveries()), /notification-media|base64|\.png/);
+
+  const unavailable = new NotificationCenter({
+    dataDir: await mkdtemp(join(tmpdir(), "zhitai-notify-sensitive-fallback-")),
+    buildDigest: async () => "摘要",
+    clawbot: {
+      status: async () => ({ ready: true, paired: true, pairedCount: 1 }),
+      sendMedia: async () => ({ ok: false, error: "sendMessage ret=-2 errmsg=prepare failed" }),
+    },
+  });
+  t.after(() => rm(unavailable.dataDir, { recursive: true, force: true }));
+  await unavailable.init();
+  await unavailable.createSubscription();
+  const fallback = await unavailable.sendSensitiveMedia("登录二维码", "请扫码", fakeSquarePng());
+  assert.equal(fallback.ok, false);
+  assert.equal(fallback.fallback.ok, true);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(typeof fetchCalls[0].options.body, "string");
+  assert.doesNotMatch(fetchCalls[0].options.body, /data:image|base64|notification-media|\.png/);
+});
+
 test("notification center creates a private-looking topic and records accepted test push", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
@@ -234,7 +294,57 @@ test("accepted blocker stays open, repeats on the blocker cadence, and stops onl
   assert.equal(state.blockers.acknowledgedCount, 0);
 });
 
-test("prepare failed opens a session-refresh cooldown and a newer inbound context clears it", async (t) => {
+test("creative transient exhaustion keeps reminding until the exact job recovers or creative alerts are disabled", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-creative-transient-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  let now = new Date("2026-08-27T00:00:00.000Z");
+  let sendCalls = 0;
+  const center = new NotificationCenter({
+    dataDir,
+    buildDigest: async () => "摘要",
+    clawbot: {
+      status: async () => ({ ready: true, paired: true, pairedCount: 1, reason: null }),
+      send: async () => { sendCalls += 1; return { ok: true, accepted: 1 }; },
+    },
+    now: () => now,
+    blockerReminderDelaysMs: [1_000],
+  });
+  await center.init();
+
+  const firstKey = "creative_transient_exhausted:job-one";
+  await center.send("GPT 原断点需要处理", "请重试原断点", "creative_transient_exhausted", { blockerKey: firstKey });
+  assert.equal((await center.publicState()).blockers.openCount, 1);
+  now = new Date(now.getTime() + 1_000);
+  await center.tick(now);
+  assert.equal(sendCalls, 2);
+
+  const resolved = await center.resolveBlockersByKeys([firstKey], "creative_job_recovered");
+  assert.equal(resolved.changed, 1);
+  assert.equal((await center.publicState()).blockers.openCount, 0);
+  now = new Date(now.getTime() + 5_000);
+  await center.tick(now);
+  assert.equal(sendCalls, 2);
+
+  await center.send("GPT 原断点需要处理", "请重试另一个原断点", "creative_transient_exhausted", {
+    blockerKey: "creative_transient_exhausted:job-two",
+  });
+  assert.equal((await center.publicState()).blockers.openCount, 1);
+  await center.update({ events: { creative: false } });
+  const disabled = await center.publicState();
+  assert.equal(disabled.blockers.openCount, 0);
+  assert.equal(disabled.blockers.acknowledgedCount, 1);
+  const disabledSend = await center.send(
+    "GPT 原断点需要处理",
+    "关闭创作通知后不应发送",
+    "creative_transient_exhausted",
+    { blockerKey: "creative_transient_exhausted:job-three" },
+  );
+  assert.equal(disabledSend.disabled, true);
+  assert.equal(sendCalls, 3);
+  assert.equal((await center.publicState()).blockers.openCount, 0);
+});
+
+test("prepare failed opens a session-refresh cooldown and an explicitly verified inbound clears it", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-session-refresh-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
   let now = new Date("2026-08-27T00:00:00.000Z");
@@ -274,6 +384,7 @@ test("prepare failed opens a session-refresh cooldown and a newer inbound contex
 
   now = new Date(now.getTime() + 1_000);
   contextUpdatedAt = now.toISOString();
+  await center.noteClawbotInbound({ contextUpdatedAt });
   const recovered = await center.send("三", "三", "ordinary_three");
   assert.equal(recovered.ok, true);
   assert.equal(sendCalls, 2);
@@ -283,7 +394,7 @@ test("prepare failed opens a session-refresh cooldown and a newer inbound contex
   assert.equal(state.blockers.openCount, 0);
   const recoveredBlocker = (await center.blockers()).find((item) => item.key === "blocker:clawbot-session-refresh");
   assert.equal(recoveredBlocker.status, "resolved");
-  assert.equal(recoveredBlocker.closeReason, "clawbot_delivery_recovered");
+  assert.equal(recoveredBlocker.closeReason, "clawbot_context_refreshed");
 });
 
 test("session-refresh cooldown escalates globally from 2h to 8h to daily-equivalent stages", async (t) => {
@@ -339,9 +450,180 @@ test("new inbound context resets session-refresh escalation before another prepa
 
   now = new Date(now.getTime() + 200);
   contextUpdatedAt = now.toISOString();
+  await center.noteClawbotInbound({ contextUpdatedAt });
   await center.send("C", "C", "c");
   assert.equal(center.deliveryHealth.clawbot.sessionFailureStage, 1);
   assert.equal(Date.parse(center.deliveryHealth.clawbot.cooldownUntil) - now.getTime(), 100);
+});
+
+test("background mtime polling cannot clear ClawBot cooldown without bound inbound proof", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-session-watch-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  let now = new Date("2026-08-29T00:00:00.000Z");
+  let contextUpdatedAt = "2026-08-28T23:59:59.000Z";
+  let sendCalls = 0;
+  const clawbot = {
+    status: async () => ({ ready: true, paired: true, pairedCount: 1, contextUpdatedAt, reason: null }),
+    send: async () => {
+      sendCalls += 1;
+      return { ok: false, error: "sendMessage ret=-2 errmsg=prepare failed" };
+    },
+  };
+  const center = new NotificationCenter({
+    dataDir,
+    buildDigest: async () => "摘要",
+    clawbot,
+    now: () => now,
+    sessionRetryDelaysMs: [60_000],
+  });
+  await center.init();
+  await center.send("A", "A", "a");
+  assert.equal(center.deliveryHealth.clawbot.deliveryState, "session_refresh_required");
+  assert.equal(sendCalls, 1);
+
+  now = new Date(now.getTime() + 1_000);
+  contextUpdatedAt = now.toISOString();
+  await center.tick(now);
+
+  assert.equal(center.deliveryHealth.clawbot.deliveryState, "session_refresh_required");
+  assert.notEqual(center.deliveryHealth.clawbot.cooldownUntil, null);
+  assert.equal(center.deliveryHealth.clawbot.sessionFailureStage, 1);
+  assert.equal(sendCalls, 1);
+
+  await center.noteClawbotInbound({ contextUpdatedAt });
+  assert.equal(center.deliveryHealth.clawbot.deliveryState, "unverified");
+  assert.equal(center.deliveryHealth.clawbot.cooldownUntil, null);
+  assert.equal(center.deliveryHealth.clawbot.sessionFailureStage, 0);
+  assert.equal(center.deliveryHealth.clawbot.contextUpdatedAt, contextUpdatedAt);
+});
+
+test("ClawBot watcher lifecycle resets only session health and preserves business blockers", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-context-lifecycle-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  let now = new Date("2026-08-29T00:00:00.000Z");
+  let watcherListener = null;
+  let disposeCalls = 0;
+  const clawbot = {
+    status: async () => ({ ready: true, paired: true, pairedCount: 1, contextUpdatedAt: null, reason: null }),
+    send: async () => ({ ok: true, accepted: 1 }),
+    watchContextTokens: (listener) => {
+      watcherListener = listener;
+      return () => { disposeCalls += 1; };
+    },
+  };
+  const center = new NotificationCenter({ dataDir, buildDigest: async () => "摘要", clawbot, now: () => now });
+  await center.init();
+  await center.send("运行条件需处理", "请登录发布平台", "runtime_conditions");
+  center.deliveryHealth.clawbot = {
+    ...center.deliveryHealth.clawbot,
+    deliveryState: "session_refresh_required",
+    sessionFailureStage: 2,
+    lastFailureAt: now.toISOString(),
+    lastError: "session_refresh_required",
+    cooldownUntil: new Date(now.getTime() + 60_000).toISOString(),
+  };
+  await center.persistDeliveryHealth();
+  await center.send("ClawBot 会话需恢复", "请刷新会话", "notification_channel", {
+    blockerKey: "blocker:clawbot-session-refresh",
+  });
+
+  center.start();
+  assert.equal(typeof watcherListener, "function");
+  now = new Date(now.getTime() + 1_000);
+  watcherListener({ contextUpdatedAt: now.toISOString() });
+  await center.flush();
+
+  const state = await center.publicState();
+  assert.equal(state.clawbot.deliveryState, "unverified");
+  assert.equal(state.clawbot.cooldownUntil, null);
+  assert.equal(center.deliveryHealth.clawbot.sessionFailureStage, 0);
+  assert.equal(state.blockers.openCount, 1);
+  assert.equal(state.blockers.items[0].kind, "runtime_conditions");
+  const transportBlocker = (await center.blockers()).find((item) => item.key === "blocker:clawbot-session-refresh");
+  assert.equal(transportBlocker.status, "resolved");
+  assert.equal(transportBlocker.closeReason, "clawbot_context_refreshed");
+  await center.stop();
+  assert.equal(disposeCalls, 1);
+});
+
+test("emergency ntfy bypasses ClawBot and ordinary notification storage with only fixed text", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-emergency-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const requests = [];
+  let clawbotSends = 0;
+  const center = new NotificationCenter({
+    dataDir,
+    buildDigest: async () => "摘要",
+    clawbot: {
+      status: async () => ({ ready: true, paired: true, pairedCount: 1 }),
+      send: async () => { clawbotSends += 1; return { ok: true, accepted: 1 }; },
+    },
+    emergencyFetch: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true };
+    },
+  });
+  await center.init();
+  await center.update({
+    ntfy: {
+      enabled: true,
+      server: "https://notify.example",
+      topic: "safe_topic_123",
+      accessToken: "test-secret-token",
+    },
+  });
+
+  assert.deepEqual(
+    await center.sendEmergencyNtfy("织台备用告警", "保活状态不可读"),
+    { ok: true, code: "accepted" },
+  );
+  assert.equal(clawbotSends, 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "https://notify.example/safe_topic_123");
+  assert.equal(requests[0].options.body, "保活状态不可读");
+  assert.equal(JSON.stringify(await center.deliveries()).includes("保活状态不可读"), false);
+});
+
+test("ClawBot outbound receipt marks ready only on explicit success and never closes business blockers", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "zhitai-notify-outbound-receipt-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const now = new Date("2026-08-29T00:00:00.000Z");
+  const center = new NotificationCenter({
+    dataDir,
+    buildDigest: async () => "摘要",
+    clawbot: {
+      status: async () => ({ ready: true, paired: true, pairedCount: 1, reason: null }),
+      send: async () => ({ ok: true, accepted: 1 }),
+    },
+    now: () => now,
+  });
+  await center.init();
+  await center.send("运行条件需处理", "请登录发布平台", "runtime_conditions");
+
+  await center.noteClawbotOutboundResult({
+    success: false,
+    errorCode: "session_refresh_required",
+    senderId: "must-not-persist",
+    content: "must-not-persist",
+    token: "must-not-persist",
+  });
+  let state = await center.publicState();
+  assert.equal(state.clawbot.ready, false);
+  assert.equal(state.clawbot.deliveryState, "session_refresh_required");
+  assert.equal(state.blockers.openCount, 1);
+
+  await center.noteClawbotOutboundResult({ success: "true", errorCode: "not-allowed" });
+  state = await center.publicState();
+  assert.equal(state.clawbot.ready, false);
+  assert.equal(state.clawbot.deliveryState, "delivery_failed");
+
+  await center.noteClawbotOutboundResult({ success: true, errorCode: "session_refresh_required" });
+  state = await center.publicState();
+  assert.equal(state.clawbot.ready, true);
+  assert.equal(state.clawbot.deliveryState, "ready");
+  assert.equal(state.blockers.openCount, 1);
+  const persisted = await readFile(join(dataDir, "notification-delivery-health.json"), "utf8");
+  assert.doesNotMatch(persisted, /must-not-persist/);
 });
 
 test("corrupt outbox is preserved and degrades notification storage instead of being overwritten", async (t) => {

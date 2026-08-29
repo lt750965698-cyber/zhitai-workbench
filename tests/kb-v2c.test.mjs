@@ -92,7 +92,14 @@ before(async () => {
   await writeFile(join(ROOT, "config.json"), JSON.stringify(config));
   server = spawn(process.execPath, [AGENT_ENTRY], {
     cwd: repoRoot,
-    env: { ...process.env, ZHITAI_CONFIG_PATH: join(ROOT, "config.json"), ZHITAI_DATA_DIR: DATA_DIR, ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH },
+    env: {
+      ...process.env,
+      ZHITAI_CONFIG_PATH: join(ROOT, "config.json"),
+      ZHITAI_DATA_DIR: DATA_DIR,
+      ZHITAI_ENRICH_SCRIPT: MOCK_ENRICH,
+      ZHITAI_DISABLE_PUBLISHER_LOGIN_RECOVERY: "1",
+      ZHITAI_MATRIX_PARTITIONS_DIR: join(DATA_DIR, "matrix-partitions"),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.unref();

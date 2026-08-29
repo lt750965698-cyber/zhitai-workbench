@@ -12,11 +12,23 @@ const HELP = [
   "备用直接发送链接：自动识别并下载入知识库；链接后文字会保存为你的备注/要求",
   "状态：织台与各后台状态",
   "生成 1：准备第 1 条素材（需二次确认）",
-  "选择 2：批准今日第 2 条成片创建多平台草稿待办（兼容“发布 2”），不会公开发布",
-  "改进 2 镜头太快：保存意见并为第 2 条创建返工任务",
+  "选择 2：查询今日第 2 条成片的织台自审、返工或发布准备状态（兼容“发布 2”）",
+  "改进 2 镜头太快：可选补充意见；织台会保存意见并创建返工任务",
   "暂停生成 / 继续生成：控制生成队列",
   "帮助：再次显示本说明",
 ].join("\n");
+
+// 电脑微信只发送这一句固定纯文字来刷新 ClawBot 会话。它不承载业务语义，
+// 也不包含账号、令牌或其它认证信息；必须保持精确匹配，避免普通消息被误判。
+const AUTOMATED_KEEPALIVE_TEXT = "织台连接保活";
+// Android ADB 在未安装第三方中文输入法时只能可靠注入 ASCII。这个唯一别名
+// 与中文保活词完全等价，不接受参数，也不扩展为任意消息发送能力。
+const AUTOMATED_KEEPALIVE_ASCII = "ZT_KEEPALIVE";
+const AUTOMATED_KEEPALIVE_ACK_TEXT = "已保活";
+
+function isAutomatedKeepalive(value) {
+  return value === AUTOMATED_KEEPALIVE_TEXT || value === AUTOMATED_KEEPALIVE_ASCII;
+}
 
 function cleanText(value, limit = 500) {
   return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -110,12 +122,14 @@ export class RemoteController {
     const authorizedSender = this.settings.allowedSenders.includes(sender);
     // 遥控命令即使被关闭，已配对白名单用户的私聊回复仍能确认“我已看到”，
     // 从而停止运营阻塞提醒；未配对发送者始终不能关闭提醒。
-    if (!this.settings.enabled) {
-      return { ok: false, text: "织台手机遥控器当前已停用。", code: "remote_disabled", authorizedSender };
-    }
     if (!authorizedSender) {
       await this.record(sender, accountId, command || "EMPTY", "rejected", "发送者不在白名单");
       return { ok: false, text: "这个微信账号未与织台绑定，命令未执行。", code: "sender_not_allowed", authorizedSender: false };
+    }
+    // 保活不是业务遥控命令；即使业务遥控被停用，白名单私聊也必须能刷新会话。
+    // 其它普通白名单回复仍按旧行为返回 remote_disabled，并由服务端确认 blocker。
+    if (!this.settings.enabled && !isAutomatedKeepalive(command)) {
+      return { ok: false, text: "织台手机遥控器当前已停用。", code: "remote_disabled", authorizedSender: true };
     }
 
     let result;
@@ -125,11 +139,26 @@ export class RemoteController {
       return { ...result, authorizedSender: true };
     } catch (error) {
       await this.record(sender, accountId, command || "EMPTY", "failed", cleanText(error?.message || error, 160));
-      return { ok: false, text: "织台执行命令失败，请打开织台消息中心查看记录。", code: "command_failed", authorizedSender: true };
+      return {
+        ok: false,
+        text: "织台执行命令失败，请打开织台消息中心查看记录。",
+        code: "command_failed",
+        authorizedSender: true,
+        ...(isAutomatedKeepalive(command) ? { automatedKeepalive: true } : {}),
+      };
     }
   }
 
   async execute(command, sender) {
+    if (isAutomatedKeepalive(command)) {
+      return {
+        ok: true,
+        text: AUTOMATED_KEEPALIVE_ACK_TEXT,
+        code: "automated_keepalive",
+        audit: "automated_keepalive",
+        automatedKeepalive: true,
+      };
+    }
     if (/https?:\/\//i.test(command)) {
       if (typeof this.ingestLink !== "function") return { ok: false, text: "织台链接收件功能尚未就绪。", code: "ingest_unavailable" };
       const url = command.match(/https?:\/\/[^\s<>"']+/i)?.[0]?.replace(/[，。；、）》】\])}]+$/u, "") || "";
@@ -222,4 +251,13 @@ export class RemoteController {
   }
 }
 
-export { HELP as REMOTE_HELP_TEXT };
+export function shouldAcknowledgeRemoteUserReply(result) {
+  return result?.authorizedSender === true && result?.automatedKeepalive !== true;
+}
+
+export {
+  HELP as REMOTE_HELP_TEXT,
+  AUTOMATED_KEEPALIVE_TEXT as REMOTE_KEEPALIVE_TEXT,
+  AUTOMATED_KEEPALIVE_ASCII as REMOTE_KEEPALIVE_ASCII,
+  AUTOMATED_KEEPALIVE_ACK_TEXT as REMOTE_KEEPALIVE_ACK_TEXT,
+};

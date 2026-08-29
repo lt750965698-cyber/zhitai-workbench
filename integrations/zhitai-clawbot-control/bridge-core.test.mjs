@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createBeforeDispatchHandler } from "./bridge-core.mjs";
+import {
+  createBeforeDispatchHandler,
+  createMessageSentHandler,
+  sanitizedMessageSentResult,
+} from "./bridge-core.mjs";
 
 test("routes private Weixin commands to deterministic controller", async () => {
   const calls = [];
@@ -10,6 +14,21 @@ test("routes private Weixin commands to deterministic controller", async () => {
   assert.equal(result.handled, true);
   assert.equal(result.text, "织台状态：在线");
   assert.deepEqual(calls, [{ text: "状态", senderId: "user-1", accountId: "account-1", isGroup: false }]);
+});
+
+test("automated keepalive is handled without an outbound reply or notification sound", async () => {
+  const handler = createBeforeDispatchHandler({
+    execute: async () => ({ automatedKeepalive: true, text: "已保活" }),
+  });
+  const result = await handler({
+    Body: "ZT_KEEPALIVE",
+    From: "user-1",
+    AccountId: "account-1",
+    ChatType: "direct",
+    OriginatingChannel: "openclaw-weixin",
+  }, {});
+  assert.deepEqual(result, { handled: true });
+  assert.equal(Object.hasOwn(result, "text"), false);
 });
 
 test("uses a strict direct-Weixin conversation fallback when canonical senderId is absent", async () => {
@@ -87,4 +106,51 @@ test("routes links to the deterministic ingest controller and blocks group contr
 test("ignores other channels", async () => {
   const handler = createBeforeDispatchHandler({ execute: async () => ({ text: "no" }) });
   assert.equal(await handler({ Body: "状态", OriginatingChannel: "telegram" }, {}), undefined);
+});
+
+test("message_sent reports only a sanitized outbound result for Weixin", async () => {
+  const reports = [];
+  const handler = createMessageSentHandler({ report: async (value) => { reports.push(value); } });
+  const event = {
+    event: {
+      canonical: true,
+      context: {
+        to: "private-user@im.wechat",
+        content: "private message content",
+        success: false,
+        error: "sendMessage ret=-2 errmsg=prepare failed token=private-token",
+      },
+    },
+  };
+  const context = {
+    pluginContext: {
+      canonical: true,
+      context: {
+        channelId: "openclaw-weixin",
+        accountId: "private-account",
+        conversationId: "private-user@im.wechat",
+      },
+    },
+  };
+
+  await handler(event, context);
+  assert.deepEqual(reports, [{ success: false, errorCode: "session_refresh_required" }]);
+  assert.deepEqual(Object.keys(reports[0]).sort(), ["errorCode", "success"]);
+  assert.doesNotMatch(JSON.stringify(reports), /private|token|content|account|conversation/i);
+});
+
+test("message_sent ignores other channels and requires explicit boolean success", async () => {
+  const reports = [];
+  const handler = createMessageSentHandler({ report: async (value) => { reports.push(value); } });
+  await handler({ success: true, content: "telegram" }, { channelId: "telegram" });
+  await handler({ success: "true", error: "network failed", content: "hidden" }, { channelId: "openclaw-weixin" });
+  await handler({ success: true, content: "hidden" }, { channelId: "openclaw-weixin" });
+  assert.deepEqual(reports, [
+    { success: false, errorCode: "network_unavailable" },
+    { success: true, errorCode: null },
+  ]);
+  assert.deepEqual(sanitizedMessageSentResult({ success: false, error: "unknown private detail" }), {
+    success: false,
+    errorCode: "delivery_failed",
+  });
 });

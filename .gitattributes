@@ -5,6 +5,7 @@
 *.zsh text eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+*.patch text eol=lf -whitespace
 
 *.avif binary
 *.gif binary

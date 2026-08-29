@@ -114,7 +114,16 @@ export function originalChannelsVideoUrl(url) {
 
 export async function getChannelsCardEngineStatus(options = {}) {
   const baseUrl = loopbackBase(options.baseUrl || process.env.ZHITAI_CHANNELS_CARD_URL || DEFAULT_BASE_URL);
-  const body = await getJson(`${baseUrl}/api/channels/status`, Number(options.timeoutMs || 3_000));
+  let body;
+  try {
+    body = await getJson(`${baseUrl}/api/channels/status`, Number(options.timeoutMs || 3_000));
+  } catch (error) {
+    const code = String(error?.message || error || "");
+    if (/^channels_card_(?:invalid_response|profile_failed)_/.test(code)) {
+      throw new Error("channels_card_engine_starting");
+    }
+    throw error;
+  }
   return { online: true, available: body?.data?.available === true };
 }
 
