@@ -226,11 +226,11 @@
 
   /** 终态集合：只有这些状态才停止轮询 */
   function isTerminalStatus(s) {
-    return ["success", "duplicate", "linked", "failed", "partial", "orphaned"].indexOf(s) !== -1;
+    return ["success", "duplicate", "linked", "completed", "failed", "partial", "orphaned", "needs_attention", "cancelled"].indexOf(s) !== -1;
   }
   /** 只有成功系才可写 REPORTED_KEY */
   function isReportedSuccess(s) {
-    return ["success", "duplicate", "linked"].indexOf(s) !== -1;
+    return ["success", "duplicate", "linked", "completed"].indexOf(s) !== -1;
   }
 
   /** 有界轮询到终态：fetchStatus(cb) 每次返回 {status, itemId} 或 null（网络错）；
@@ -270,6 +270,26 @@
     GM_setValue(CARD_REPORTED_KEY, done.slice(-2000));
   }
 
+  function fetchTaskStatus(taskId, cb) {
+    GM_xmlhttpRequest({
+      method: "GET",
+      url: API_BASE + "/api/v1/tasks",
+      timeout: 10000,
+      onload: function (res) {
+        var body = null;
+        try { body = JSON.parse(res.responseText || "{}"); } catch (e) { /* ignore */ }
+        var tasks = body && Array.isArray(body.tasks) ? body.tasks : [];
+        var task = null;
+        for (var i = 0; i < tasks.length; i++) {
+          if (tasks[i] && tasks[i].id === taskId) { task = tasks[i]; break; }
+        }
+        cb(task ? { status: task.status, itemId: task.id } : null);
+      },
+      onerror: function () { cb(null); },
+      ontimeout: function () { cb(null); },
+    });
+  }
+
   function submitCardCandidate(card) {
     var flightKey = "card:" + card.key;
     if (inFlight[flightKey]) return;
@@ -289,8 +309,24 @@
       onload: function (res) {
         delete inFlight[flightKey];
         if (res.status === 202) {
-          rememberCardReported(card.key);
-          lastResult = "视频号卡片已交给织台下载";
+          var body = null;
+          try { body = JSON.parse(res.responseText || "{}"); } catch (e) { /* ignore */ }
+          var taskId = body && body.task && body.task.id;
+          if (!taskId) {
+            lastResult = "卡片已受理，但缺少任务编号，等待重试";
+            return;
+          }
+          lastResult = "视频号卡片已受理，等待入库终态";
+          pollUntilTerminal(function (cb) { fetchTaskStatus(taskId, cb); }, {}).run(function (result) {
+            if (result.terminal && isReportedSuccess(result.status)) {
+              rememberCardReported(card.key);
+              lastResult = "视频号卡片已完成入库";
+            } else if (result.terminal) {
+              lastResult = "视频号卡片未入库（" + result.status + "），可重试";
+            } else {
+              lastResult = "视频号卡片等待终态超时，可重试";
+            }
+          });
         } else {
           lastResult = "卡片提交失败（" + res.status + "）";
         }

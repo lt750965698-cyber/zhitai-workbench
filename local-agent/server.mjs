@@ -45,6 +45,7 @@ import { createPlatformReceipts, persistPlatformReceipts, redactPlatformReceiptT
 import * as xhsPublisher from "./xiaohongshu-publisher.mjs";
 import * as wechatOfficial from "./wechat-official-publisher.mjs";
 import { CreativeQueue } from "./creative-queue.mjs";
+import { assertLifecycleTransition, publishFailureDisposition } from "./content-lifecycle.mjs";
 import { AnalysisQueue } from "./analysis-queue.mjs";
 import { buildRuntimeConditions, normalizeCreativeConditionReport } from "./runtime-conditions.mjs";
 import { assessGenerationReadiness } from "./seedance-workflow.mjs";
@@ -1382,12 +1383,18 @@ async function waitForClawbotContextRefresh(startedAt, timeoutMs = 25_000) {
   }
 }
 
+const openInterpreterTargetChat = String(process.env.ZHITAI_OPEN_INTERPRETER_TARGET_CHAT || "").trim();
+const openInterpreterKeepaliveEnabled = process.platform === "darwin"
+  && openInterpreterTargetChat.length > 0
+  && openInterpreterTargetChat.length <= 80
+  && !/[\r\n\0]/u.test(openInterpreterTargetChat);
+
 const KEEPALIVE_FALLBACK_TEXT = Object.freeze({
   driver_unavailable: "Open Interpreter 控制服务当前不可用。请保持 Interpreter 应用运行；织台不会改用其他电脑控制工具，并会自动重试。",
   permission_denied: "Open Interpreter 缺少 macOS 辅助功能权限。请在系统设置中为 Interpreter/Cua Driver 开启辅助功能后重新启动 Interpreter。",
   auth_required: "电脑微信当前需要重新登录或扫码确认。完成一次微信登录后，织台会自动只读校验并恢复 ClawBot 保活。",
-  target_not_ready: "Open Interpreter 尚未在电脑微信中唯一识别“微信 ClawBot AI”私聊及输入框，保活消息未发送；登录并打开该私聊后会自动重试。",
-  target_ambiguous: "电脑微信出现多个目标联系人、窗口或输入框候选，织台已停止操作以避免误发；请只保留一个“微信 ClawBot AI”私聊窗口。",
+  target_not_ready: "Open Interpreter 尚未在电脑微信中唯一识别所配置的 ClawBot 私聊及输入框，保活消息未发送；登录并打开该私聊后会自动重试。",
+  target_ambiguous: "电脑微信出现多个目标联系人、窗口或输入框候选，织台已停止操作以避免误发；请只保留一个所配置的 ClawBot 私聊窗口。",
   ax_incomplete: "电脑微信没有向 Open Interpreter 暴露足够的可访问性元素，织台未使用坐标盲点并会继续自动核验。",
   state_changed: "电脑微信界面在保活校验期间发生变化，织台已停止本次发送以避免发错联系人，并会自动重试。",
   send_uncertain: "固定保活消息的发送结果无法确认，织台未将本次操作记为成功，并会通过 ClawBot 状态回读继续核验。",
@@ -1401,11 +1408,11 @@ const KEEPALIVE_FALLBACK_TEXT = Object.freeze({
 });
 
 const KEEPALIVE_TERMINAL_FALLBACK_TEXT = Object.freeze({
-  draft_present: "“微信 ClawBot AI”输入框已有未发送文字。为避免覆盖或误发，自动保活已持久冻结，冷却到期或织台重启都不会重发。请打开该私聊处理输入框文字并发送一条消息；检测到明确会话刷新后自动解冻。",
-  draft_cleanup_unconfirmed: "织台无法确认保活文字是否仍留在“微信 ClawBot AI”输入框，已持久冻结自动重试以避免重复发送。请检查该私聊的输入框和最后一条消息，处理后发送一条消息刷新会话。",
-  send_uncertain: "固定保活消息的发送结果无法确认，已持久冻结自动重试，冷却到期或织台重启也不会重发。请检查“微信 ClawBot AI”的最后一条消息并发送一条新消息；明确会话刷新后自动解冻。",
-  context_not_refreshed: "固定保活消息已提交，但 ClawBot 会话未在限定时间刷新。织台已持久冻结自动重发；请在“微信 ClawBot AI”发送一条新消息，明确会话刷新后自动解冻。",
-  needs_user: "ClawBot 保活进入需要人工处理的安全终态，已持久冻结自动重试。请检查“微信 ClawBot AI”私聊并发送一条新消息，明确会话刷新后自动解冻。",
+  draft_present: "所配置的 ClawBot 私聊输入框已有未发送文字。为避免覆盖或误发，自动保活已持久冻结，冷却到期或织台重启都不会重发。请处理输入框文字并发送一条消息；检测到明确会话刷新后自动解冻。",
+  draft_cleanup_unconfirmed: "织台无法确认保活文字是否仍留在所配置私聊的输入框，已持久冻结自动重试以避免重复发送。请检查输入框和最后一条消息，处理后发送一条消息刷新会话。",
+  send_uncertain: "固定保活消息的发送结果无法确认，已持久冻结自动重试，冷却到期或织台重启也不会重发。请检查所配置私聊的最后一条消息并发送一条新消息；明确会话刷新后自动解冻。",
+  context_not_refreshed: "固定保活消息已提交，但 ClawBot 会话未在限定时间刷新。织台已持久冻结自动重发；请在所配置私聊发送一条新消息，明确会话刷新后自动解冻。",
+  needs_user: "ClawBot 保活进入需要人工处理的安全终态，已持久冻结自动重试。请检查所配置的 ClawBot 私聊并发送一条新消息，明确会话刷新后自动解冻。",
 });
 
 clawbotKeepaliveSupervisor = createClawbotKeepaliveSupervisor({
@@ -1426,7 +1433,7 @@ clawbotKeepaliveSupervisor = createClawbotKeepaliveSupervisor({
       targetFingerprint: selected.targetFingerprint,
       contextFingerprint: selected.contextFingerprint,
     };
-    const result = await runOpenInterpreterKeepalive();
+    const result = await runOpenInterpreterKeepalive({ targetChat: openInterpreterTargetChat });
     if (result.ok) {
       void recordEvent("info", "CLAWBOT_KEEPALIVE", "Open Interpreter 已向唯一验证的 ClawBot 私聊提交固定保活消息，正在回读会话状态").catch(() => {});
       return { ok: true, code: "keepalive_sent" };
@@ -2178,19 +2185,30 @@ const server = createServer(async (request, response) => {
         return;
       }
       let persistedOutput = null;
+      let job;
       if (action === "advance" && String(json?.step || "") === "complete") {
-        const current = (await creativeQueue.list()).find((item) => item.id === jobId);
-        if (!current) throw httpError(404, "creative_job_not_found");
         const { persistZhitaiGeneration } = await import("./kb.mjs");
-        const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
-        try { persistedOutput = await persistZhitaiGeneration(db, current.assetId, { jobId, subject: current.title }); }
-        finally { db.close(); }
-        if (!persistedOutput?.ok) throw httpError(persistedOutput?.status || 400, `creative_output_persist_failed：${persistedOutput?.error || "unknown"}`);
+        try {
+          const completion = await creativeQueue.completeWithPersistence(jobId, async (current) => {
+            const db = openKbDb(join(dataDir, "kb.sqlite"), { migrateSchema: false });
+            try { persistedOutput = await persistZhitaiGeneration(db, current.assetId, { jobId, subject: current.title }); }
+            finally { db.close(); }
+            if (!persistedOutput?.ok) throw httpError(persistedOutput?.status || 400, `creative_output_persist_failed：${persistedOutput?.error || "unknown"}`);
+            return { ...persistedOutput, generationId: persistedOutput.id, mediaUrl: persistedOutput.mediaUrl };
+          });
+          job = completion.job;
+          persistedOutput = completion.output;
+        } catch (error) {
+          if (error?.message === "creative_job_not_found") throw httpError(404, error.message);
+          if (error?.message === "invalid_creative_transition") throw httpError(409, error.message);
+          throw error;
+        }
+      } else {
+        job = action === "pause" ? await creativeQueue.pause(jobId)
+          : action === "cancel" ? await creativeQueue.cancel(jobId)
+            : action === "advance" ? await creativeQueue.advance(jobId, String(json?.step || ""))
+              : await creativeQueue.resume(jobId);
       }
-      const job = action === "pause" ? await creativeQueue.pause(jobId)
-        : action === "cancel" ? await creativeQueue.cancel(jobId)
-          : action === "advance" ? await creativeQueue.advance(jobId, String(json?.step || ""), persistedOutput ? { generationId: persistedOutput.id, mediaUrl: persistedOutput.mediaUrl } : null)
-            : await creativeQueue.resume(jobId);
       if (["resume", "retry", "cancel", "advance"].includes(action)
         && job && !["failed", "needs_attention", "transient_wait"].includes(job.status)) {
         await resolveCreativeTransientBlocker(
@@ -3345,13 +3363,20 @@ const server = createServer(async (request, response) => {
           sendJson(response, 202, {
             ok: true,
             scheduled: true,
+            businessSuccess: false,
+            requiresReadback: true,
             task: publicPublisherSchedule(task),
             results: { total: task.targets.length, detail: { status: "scheduled" } },
           }, request);
           return;
         }
         const results = await executeMatrixPublish(withoutPublishTime(json));
-        sendJson(response, results.submitted === false ? 207 : 200, { ok: results.submitted !== false, results }, request);
+        sendJson(response, results.submitted === false ? 207 : 200, {
+          ok: results.submitted !== false,
+          businessSuccess: results.businessSuccess === true,
+          requiresReadback: results.requiresReadback !== false,
+          results,
+        }, request);
         return;
       }
       const task = await createPublishTask(json, request);
@@ -3386,7 +3411,7 @@ server.listen(config.port, config.host, async () => {
   publisherSchedulerInit = publisherScheduler.init();
   // 只有成功占用监听端口的实例才启动通知轮询，避免双启动并发投递同一 outbox。
   notificationCenter.start();
-  clawbotKeepaliveSupervisor.start();
+  if (openInterpreterKeepaliveEnabled) clawbotKeepaliveSupervisor.start();
   // 账号失效恢复由监听成功的唯一实例持有；服务重启后从私有账本继续，
   // 不依赖用户重新打开发布页。
   setTimeout(() => void reconcilePublisherLogins().catch((error) => recordEvent(
@@ -4795,13 +4820,25 @@ async function executeMatrixPublish(json, preparationOptions = {}) {
         message: "publisher_response_received",
       })),
     });
+    // 适配器的即时响应只是候选回执；即便其中出现 published/public，仍需
+    // 独立的平台历史或公开页回读后，才能把业务状态提升为 public。
+    const businessSuccess = false;
+    const uncertain = results.some((row) => ["unknown", "needs_reconciliation"].includes(String(row?.state || row?.status || "")));
+    const hasFailure = results.some((row) => row?.success === false || row?.state === "failed");
+    const wrongOutcome = !prepared.payload.draft
+      && results.some((row) => ["draft", "platform_draft"].includes(String(row?.state || row?.status || "")));
+    const lifecycleStatus = uncertain
+      ? "needs_reconciliation"
+      : hasFailure || wrongOutcome ? "needs_attention" : "submitted_unverified";
     await recordEvent("info", "PUBLISH", `MatrixMedia 立即发布提交：${prepared.payload.platforms.length} 平台（${immediate.videoId}${immediate.useLatestRemake === true ? "，生成成片" : "，原素材"}）`);
     return {
       submitted: body?.success !== false,
+      businessSuccess,
+      requiresReadback: true,
       results,
       total: typeof body?.total === "number" ? body.total : prepared.payload.platforms.length,
       detail: {
-        status: body?.success === false ? "partial_failed" : "submitted",
+        status: lifecycleStatus,
         message: body?.message,
         quality: prepared.publishQuality,
         receiptPersistence,
@@ -5600,16 +5637,29 @@ async function deactivateLegacyScheduledTasks() {
   const changed = await mutateTasks((tasks) => {
     let count = 0;
     for (const task of tasks) {
-      if (task.type !== "publish" || task.status !== "scheduled") continue;
-      task.status = "needs_attention";
-      task.errorCode = "legacy_scheduler_inactive";
+      if (task.type !== "publish") continue;
+      const previousStatus = task.status;
+      if (["running", "submitting"].includes(previousStatus)) {
+        task.status = "needs_reconciliation";
+        task.progress = Math.min(90, Number(task.progress) || 0);
+        task.errorCode = "submission_interrupted_outcome_unknown";
+      } else if (previousStatus === "submitted") {
+        task.status = "submitted_unverified";
+        task.progress = Math.min(90, Number(task.progress) || 90);
+      } else if (previousStatus === "scheduled") {
+        task.status = "needs_attention";
+        task.errorCode = "legacy_scheduler_inactive";
+      } else {
+        continue;
+      }
+      assertLifecycleTransition("publish_task", previousStatus, task.status);
       task.updatedAt = new Date().toISOString();
       count += 1;
     }
     return count;
   });
   if (changed) {
-    await recordEvent("warning", "PUBLISH", `${changed} 条旧排期缺少精确账号与完整预检，已停止自动执行`);
+    await recordEvent("warning", "PUBLISH", `${changed} 条旧发布任务已按生命周期证据安全收敛，未自动重发`);
   }
 }
 
@@ -5676,21 +5726,24 @@ async function runPublishTask(task) {
       }
       publisherStarted = platforms.length > 0;
       result = publisherStarted
-        ? await matrix.publishWithReceipts({
-          payload: {
-            platforms,
-            file: task.assetPath,
-            title: task.title,
-            draft: task.mode !== "publish",
-          },
-          receiptStore: publisherReceiptStore,
-          content: {
-            id: String(task.assetId || task.id || ""),
-            title: task.title,
-            mediaSha256: task.assetSha256,
-          },
-          jobId: task.id,
-        })
+        ? await (async () => {
+          await updateTask(task.id, { status: "submitting", progress: 50 });
+          return matrix.publishWithReceipts({
+            payload: {
+              platforms,
+              file: task.assetPath,
+              title: task.title,
+              draft: task.mode !== "publish",
+            },
+            receiptStore: publisherReceiptStore,
+            content: {
+              id: String(task.assetId || task.id || ""),
+              title: task.title,
+              mediaSha256: task.assetSha256,
+            },
+            jobId: task.id,
+          });
+        })()
         : { success: false, total: 0, results: [] };
       publisherReturned = publisherStarted;
       await recordPlatformReceipts({
@@ -5724,6 +5777,7 @@ async function runPublishTask(task) {
     } else if (type === "command") {
       const jobFile = join(publishDir, `${task.id}.json`);
       const args = (adapter.args || []).map((value) => String(value).replace(/\{jobFile\}/g, jobFile));
+      await updateTask(task.id, { status: "submitting", progress: 50 });
       publisherStarted = true;
       await spawnAndWait(adapter.command, args, {
         cwd: adapter.cwd ? expandHome(adapter.cwd) : agentRoot,
@@ -5735,7 +5789,7 @@ async function runPublishTask(task) {
     } else {
       throw new Error("unsupported_publisher_type");
     }
-    const status = task.mode === "publish" ? "submitted" : "platform_draft";
+    const receiptStatus = task.mode === "publish" ? "submitted" : "platform_draft";
     if (type === "command") {
       await recordPlatformReceipts({
         operationId: task.id,
@@ -5747,20 +5801,31 @@ async function runPublishTask(task) {
         results: requestedPlatforms.map((platform) => ({
           platform,
           success: true,
-          status,
+          status: receiptStatus,
           message: "publisher_response_received",
         })),
       }, task.id);
     }
-    await updateTask(task.id, { status, progress: 100, result: sanitizeResult(result) });
-    await recordEvent("info", "PUBLISH", `发布器已接收任务，状态 ${status}`, task.id);
+    const status = "submitted_unverified";
+    await updateTask(task.id, {
+      status,
+      progress: 90,
+      intendedOutcome: task.mode === "publish" ? "public" : "platform_draft",
+      businessSuccess: false,
+      requiresReadback: true,
+      result: sanitizeResult(result),
+    });
+    await recordEvent("info", "PUBLISH", "发布器已接收任务，等待平台回读（不等于业务成功）", task.id);
   } catch (error) {
+    const rawCode = safeErrorCode(error);
     const code = publisherReturned
       ? "local_finalize_after_publisher_returned"
       : publisherStarted
         ? "publisher_outcome_not_observed"
-        : (preflightErrorCode || safeErrorCode(error));
-    const status = "needs_attention";
+        : (preflightErrorCode || rawCode);
+    const status = publisherReturned || rawCode === "adapter_exit_4" || /account|login|cookie|session/i.test(rawCode)
+      ? "needs_attention"
+      : publishFailureDisposition({ externalCallStarted: publisherStarted, errorCode: code });
     if (publisherStarted && !publisherReturned) {
       await recordPlatformReceipts({
         operationId: task.id,
@@ -5777,8 +5842,19 @@ async function runPublishTask(task) {
         })),
       }, task.id);
     }
-    await updateTask(task.id, { status, progress: 0, errorCode: code });
-    await recordEvent("warning", "PUBLISH", `发布结果需人工核对：${code}`, task.id);
+    await updateTask(task.id, {
+      status,
+      progress: status === "failed" ? 0 : 90,
+      errorCode: code,
+      businessSuccess: false,
+      requiresReadback: status !== "failed",
+    });
+    const message = status === "needs_reconciliation"
+      ? `外部提交结果不确定，禁止自动重发：${code}`
+      : publisherReturned
+        ? `发布器已返回但本地收尾失败，需人工核对：${code}`
+        : `发布未完成：${code}`;
+    await recordEvent(status === "failed" ? "error" : "warning", "PUBLISH", message, task.id);
   }
 }
 
@@ -6590,10 +6666,13 @@ async function appendTask(task) {
   });
 }
 
-async function updateTask(taskId, patch) {
+async function updateTask(taskId, patch, transitionContext = {}) {
   return mutateTasks((tasks) => {
     const index = tasks.findIndex((task) => task.id === taskId);
     if (index < 0) return null;
+    if (tasks[index].type === "publish" && patch.status && patch.status !== tasks[index].status) {
+      assertLifecycleTransition("publish_task", tasks[index].status, patch.status, transitionContext);
+    }
     tasks[index] = { ...tasks[index], ...patch, updatedAt: new Date().toISOString() };
     return tasks[index];
   });

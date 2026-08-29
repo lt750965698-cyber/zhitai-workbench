@@ -197,6 +197,7 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 
 - [开始使用](docs/GETTING_STARTED.md)
 - [架构与信任边界](docs/ARCHITECTURE.md)
+- [统一内容生命周期契约](docs/CONTENT_LIFECYCLE.md)
 - [第三方集成指南](docs/INTEGRATION.md)
 - [知识库字段契约](docs/VIDEO_KNOWLEDGE_SCHEMA.md)
 - [可验证备份、恢复与迁移](docs/BACKUP_RESTORE.md)

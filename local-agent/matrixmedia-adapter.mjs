@@ -9,6 +9,8 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { canonicalPublicResultUrl } from "./content-lifecycle.mjs";
+import { sanitizeFailureText } from "./kb.mjs";
 
 export const MATRIX_BINARY = process.env.ZHITAI_MATRIX_BINARY
   || join(homedir(), ".local", "share", "zhitai-runtime", "engines", "matrixmedia.app", "Contents", "MacOS", "matrixmedia");
@@ -108,6 +110,7 @@ export function publishModeFor({ draft = false, scheduledAt = null, publishAt = 
 
 function canonicalAccountIdentifier(value) {
   if (value && typeof value === "object") {
+    if (value.accountFingerprint) return canonicalAccountIdentifier(value.accountFingerprint);
     if (value.partition) return canonicalAccountIdentifier(value.partition);
     if (value.phone) return canonicalAccountIdentifier(value.phone);
   }
@@ -376,22 +379,17 @@ function normalizeScheduledAt(value) {
 }
 
 function cleanReceiptText(value, maxLength = 1_000) {
-  const clean = String(value ?? "")
+  const clean = sanitizeFailureText(String(value ?? "")
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-    .replace(/\b1\d{10}\b/g, "[account]")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/(?:\+?86[\s-]*)?1[3-9]\d(?:[\s-]*\d){8}/g, "[account]"))
     .trim();
   return clean ? clean.slice(0, maxLength) : null;
 }
 
 function validResultUrl(value) {
-  if (!value) return null;
-  try {
-    const url = new URL(String(value));
-    return ["http:", "https:"].includes(url.protocol) ? url.toString() : null;
-  } catch {
-    return null;
-  }
+  return canonicalPublicResultUrl(value);
 }
 
 function resultObjects(parsed) {
@@ -439,7 +437,7 @@ function structuredReceiptState(objects) {
 
 /**
  * MatrixMedia 的退出码 0 只能证明 CLI 成功完成，不能证明平台内容已经公开。
- * 只有结构化状态明确写出 published/public 才返回 public。
+ * structured public/draft/scheduled 只作为候选证据保留，不能直接成为业务终态。
  */
 export function classifyMatrixPublishResult({ code, out = "", err = "" } = {}, { mode = "public" } = {}) {
   const parsed = extractJson(out) || extractJson(err);
@@ -448,12 +446,10 @@ export function classifyMatrixPublishResult({ code, out = "", err = "" } = {}, {
   const succeeded = code === 0 || code === "0";
   const savedDraftFallback = code === 4 || code === "4";
   let state;
-  if (savedDraftFallback) state = "draft";
+  if (savedDraftFallback) state = mode === "draft" ? "submitted" : "draft";
   else if (!succeeded) state = "failed";
-  else if (explicitState === "public") state = "public";
   else if (explicitState === "failed") state = "failed";
-  else if (explicitState === "draft" || mode === "draft") state = "draft";
-  else if (explicitState === "scheduled" || mode === "scheduled") state = "scheduled";
+  else if (explicitState === "draft" && mode === "public") state = "draft";
   else state = "submitted";
 
   const taskId = cleanReceiptText(firstResultField(objects, ["taskId", "task_id", "scheduleId", "schedule_id", "platformTaskId", "id"]), 240);
@@ -461,20 +457,23 @@ export function classifyMatrixPublishResult({ code, out = "", err = "" } = {}, {
   const resultUrl = validResultUrl(firstResultField(objects, ["resultUrl", "result_url", "postUrl", "post_url", "noteUrl", "note_url", "shareUrl", "share_url", "url"]));
   const parsedMessage = firstResultField(objects, ["platformMessage", "platform_message", "message", "msg"]);
   const platformMessage = cleanReceiptText(parsedMessage ?? err ?? out);
-  const accepted = state === "draft"
-    ? mode === "draft" && (succeeded || savedDraftFallback)
-    : succeeded && !["failed", "unknown"].includes(state);
+  const accepted = savedDraftFallback
+    ? mode === "draft"
+    : succeeded && !["failed", "unknown", "draft"].includes(state);
   return {
     state,
     accepted,
+    source: "adapter_submission",
+    receivedAt: new Date().toISOString(),
     platformMessage,
+    ...(explicitState ? { adapterReportedState: explicitState } : {}),
     ...(taskId ? { taskId } : {}),
     ...(postId ? { postId } : {}),
     ...(resultUrl ? { resultUrl } : {}),
   };
 }
 
-export function publishReceiptDedupeKey({ platform, account, mediaSha256, mode, scheduledAt = null } = {}) {
+export function publishReceiptDedupeKey({ platform, account, accountFingerprint, mediaSha256, mode, scheduledAt = null } = {}) {
   const normalizedMode = String(mode || "").trim();
   if (!PUBLISH_RECEIPT_MODES.has(normalizedMode)) throw new Error("publisher_receipt_mode_invalid");
   const sha = String(mediaSha256 || "").trim().toLowerCase();
@@ -482,7 +481,7 @@ export function publishReceiptDedupeKey({ platform, account, mediaSha256, mode, 
   const normalizedPlatform = String(platform || "").trim();
   const identity = [
     normalizedPlatform,
-    publishAccountFingerprint(normalizedPlatform, account),
+    publishAccountFingerprint(normalizedPlatform, accountFingerprint || account),
     sha,
     normalizedMode,
     normalizeScheduledAt(scheduledAt),
@@ -878,12 +877,21 @@ export async function cliPublish(payload, { authStateStore = matrixAuthStateStor
       state: receipt.state,
       message: receipt.platformMessage,
       platformMessage: receipt.platformMessage,
+      source: receipt.source,
+      receivedAt: receipt.receivedAt,
+      ...(receipt.adapterReportedState ? { adapterReportedState: receipt.adapterReportedState } : {}),
       ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
       ...(receipt.postId ? { postId: receipt.postId } : {}),
       ...(receipt.resultUrl ? { resultUrl: receipt.resultUrl } : {}),
     });
   }
-  return { success: results.every((item) => item.success), total: results.length, results };
+  return {
+    success: results.every((item) => item.success),
+    businessSuccess: false,
+    requiresReadback: true,
+    total: results.length,
+    results,
+  };
 }
 
 function receiptResult(receipt, { deduplicated = false, success = null } = {}) {

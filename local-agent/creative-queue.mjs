@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { assertLifecycleTransition } from "./content-lifecycle.mjs";
 import { remediateToOriginalWorkflow } from "./originality-remediation.mjs";
 import { assessGenerationReadiness } from "./seedance-workflow.mjs";
 
@@ -123,12 +124,17 @@ export class CreativeQueue {
       for (const job of jobs) {
         if (job.status === "preparing" || job.status === "retry_wait"
           || (job.status === "failed" && isTransientSqliteBusy(job.error))) {
+          const previousStatus = job.status;
           job.status = "queued";
           job.stage = "analysis";
           job.progress = 0;
           job.error = null;
           job.retryAt = null;
           job.updatedAt = isoNow();
+          assertLifecycleTransition("creative_job", previousStatus, job.status, {
+            interruptedRecovery: previousStatus === "preparing",
+            transientRecovery: previousStatus === "failed",
+          });
         }
         if (["needs_attention", "transient_wait"].includes(job.status)) {
           job.resumeStatus = inferredResumeStatus(job);
@@ -163,14 +169,17 @@ export class CreativeQueue {
           remapped += 1;
         }
         if (["ready_for_images", "ready_for_seedance", "ready_for_assembly"].includes(job.status) && state?.ready !== true) {
+          const previousStatus = job.status;
           job.status = "queued";
           job.stage = "analysis";
           job.progress = 0;
           job.error = null;
           job.retryAt = null;
           job.updatedAt = isoNow();
+          assertLifecycleTransition("creative_job", previousStatus, job.status, { integrityRepair: true });
           repaired += 1;
         } else if (job.status === "failed" && state?.ready === true) {
+          const previousStatus = job.status;
           job.status = "ready_for_images";
           job.stage = "gpt_images";
           job.progress = 40;
@@ -178,6 +187,7 @@ export class CreativeQueue {
           job.retryAt = null;
           job.transientRetryCount = 0;
           job.updatedAt = isoNow();
+          assertLifecycleTransition("creative_job", previousStatus, job.status, { integrityRepair: true });
           repaired += 1;
         }
       }
@@ -215,7 +225,7 @@ export class CreativeQueue {
 
   async pause(id) {
     const job = await this.#change(id, (row) => {
-      if (!["queued", "preparing", "retry_wait", "transient_wait"].includes(row.status)) return;
+      if (!["queued", "preparing", "retry_wait", "transient_wait"].includes(row.status)) throw new Error("invalid_creative_transition");
       row.resumeStatus = inferredResumeStatus(row);
       row.status = "paused";
       row.progress = Math.min(95, Number(row.progress) || 0);
@@ -229,10 +239,10 @@ export class CreativeQueue {
 
   async resume(id) {
     const job = await this.#change(id, (row) => {
-      if (!["paused", "failed", "needs_attention", "transient_wait"].includes(row.status)) return;
+      if (!["paused", "failed", "needs_attention", "transient_wait"].includes(row.status)) throw new Error("invalid_creative_transition");
       restoreInterruptedState(row, { resetTransientRetryCount: true });
       row.updatedAt = isoNow();
-    });
+    }, { explicitRetry: true });
     this.#scheduleDrain();
     return job;
   }
@@ -278,12 +288,39 @@ export class CreativeQueue {
         // 兼容升级前已经完成、但尚未登记回知识库的任务。
         row.generationId = output.generationId ?? row.generationId ?? null;
         row.outputMediaUrl = output.mediaUrl ?? row.outputMediaUrl ?? null;
+      } else {
+        throw new Error("invalid_creative_transition");
       }
       if (advanced) {
         clearAttentionState(row);
         row.transientRetryCount = 0;
       }
       row.updatedAt = isoNow();
+    });
+  }
+
+  /**
+   * Serialize transition validation, artifact persistence and the queue write.
+   * The SQLite generation record remains the recovery source if the final JSON
+   * rename fails after persistence.
+   */
+  async completeWithPersistence(id, persist) {
+    if (typeof persist !== "function") throw new Error("creative_persist_callback_required");
+    return this.#mutate(async (jobs) => {
+      const row = jobs.find((job) => job.id === id);
+      if (!row) throw new Error("creative_job_not_found");
+      if (!["ready_for_assembly", "completed"].includes(row.status)) throw new Error("invalid_creative_transition");
+      const previousStatus = row.status;
+      const output = await persist(publicJob(row));
+      if (!output?.generationId || !output?.mediaUrl) throw new Error("creative_persist_evidence_missing");
+      row.status = "completed";
+      row.stage = "completed";
+      row.progress = 100;
+      row.generationId = output.generationId;
+      row.outputMediaUrl = output.mediaUrl;
+      row.updatedAt = isoNow();
+      assertLifecycleTransition("creative_job", previousStatus, row.status);
+      return { job: publicJob(row), output };
     });
   }
 
@@ -322,11 +359,13 @@ export class CreativeQueue {
     return job;
   }
 
-  async #change(id, updater) {
+  async #change(id, updater, transitionContext = {}) {
     const result = await this.#mutate((jobs) => {
       const row = jobs.find((job) => job.id === id);
       if (!row) throw new Error("creative_job_not_found");
+      const previousStatus = row.status;
       updater(row);
+      assertLifecycleTransition("creative_job", previousStatus, row.status, transitionContext);
       return publicJob(row);
     });
     return result;

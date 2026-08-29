@@ -668,7 +668,16 @@ export function PublishNative({
         || (data?.scheduled === true ? "scheduled" : "submitted");
       const responseScheduledAt = responseTask?.scheduledAt || scheduledAt || null;
       const responseTotal = typeof responseResults?.total === "number" ? responseResults.total : selectedPlatforms.length;
-      setMsg(`已受理 ${responseTotal} 个平台：${publishStatusText(responseStatus, { scheduledAt: responseScheduledAt })}`);
+      const statusText = publishStatusText(responseStatus, { scheduledAt: responseScheduledAt });
+      if (data?.businessSuccess === true) {
+        setMsg(`平台已回读公开：${responseTotal} 个目标`);
+      } else if (data?.requiresReadback === true && ["submitted", "submitted_unverified"].includes(normalizedPublishToken(responseStatus))) {
+        setMsg(mode === "publish"
+          ? `已受理 ${responseTotal} 个平台，等待独立平台回读；当前不算公开成功`
+          : `已受理 ${responseTotal} 个平台，等待平台草稿回读；当前尚未确认草稿保存`);
+      } else {
+        setMsg(`已受理 ${responseTotal} 个平台：${statusText}`);
+      }
       void loadAll();
     } catch (e) {
       setMsg("提交失败：" + publishFailureText(e instanceof Error ? e.message : e));

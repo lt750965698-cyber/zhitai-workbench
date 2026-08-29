@@ -622,6 +622,9 @@ function displayStatus(rawStatus: string, hasPackage = false): string {
   if (status === "drifted" || status === "invalid") return "需校验";
   if (status === "awaiting_approval" || status === "needs_approval") return "待确认";
   if (status === "scheduled") return "已排期";
+  if (status === "submitted" || status === "submitted_unverified") return "已提交 · 待回读";
+  if (status === "needs_reconciliation") return "待人工对账";
+  if (status === "public") return "已公开";
   if (status === "platform_draft") return "平台草稿";
   if (status === "workbench_draft" || status === "draft") return "草稿";
   if (status === "failed" || status === "crashed" || status === "error") return "失败";
@@ -3152,9 +3155,9 @@ function PublishCenter({
   openComposer: () => void;
 }) {
   const publisher = services.find((service) => service.id.includes("matrix") || service.id.includes("publisher")) ?? null;
-  const pending = tasks.filter((task) => !["failed", "completed", "success", "submitted", "platform_draft"].includes(task.rawStatus.toLowerCase()));
-  const successful = tasks.filter((task) => ["submitted", "platform_draft", "completed", "success"].includes(task.rawStatus.toLowerCase())).length;
-  const attention = tasks.filter((task) => ["failed", "needs_attention", "needs_setup"].includes(task.rawStatus.toLowerCase())).length;
+  const pending = tasks.filter((task) => ["scheduled", "queued", "running", "submitting", "submitted", "submitted_unverified"].includes(task.rawStatus.toLowerCase()));
+  const successful = tasks.filter((task) => task.rawStatus.toLowerCase() === "public").length;
+  const attention = tasks.filter((task) => ["failed", "needs_attention", "needs_reconciliation", "needs_setup"].includes(task.rawStatus.toLowerCase())).length;
   return (
     <>
       <section className="publish-hero">
@@ -3165,7 +3168,7 @@ function PublishCenter({
       </section>
       <section className="publish-stat-row">
         <div><small>任务总数</small><strong>{tasks.length}</strong><span>本地记录</span></div>
-        <div><small>已提交/草稿</small><strong>{successful}</strong><span>不等于平台已公开</span></div>
+        <div><small>平台已公开</small><strong>{successful}</strong><span>仅统计公开回读</span></div>
         <div><small>队列与排期</small><strong>{pending.length}</strong><span>等待处理</span></div>
         <div><small>需处理</small><strong>{attention}</strong><span>需要人工检查</span></div>
       </section>
@@ -4391,12 +4394,12 @@ function Logs({
   tasks: WorkbenchTask[];
   events: LocalEvent[];
 }) {
-  const completed = tasks.filter((task) => ["completed", "success", "submitted", "platform_draft"].includes(task.rawStatus.toLowerCase())).length;
-  const attention = tasks.filter((task) => ["failed", "needs_attention", "needs_setup"].includes(task.rawStatus.toLowerCase())).length;
+  const completed = tasks.filter((task) => ["completed", "success", "public"].includes(task.rawStatus.toLowerCase())).length;
+  const attention = tasks.filter((task) => ["failed", "needs_attention", "needs_reconciliation", "needs_setup"].includes(task.rawStatus.toLowerCase())).length;
   return (
     <section className="log-console">
       <header><div><i /><i /><i /></div><span>local-companion / {agentState === "online" ? "live" : "offline"}</span><button type="button" disabled>日志已脱敏</button></header>
-      <div className="log-summary"><div><small>运行时长</small><strong>{health?.uptimeSeconds === null || health?.uptimeSeconds === undefined ? "—" : formatDuration(health.uptimeSeconds * 1000)}</strong></div><div><small>本地任务</small><strong>{tasks.length}</strong></div><div><small>已完成/提交</small><strong>{completed}</strong></div><div><small>需处理</small><strong>{attention}</strong></div></div>
+      <div className="log-summary"><div><small>运行时长</small><strong>{health?.uptimeSeconds === null || health?.uptimeSeconds === undefined ? "—" : formatDuration(health.uptimeSeconds * 1000)}</strong></div><div><small>本地任务</small><strong>{tasks.length}</strong></div><div><small>已完成/公开</small><strong>{completed}</strong></div><div><small>需处理</small><strong>{attention}</strong></div></div>
       <div className="log-stream">
         {events.map((event) => <div key={event.id}><time>{event.time}</time><span className={`log-type type-${event.type}`}>{event.type}</span><p>{event.message}</p></div>)}
         {!events.length && <div className="log-cursor"><time>—</time><span>{agentState === "online" ? "READY" : "OFFLINE"}</span><p>{agentState === "online" ? "等待下一条真实事件" : "启动本地节点后同步事件"} <i /></p></div>}
