@@ -202,7 +202,7 @@ test("tasks.json 的 task.result.results 按平台目的地展开", () => {
   assert.deepEqual(rows.map((row) => [row.platform, row.state]), [["douyin", "submitted"], ["xiaohongshu", "failed"]]);
 });
 
-test("发布回执与帖子 URL 剥离签名参数并拒绝内嵌凭据", () => {
+test("稳定分享 URL 剥离全部查询参数并拒绝内嵌凭据", () => {
   const [signed] = normalizePublishReceipts([{
     id: "receipt-signed-url",
     platform: "douyin",
@@ -211,7 +211,7 @@ test("发布回执与帖子 URL 剥离签名参数并拒绝内嵌凭据", () => 
     url: "https://www.douyin.com/video/123?safe=1&token=fixture-secret",
   }]);
   assert.equal(signed.state, "public");
-  assert.equal(signed.resultUrl, "https://www.douyin.com/video/123?safe=1");
+  assert.equal(signed.resultUrl, "https://www.douyin.com/video/123");
   assert.doesNotMatch(signed.resultUrl, /fixture-secret|token/i);
 
   const [credentialed] = normalizePublishReceipts([{

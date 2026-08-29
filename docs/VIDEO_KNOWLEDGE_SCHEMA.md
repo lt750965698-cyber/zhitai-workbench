@@ -2,7 +2,7 @@
 
 当前内容包格式：schemaVersion 2。
 
-本文描述 v0.1.0-alpha.1 实际写入的内容包，以及 SQLite 与 API 的对应关系。内容包字段使用 camelCase 与少量历史 snake_case；SQLite 和多数 API 字段使用 snake_case。预发布阶段可能调整字段，消费者必须容忍未知字段并检查 status。
+本文描述 v0.2.0-alpha.1 实际写入的内容包，以及 SQLite 与 API 的对应关系。内容包字段使用 camelCase 与少量历史 snake_case；SQLite 和多数 API 字段使用 snake_case。预发布阶段可能调整字段，消费者必须容忍未知字段并检查 status。
 
 本文件只定义知识内容字段；从采集到归档的状态、真相源、幂等键与完成不变量以 [统一内容生命周期契约](CONTENT_LIFECYCLE.md) 为准。
 
