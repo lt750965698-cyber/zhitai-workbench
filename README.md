@@ -181,6 +181,18 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 
 许可证不明确、限制再分发或与本项目发行方式不兼容的源码和二进制不得打包进织台发行物。尤其不要复制、分叉或捆绑未提供明确许可证的浏览器脚本；织台只保留可替换的接口契约。
 
+## 运营指标与复盘
+
+运营指标合同复用知识库、`metric_snapshot`、生成成片、发布回执和创作审核结构；补充四态平台指标、成片到多平台帖子的血缘、1h/24h/7d/30d 快照、反馈漏斗、单变量实验卡及 D7/D14/D30 复盘。`submitted` / `success` 只表示平台接收，绝不自动计作公开。
+
+- 合同与口径：[docs/OPERATIONS_METRICS_CONTRACT.md](docs/OPERATIONS_METRICS_CONTRACT.md)
+- 后续接入：[docs/OPERATIONS_INTEGRATION.md](docs/OPERATIONS_INTEGRATION.md)
+- 合成示例：[docs/examples/operations-review.synthetic.md](docs/examples/operations-review.synthetic.md)
+- 只读报告：`node scripts/operations-report.mjs --help`
+- 专项测试：`pnpm run test:ops`
+
+合成模式只能用于隔离验收，并在报告中强制标记；它不登录平台、不修改账号、不执行真实发布，也不能代表真实运营结果。
+
 ## 文档
 
 - [开始使用](docs/GETTING_STARTED.md)

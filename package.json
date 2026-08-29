@@ -35,6 +35,8 @@
     "test:node": "node scripts/test-node.mjs",
     "test:integrations": "node scripts/test-integrations.mjs",
     "test:agent": "node --test tests/local-agent.integration.test.mjs",
+    "test:ops": "node --test tests/operations-experiment-review.test.mjs tests/operations-metrics-contract.test.mjs tests/operations-report.test.mjs tests/operations-schema-validation.test.mjs",
+    "report:ops:synthetic": "node scripts/operations-report.mjs --synthetic --format markdown",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },
@@ -54,6 +56,8 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.34",
+    "ajv": "8.20.0",
+    "ajv-formats": "2.1.1",
     "cross-env": "^10.1.0",
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
