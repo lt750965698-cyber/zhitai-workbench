@@ -1,6 +1,6 @@
 # 织台（Zhitai Workbench）
 
-> Public Preview · v0.1.0-alpha.1
+> Public Preview · v0.2.0-alpha.1
 
 ![织台：本地优先的内容自动化工作台](public/og.png)
 
@@ -30,12 +30,25 @@
 | --- | --- | --- |
 | 本地节点与知识库 | 可运行 / Alpha | 本地任务、SQLite、内容包、检索与媒体接口可用；迁移前应自行备份 |
 | Web 工作台 | 可运行 / Alpha | 可查看和操作本地节点；部分桌面能力只在 Electron 外壳中可用 |
-| 桌面外壳 | Public Preview | 主要在 macOS 开发验证；尚无稳定、签名的跨平台发行包 |
+| 桌面外壳 | Public Preview | 主要在 macOS 开发验证；提供 Windows 10 22H2/Windows 11 x64 预览包，但暂未代码签名 |
 | 采集 | 适配器预览 | 分享链接或媒体解析通常需要外置工具、登录态与平台许可 |
 | 视频分析与生成 | 适配器预览 | ASR、OCR、镜头、视觉模型和生成服务均为可选外置能力；缺失字段必须明确标为 unavailable |
 | 多平台发布 | 实验性 | 需要外置发布器和各平台登录；默认优先草稿，公开发布必须显式确认 |
 | 闲鱼、X 收藏、手机控制与通知 | 实验性 | 依赖外置程序或已登录浏览器；可能受平台规则、风控和接口变化影响 |
 | 安全性 | 预览阶段 | 已实现多项本地边界与审核门，但尚未完成独立安全审计 |
+
+## Windows 预览版
+
+Windows 10 22H2 和 Windows 11 x64 用户可从 [v0.2.0-alpha.1 GitHub Release](https://github.com/lt750965698-cyber/zhitai-workbench/releases/tag/v0.2.0-alpha.1) 下载当前用户安装包或便携包。运行前请用同一 Release 中的 `SHA256SUMS.txt` 核对文件哈希。
+
+该安装包是未签名的公开预览版，Windows SmartScreen 可能显示“未知发布者”。当前支持本地工作台、知识库和内容/人工审核流程；原生第三方发布、外置服务自动安装/管理、微信与浏览器自动化会以 `unsupported_on_windows_preview` 失败关闭。安装、校验、数据目录和源码构建步骤见 [Windows 预览版指南](docs/WINDOWS.md)。
+
+## v0.2.0-alpha.1 最新修复
+
+- 可验证备份、隔离恢复、新根迁移和可恢复回滚，不覆盖用户现有数据；
+- 脱敏隐私诊断快照，用稳定错误码和经过缩减的环境证据帮助排查；
+- 统一内容生命周期，明确收件、入库、生成、审核、排期、回执与对账状态；
+- 19 个场景、352 条断言的整链离线 E2E；Windows CI 使用进程级断网护栏，Linux Docker CI 另加内核级断网。该套件使用合成媒体和模拟回执，不代表真实平台已通过验收。
 
 ## 快速开始
 
@@ -44,7 +57,7 @@
 - Node.js 22.13.0 或更高版本；
 - pnpm 11.19.0 或更高版本（建议通过 Corepack 启用）；
 - Git；
-- 当前支持的完整开发流程是 macOS 或带 POSIX shell 的环境。Linux 可用于核心与 CI 测试；原生 Windows 下本地节点可以尝试运行，但 dev、build、start 脚本的环境变量语法、桌面脚本和部分媒体探测尚未适配。
+- macOS 是主要开发验证环境；Linux 可用于 Web/Node.js 核心和 CI 测试；Windows 10 22H2/Windows 11 x64 可使用公开预览包，也可按 [Windows 预览版指南](docs/WINDOWS.md) 在 PowerShell 中构建。Windows 的平台自动化仍受上述支持边界限制。
 
 ### 1. 获取并安装
 
@@ -207,6 +220,7 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 - [诊断隐私与保留策略](docs/DIAGNOSTICS_PRIVACY.md)
 - [内容与授权政策](docs/CONTENT_POLICY.md)
 - [离线整链 E2E 与故障注入](docs/OFFLINE_E2E.md)
+- [Windows 预览版安装与支持边界](docs/WINDOWS.md)
 - [路线图](ROADMAP.md)
 - [变更记录](CHANGELOG.md)
 - [支持](SUPPORT.md)
@@ -220,7 +234,7 @@ pnpm backup rollback --target-root <迁移根> --migration-id <迁移编号>
 
 ## English summary
 
-Zhitai Workbench is a local-first, Chinese-first public preview for organizing media ingestion, a searchable knowledge base, task state, human review, and optional publishing adapters.
+Zhitai Workbench v0.2.0-alpha.1 is a local-first, Chinese-first public preview for organizing media ingestion, a searchable knowledge base, task state, human review, and optional publishing adapters. An unsigned Windows preview is available for Windows 10 22H2 and Windows 11 x64; see the [Windows guide](docs/WINDOWS.md) for installation and current platform limitations.
 
 The repository contains a runnable local control plane and UI. Platform ingestion, media analysis, generation, remote control, notifications, and publishing require separately obtained and configured engines or services. They are not bundled under Zhitai's MIT license. Keep the local agent on loopback, review every high-impact action, and use only content and accounts you own or are authorized to operate.
 
