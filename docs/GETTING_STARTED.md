@@ -9,7 +9,7 @@
 - Git；
 - 至少两个终端窗口。
 
-主要开发验证环境为 macOS。Linux 可用于核心与 CI 测试。原生 Windows 可以尝试运行本地节点，但 dev、build、start 当前使用 POSIX 环境变量语法，桌面启动脚本、系统钥匙串和部分媒体探测也未适配，因此完整快速开始需要 POSIX shell。
+主要开发验证环境为 macOS；Electron 44 桌面版要求 macOS 13 Ventura 或更高版本。Linux 可用于核心与 CI 测试。原生 Windows 可以尝试运行本地节点，但 dev、build、start 当前使用 POSIX 环境变量语法，桌面启动脚本、系统钥匙串和部分媒体探测也未适配，因此完整快速开始需要 POSIX shell。
 
 确认版本：
 
