@@ -57,7 +57,7 @@ Windows 10 22H2 和 Windows 11 x64 用户可从 [v0.2.0-alpha.1 GitHub Release](
 - Node.js 22.13.0 或更高版本；
 - pnpm 11.19.0 或更高版本（建议通过 Corepack 启用）；
 - Git；
-- macOS 是主要开发验证环境；Linux 可用于 Web/Node.js 核心和 CI 测试；Windows 10 22H2/Windows 11 x64 可使用公开预览包，也可按 [Windows 预览版指南](docs/WINDOWS.md) 在 PowerShell 中构建。Windows 的平台自动化仍受上述支持边界限制。
+- 桌面版的 Electron 44 要求 macOS 13 Ventura 或更高版本；macOS 是主要开发验证环境。Linux 可用于 Web/Node.js 核心和 CI 测试；Windows 10 22H2/Windows 11 x64 可使用公开预览包，也可按 [Windows 预览版指南](docs/WINDOWS.md) 在 PowerShell 中构建。Windows 的平台自动化仍受上述支持边界限制。
 
 ### 1. 获取并安装
 
