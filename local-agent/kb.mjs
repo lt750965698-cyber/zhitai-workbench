@@ -774,6 +774,13 @@ function migrate(db) {
     if (!metricCols.includes(col)) db.exec(`ALTER TABLE metric_snapshot ADD COLUMN ${col} ${ddl}`);
   }
   db.exec("CREATE INDEX IF NOT EXISTS ix_comment_item_asset ON comment_item(asset_id, captured_at)");
+  // List pages need the newest assets, receipts and non-null metric evidence.
+  // Create these after legacy table rebuilds so reopened databases retain them.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS ix_video_asset_created ON video_asset(created_at);
+    CREATE INDEX IF NOT EXISTS ix_download_receipt_asset_id ON download_receipt(asset_id, id);
+    CREATE INDEX IF NOT EXISTS ix_metric_snapshot_asset_captured_id ON metric_snapshot(asset_id, captured_at, id);
+  `);
   repairDanglingImportItems(db);
 }
 
@@ -2421,7 +2428,7 @@ export function queryVideos(db, { q = "", platform = "", category = "", sort = "
     params[":plat"] = String(platform);
   }
   const w = where.length ? "WHERE " + where.join(" AND ") : "";
-  const sortMap = { created_at: "v.created_at", duration: "v.duration_ms", likes: "COALESCE((SELECT likes FROM platform_post WHERE asset_id=v.id ORDER BY fetched_at DESC LIMIT 1), -1)" };
+  const sortMap = { created_at: "v.created_at", duration: "v.duration_ms", likes: "likes" };
   const order = (sortMap[sort] || "v.created_at") + " DESC";
   const lim = Math.max(1, Math.min(5000, Number(limit) || 50));
   const off = Math.max(0, Number(offset) || 0);

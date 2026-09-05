@@ -5,6 +5,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getVideoDetail, importPerformanceEvidence, openKbDb, queryVideos } from "../local-agent/kb.mjs";
 
+test("按点赞排序使用列表展示的最新非空证据，并在分页前排序", () => {
+  const db = openKbDb(":memory:");
+  try {
+    for (const id of ["stale-popular", "latest-popular", "unknown", "zero"]) {
+      db.prepare("INSERT INTO video_asset (id,title) VALUES (?,?)").run(id, id);
+    }
+    const post = db.prepare("INSERT INTO platform_post (asset_id,content_id,likes,fetched_at) VALUES (?,?,?,?)");
+    post.run("stale-popular", "p1", 100, "2026-09-01");
+    post.run("latest-popular", "p2", 1, "2026-09-01");
+    post.run("zero", "p3", 0, "2026-09-01");
+    const metric = db.prepare("INSERT INTO metric_snapshot (asset_id,likes,captured_at) VALUES (?,?,?)");
+    metric.run("latest-popular", 200, "2026-09-02");
+    metric.run("latest-popular", null, "2026-09-03");
+    assert.deepEqual(queryVideos(db, { sort: "likes", limit: 2 }).items.map(({ id, likes }) => ({ id, likes })), [
+      { id: "latest-popular", likes: 200 },
+      { id: "stale-popular", likes: 100 },
+    ]);
+    assert.deepEqual(queryVideos(db, { sort: "likes", limit: 2, offset: 2 }).items.map(({ id, likes }) => ({ id, likes })), [
+      { id: "zero", likes: 0 },
+      { id: "unknown", likes: null },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
 test("创作者后台指标、留存和评论正文会作为独立证据入库并写入内容包", async () => {
   const root = await mkdtemp(join(tmpdir(), "zhitai-performance-"));
   const packagePath = join(root, "package");
