@@ -57,7 +57,7 @@ jobs:
             npm run test:offline-e2e
       - name: Upload machine-readable report
         if: always() && steps.report_path.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zhitai-offline-e2e-report
           path: .artifacts/offline-e2e/*.json
@@ -81,7 +81,7 @@ jobs:
         run: pnpm run test:offline-e2e
       - name: Upload Windows machine-readable report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zhitai-offline-e2e-report-windows
           path: .artifacts/offline-e2e/*.json
