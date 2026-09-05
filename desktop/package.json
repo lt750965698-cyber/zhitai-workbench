@@ -10,6 +10,6 @@
     "test:adapter": "node --test ../tests/zhitai-adapter.contract.test.mjs"
   },
   "devDependencies": {
-    "electron": "^43.2.0"
+    "electron": "^44.0.0"
   }
 }
