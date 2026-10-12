@@ -50,7 +50,7 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
-    "@electron/asar": "4.3.0",
+    "@electron/asar": "4.3.1",
     "electron-squirrel-startup": "1.0.1"
   },
   "devDependencies": {
