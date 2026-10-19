@@ -73,7 +73,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Node.js and pnpm
-        uses: pnpm/setup@v2
+        uses: pnpm/setup@v3
         with:
           runtime: node@22.13.0
           cache: true
